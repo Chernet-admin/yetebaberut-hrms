@@ -368,6 +368,17 @@ def init_db():
         restored INTEGER DEFAULT 0)""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_recycle_type ON recycle_bin(record_type)")
 
+    c.execute("""CREATE TABLE IF NOT EXISTS employee_documents(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        emp_id TEXT NOT NULL,
+        doc_type TEXT,
+        doc_name TEXT,
+        doc_data BLOB,
+        notes TEXT,
+        uploaded_by TEXT,
+        uploaded_at TEXT)""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_empdoc_emp ON employee_documents(emp_id)")
+
     c.execute("""CREATE TABLE IF NOT EXISTS system_users(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE NOT NULL,password TEXT NOT NULL,
@@ -895,17 +906,17 @@ st.markdown("<hr>",unsafe_allow_html=True)
 # has no custom nav_access saved, the role default applies.
 # ════════════════════════════════════════════════════════
 ALL_NAV_VIEWS = ["Home","Applicant Intake","Employee Directory","Employee Profile",
-    "Supervisor Console","Payroll","Payroll Approvals","Leave & Discipline","Leave Records",
+    "Supervisor Console","Payroll","Payroll Approvals","Leave & Discipline","Leave Records","Vacation",
     "Public Holidays","Cost Centers","Recycle Bin","Administration"]
 
 ROLE_DEFAULT_VIEWS = {
     "Supervisor": ["Home","Supervisor Console","Public Holidays"],
     "Payroll Section": ["Home","Payroll Approvals","Payroll","Employee Directory","Employee Profile","Public Holidays","Cost Centers"],
     "Manager": ["Home","Applicant Intake","Employee Directory","Employee Profile","Payroll",
-        "Payroll Approvals","Leave & Discipline","Leave Records","Public Holidays","Cost Centers","Recycle Bin","Administration"],
+        "Payroll Approvals","Leave & Discipline","Leave Records","Vacation","Public Holidays","Cost Centers","Recycle Bin","Administration"],
 }
 ROLE_DEFAULT_FALLBACK = ["Home","Applicant Intake","Employee Directory","Employee Profile",
-    "Payroll","Payroll Approvals","Leave & Discipline","Leave Records","Public Holidays","Cost Centers"]
+    "Payroll","Payroll Approvals","Leave & Discipline","Leave Records","Vacation","Public Holidays","Cost Centers"]
 
 def get_user_nav_views(role, nav_access_json):
     """Returns the ordered list of views this user can see."""
@@ -953,7 +964,7 @@ NAV_GROUPS = [
     ("RECRUITMENT", ["Applicant Intake"]),
     ("WORKFORCE", ["Employee Directory","Employee Profile","Supervisor Console"]),
     ("FINANCE", ["Payroll","Payroll Approvals","Cost Centers"]),
-    ("HR OPERATIONS", ["Leave & Discipline","Leave Records"]),
+    ("HR OPERATIONS", ["Leave & Discipline","Leave Records","Vacation"]),
     ("REFERENCE", ["Public Holidays"]),
     ("SYSTEM", ["Recycle Bin","Administration"]),
 ]
@@ -1425,7 +1436,7 @@ with main_block:
             else:
                 st.markdown('<div class="pb" style="display:flex;align-items:center;justify-content:center;min-height:170px;flex-direction:column;gap:6px"><div style="font-size:36px;opacity:0.25"></div><div style="font-size:10px;color:#6B7FA3">No photo</div></div>',unsafe_allow_html=True)
         st.markdown("<hr>",unsafe_allow_html=True)
-        t1,t2,t3,t4,t5,t6=st.tabs(["Personal","Edu & Work","Financial","Documents","Edit","History"])
+        t1,t2,t3,t4,t5,t6,t7=st.tabs(["Personal","Edu & Work","Financial","Documents","Edit","History","Document History"])
         with t1:
             c1,c2=st.columns(2)
             with c1:
@@ -1709,6 +1720,62 @@ with main_block:
             else:
                 st.info("No absence records yet.")
 
+        with t7:
+            st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:12px">A permanent record of every document ever uploaded for this employee. Uploading a new document never replaces an old one — every file stays here, dated and typed, forever.</div>',unsafe_allow_html=True)
+
+            with st.expander("➕ Upload New Document"):
+                doc_type_opts=["Warning Letter","Disciplinary Letter","Penalty Letter","ID Copy","Medical Certificate",
+                    "Educational Certificate","Contract Document","Guarantee Letter","Police Clearance","Bank Statement","Other"]
+                dt1,dt2=st.columns(2)
+                with dt1: new_doc_type=st.selectbox("Document Type",doc_type_opts,key=f"newdoc_type_{eid2}")
+                with dt2: new_doc_file=st.file_uploader("File (PDF/JPG/PNG)",type=["pdf","jpg","jpeg","png"],key=f"newdoc_file_{eid2}")
+                new_doc_notes=st.text_input("Notes (optional — e.g. reason, incident date)",key=f"newdoc_notes_{eid2}")
+                if st.button("Upload to Document History",key=f"newdoc_upload_btn_{eid2}",use_container_width=True):
+                    if not new_doc_file:
+                        st.error("Choose a file first.")
+                    else:
+                        conn=get_conn()
+                        conn.execute("""INSERT INTO employee_documents(emp_id,doc_type,doc_name,doc_data,notes,uploaded_by,uploaded_at)
+                            VALUES(?,?,?,?,?,?,?)""",
+                            (eid2,new_doc_type,new_doc_file.name,new_doc_file.getvalue(),new_doc_notes,
+                             st.session_state.full_name or st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                        conn.commit(); conn.close()
+                        st.success(f"{new_doc_type} uploaded and added to permanent history."); st.rerun()
+
+            conn=get_conn()
+            doc_hist=pg_read_sql("""SELECT id,doc_type,doc_name,notes,uploaded_by,uploaded_at
+                FROM employee_documents WHERE emp_id=? ORDER BY uploaded_at DESC""",conn,params=(eid2,))
+            fine_docs=pg_read_sql("""SELECT id,'Fine Letter — '||COALESCE(fine_type,'Disciplinary') as doc_type,
+                letter_name as doc_name,fine_reason as notes,'' as uploaded_by,issue_date as uploaded_at
+                FROM fine_letters WHERE emp_id=? AND letter_name IS NOT NULL ORDER BY issue_date DESC""",conn,params=(eid2,))
+            leave_docs=pg_read_sql("""SELECT id,leave_type||' Attachment' as doc_type,
+                doc_name,notes,'' as uploaded_by,start_date as uploaded_at
+                FROM leave_records WHERE emp_id=? AND doc_name IS NOT NULL ORDER BY start_date DESC""",conn,params=(eid2,))
+            conn.close()
+
+            st.markdown('<div class="ey" style="margin-top:10px">Full Document Timeline</div>',unsafe_allow_html=True)
+            if len(doc_hist)==0 and len(fine_docs)==0 and len(leave_docs)==0:
+                st.info("No documents uploaded for this employee yet.")
+            else:
+                if len(doc_hist)>0:
+                    st.markdown('<div style="font-size:12px;color:#F0C96B;margin-top:6px">Uploaded Documents</div>',unsafe_allow_html=True)
+                    st.dataframe(doc_hist[["doc_type","doc_name","notes","uploaded_by","uploaded_at"]],use_container_width=True,hide_index=True)
+                    dh_opts={f"ID {row['id']} — {row['doc_type']} ({row['uploaded_at']})":row['id'] for _,row in doc_hist.iterrows()}
+                    dh_sel=st.selectbox("View a document",list(dh_opts.keys()),key=f"dh_sel_{eid2}")
+                    conn=get_conn(); cur=conn.cursor()
+                    cur.execute("SELECT doc_name,doc_data FROM employee_documents WHERE id=?",(dh_opts[dh_sel],))
+                    dhrow=cur.fetchone(); conn.close()
+                    if dhrow and dhrow[1]:
+                        st.markdown(f'<div class="pb">{preview_html(dhrow[1],dhrow[0],"Document")}</div>',unsafe_allow_html=True)
+                        st.download_button("Download",data=bytes(dhrow[1]),file_name=dhrow[0],use_container_width=True,key=f"dh_dl_{eid2}")
+
+                if len(fine_docs)>0:
+                    st.markdown('<div style="font-size:12px;color:#F0C96B;margin-top:14px">Fine / Disciplinary Letters</div>',unsafe_allow_html=True)
+                    st.dataframe(fine_docs[["doc_type","doc_name","notes","uploaded_at"]],use_container_width=True,hide_index=True)
+
+                if len(leave_docs)>0:
+                    st.markdown('<div style="font-size:12px;color:#F0C96B;margin-top:14px">Leave Attachments</div>',unsafe_allow_html=True)
+                    st.dataframe(leave_docs[["doc_type","doc_name","notes","uploaded_at"]],use_container_width=True,hide_index=True)
 
     # ════════════════════════════════════════════════════════
     # SUPERVISOR CONSOLE
@@ -2479,7 +2546,7 @@ with main_block:
                                 sick_leave_days,annual_leave_days,maternity_leave_days,mourning_leave_days,unpaid_leave_days,
                                 absent_days,holiday_days,dayoff_days,gross_salary,net_salary,payment_status,notes,created_at,
                                 full_name,division,cost_center)
-                                VALUES(?,?,?,0,0,0,?,?,?,0,0,0,?,?,?,?,?,?,?,?,?,?,'Processed',?,?,?,?,?)""",
+                                VALUES(?,?,?,0,0,0,?,?,?,0,0,0,?,?,?,?,?,?,?,?,?,?,'Pending Approval',?,?,?,?,?)""",
                                 (sr["Employee ID"],month_str,sr["Basic Salary"],sr["Income Tax"],sr["Pension (7%)"],
                                  sr["Basic Salary"]*0.11,
                                  next((s["Sick (S)"] for s in summary_rows if s["Employee ID"]==sr["Employee ID"]),0),
@@ -2495,9 +2562,9 @@ with main_block:
                             saved_count+=1
                         conn.commit(); conn.close()
                         if skipped_count>0:
-                            st.warning(f"Saved {saved_count} new payroll record(s) for {sheet_cc} ({month_str}). Skipped {skipped_count} employee(s) already processed this month — duplicates blocked automatically.")
+                            st.warning(f"Submitted {saved_count} new payroll record(s) for {sheet_cc} ({month_str}) for approval. Skipped {skipped_count} employee(s) already processed this month — duplicates blocked automatically.")
                         else:
-                            st.success(f"Saved {saved_count} payroll records for {sheet_cc} ({month_str}) to history.")
+                            st.success(f"Submitted {saved_count} payroll record(s) for {sheet_cc} ({month_str}) for approval. Go to Payroll Approvals to finalize.")
                 with ec3:
                     print_rows="".join([f'''<tr>
                         <td style="padding:5px 8px;font-size:11px;border:1px solid #ddd">{sr["Employee ID"]}</td>
@@ -2554,7 +2621,7 @@ with main_block:
           <div class="mb mg-red"><div class="ml ml-red">Rejected</div><div class="mv">{len(rejected)}</div></div>
         </div>""",unsafe_allow_html=True)
 
-        pa1,pa2,pa3=st.tabs(["Pending Review","Approved History","Rejected History"])
+        pa1,pa2,pa3,pa4=st.tabs(["Pending Review","Approved History","Rejected History","Bulk Payroll Runs"])
 
         with pa1:
             if len(pending)==0:
@@ -2625,6 +2692,36 @@ with main_block:
                 st.info("No rejected submissions.")
             else:
                 st.dataframe(rejected[['cost_center','division','month','submitted_by','reviewed_by','reviewed_at','review_notes']],use_container_width=True,hide_index=True)
+
+        with pa4:
+            st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">Bulk payroll runs from Payroll → Cost Center Sheet wait here for approval before they count as final. Only Manager or Payroll Section can approve.</div>',unsafe_allow_html=True)
+            if st.session_state.role not in ("Manager","Payroll Section"):
+                st.info("Only Manager or Payroll Section can review bulk payroll runs.")
+            else:
+                conn=get_conn()
+                bulk_pending=pg_read_sql("""SELECT id,emp_id,full_name,division,cost_center,month,basic_salary,
+                    gross_salary,net_salary,income_tax,pension_employee,created_at
+                    FROM payroll WHERE payment_status='Pending Approval' ORDER BY cost_center,month,created_at""",conn)
+                conn.close()
+                if len(bulk_pending)==0:
+                    st.info("No bulk payroll runs waiting for approval.")
+                else:
+                    for (cc_grp,mo_grp),grp in bulk_pending.groupby(['cost_center','month']):
+                        with st.expander(f"{cc_grp} — {mo_grp} — {len(grp)} employee(s) — Net Total ETB {grp['net_salary'].sum():,.2f}"):
+                            st.dataframe(grp[['emp_id','full_name','division','basic_salary','gross_salary','income_tax','pension_employee','net_salary']],use_container_width=True,hide_index=True)
+                            bpc1,bpc2=st.columns(2)
+                            with bpc1:
+                                if st.button(f"Approve All ({len(grp)})",key=f"appr_bulk_{cc_grp}_{mo_grp}",use_container_width=True):
+                                    conn=get_conn()
+                                    conn.execute("UPDATE payroll SET payment_status='Processed' WHERE cost_center=? AND month=? AND payment_status='Pending Approval'",(cc_grp,mo_grp))
+                                    conn.commit(); conn.close()
+                                    st.success(f"Approved payroll for {cc_grp} — {mo_grp}. Now final in payroll history and each employee's profile."); st.rerun()
+                            with bpc2:
+                                if st.button(f"Reject All ({len(grp)})",key=f"rej_bulk_{cc_grp}_{mo_grp}",use_container_width=True):
+                                    conn=get_conn()
+                                    conn.execute("DELETE FROM payroll WHERE cost_center=? AND month=? AND payment_status='Pending Approval'",(cc_grp,mo_grp))
+                                    conn.commit(); conn.close()
+                                    st.warning(f"Rejected and removed payroll run for {cc_grp} — {mo_grp}. It can be regenerated from Cost Center Sheet."); st.rerun()
 
     # ════════════════════════════════════════════════════════
     # LEAVE & DISCIPLINE
@@ -3030,26 +3127,20 @@ with main_block:
     # ════════════════════════════════════════════════════════
     elif V=="Leave Records":
         st.markdown('<div class="tl">Leave Records</div>',unsafe_allow_html=True)
-        st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:12px">Pick a date range, cost center, and leave type to see which employees were absent or on leave.</div>',unsafe_allow_html=True)
+        st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:12px">Select a date range, cost center, and leave type to see which employees were absent or on leave, plus a summary dashboard.</div>',unsafe_allow_html=True)
 
-        lr1,lr2,lr3=st.columns(3)
-        with lr1:
-            range_pick=st.selectbox("Date Range",["Today","This Week","Custom Range"],key="lr_range_pick")
-        with lr2:
+        lr1,lr2,lr3,lr4=st.columns(4)
+        with lr1: lr_from=st.date_input("Start Date",value=date.today()-timedelta(days=7),key="lr_from")
+        with lr2: lr_to=st.date_input("End Date",value=date.today(),key="lr_to")
+        with lr3:
             all_ccs_lr=get_cost_centers()
             cc_opts_lr=["All"]+(all_ccs_lr['code'].tolist() if len(all_ccs_lr)>0 else [])
             lr_cc=st.selectbox("Cost Center",cc_opts_lr,key="lr_cc")
-        with lr3:
-            lr_type=st.selectbox("Leave Type",["All","Absent","Sick Leave","Annual Leave","Maternity Leave","Mourning Leave","Unpaid Leave"],key="lr_type")
+        with lr4:
+            lr_type=st.selectbox("Leave Type",["All","Absent","Sick Leave","Annual Leave","Maternity Leave","Paternity Leave","Mourning Leave","Unpaid Leave","Emergency Leave","Study Leave"],key="lr_type")
 
-        if range_pick=="Today":
-            lr_from=lr_to=date.today()
-        elif range_pick=="This Week":
-            lr_from=date.today()-timedelta(days=date.today().weekday()); lr_to=lr_from+timedelta(days=6)
-        else:
-            crc1,crc2=st.columns(2)
-            with crc1: lr_from=st.date_input("From Date",value=date.today()-timedelta(days=7),key="lr_from")
-            with crc2: lr_to=st.date_input("To Date",value=date.today(),key="lr_to")
+        if lr_from>lr_to:
+            st.error("Start Date must be on or before End Date."); st.stop()
 
         conn=get_conn()
         lv_all=pg_read_sql("""SELECT lr.emp_id,e.full_name,e.division,e.cost_center,lr.leave_type as record_type,
@@ -3073,14 +3164,35 @@ with main_block:
         if len(combined)>0:
             combined=combined[combined.apply(_overlaps,axis=1)]
             if lr_cc!="All": combined=combined[combined['cost_center']==lr_cc]
-            if lr_type!="All": combined=combined[combined['record_type']==lr_type]
+
+        # ── Dashboard: employee counts per leave category for this range (before type filter) ──
+        st.markdown('<div class="ey" style="margin-top:6px">Dashboard — Summary for Selected Period</div>',unsafe_allow_html=True)
+        if len(combined)==0:
+            st.info("No absence/leave records in this period.")
+        else:
+            cat_counts=combined.groupby('record_type')['emp_id'].nunique().to_dict()
+            dash_cats=["Absent","Sick Leave","Annual Leave","Maternity Leave","Paternity Leave","Mourning Leave","Unpaid Leave","Emergency Leave","Study Leave"]
+            dash_html='<div class="mg">'
+            colors=["mg-red","mg-teal","mg-green","mg-amber","mg-purple","mg-cyan","mg-red","mg-amber","mg-teal"]
+            for i,cat in enumerate(dash_cats):
+                cnt=cat_counts.get(cat,0)
+                if cnt==0 and cat not in cat_counts: continue
+                dash_html+=f'<div class="mb {colors[i%len(colors)]}"><div class="ml {colors[i%len(colors)].replace("mg-","ml-")}">Total {cat}</div><div class="mv">{cnt}</div></div>'
+            dash_html+='</div>'
+            st.markdown(dash_html,unsafe_allow_html=True)
+
+        st.markdown("<hr>",unsafe_allow_html=True)
+
+        # ── Detailed record list (leave type filter applies here only) ──
+        detail=combined.copy()
+        if lr_type!="All": detail=detail[detail['record_type']==lr_type]
 
         st.markdown(f'<div style="font-size:12px;color:#94A8C8;margin:6px 0">Showing records from <b style="color:#F0C96B">{lr_from}</b> to <b style="color:#F0C96B">{lr_to}</b>{"" if lr_cc=="All" else f" — Cost Center {lr_cc}"}{"" if lr_type=="All" else f" — {lr_type}"}</div>',unsafe_allow_html=True)
 
-        if len(combined)==0:
+        if len(detail)==0:
             st.info("No matching absence/leave records for this selection.")
         else:
-            display_lr=combined.rename(columns={
+            display_lr=detail.rename(columns={
                 "emp_id":"Employee ID","full_name":"Full Name","division":"Division","cost_center":"Cost Center",
                 "record_type":"Type","start_date":"Start Date","end_date":"End Date","status":"Status"
             })[["Employee ID","Full Name","Division","Cost Center","Type","Start Date","End Date","Status"]].sort_values("Start Date",ascending=False)
@@ -3088,6 +3200,118 @@ with main_block:
             lr_buf=io.BytesIO()
             with pd.ExcelWriter(lr_buf,engine="xlsxwriter") as w: display_lr.to_excel(w,index=False,sheet_name="Leave Records")
             st.download_button("Export to Excel",lr_buf.getvalue(),file_name=f"LeaveRecords_{lr_from}_to_{lr_to}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+
+    # ════════════════════════════════════════════════════════
+    # VACATION — dedicated request + approval flow
+    # ════════════════════════════════════════════════════════
+    elif V=="Vacation":
+        st.markdown('<div class="tl">Vacation</div>',unsafe_allow_html=True)
+        if "vacation_subview" not in st.session_state: st.session_state.vacation_subview="request"
+
+        vsub1,vsub2=st.columns(2)
+        with vsub1:
+            if st.button("📝 Request Vacation",use_container_width=True,type="primary" if st.session_state.vacation_subview=="request" else "secondary"):
+                st.session_state.vacation_subview="request"; st.rerun()
+        with vsub2:
+            if st.button("✅ Vacation Approvals",use_container_width=True,type="primary" if st.session_state.vacation_subview=="approvals" else "secondary"):
+                st.session_state.vacation_subview="approvals"; st.rerun()
+        st.markdown("<hr>",unsafe_allow_html=True)
+
+        if st.session_state.vacation_subview=="request":
+            conn=get_conn()
+            vac_emps=pg_read_sql("SELECT emp_id,full_name,division,annual_leave_entitlement FROM employees WHERE current_status != 'Terminated' ORDER BY full_name",conn)
+            conn.close()
+            if len(vac_emps)==0:
+                st.info("No active employees yet.")
+            else:
+                velo={f"{r['emp_id']} — {r['full_name']}":r for _,r in vac_emps.iterrows()}
+                v_emp_lbl=st.selectbox("Employee",list(velo.keys()),key="vac_emp_sel")
+                v_row=velo[v_emp_lbl]
+                v_eid=v_row['emp_id']
+                v_entitlement=int(v_row['annual_leave_entitlement'] or 20)
+
+                vc1,vc2=st.columns(2)
+                with vc1: v_start=st.date_input("Vacation Start Date",value=date.today(),key="vac_start")
+                with vc2: v_return=st.date_input("Return-to-Work Date",value=date.today()+timedelta(days=1),key="vac_return")
+
+                v_days=max((v_return-v_start).days,0)
+                used_now,remaining_now=get_annual_leave_balance(v_eid,v_start.year,v_entitlement)
+
+                st.markdown(f"""<div class="mg" style="grid-template-columns:repeat(3,1fr);margin-top:10px">
+                  <div class="mb mg-teal"><div class="ml ml-teal">Total Vacation Days</div><div class="mv">{v_days}</div></div>
+                  <div class="mb mg-amber"><div class="ml ml-amber">Already Used ({v_start.year})</div><div class="mv">{used_now}</div></div>
+                  <div class="mb mg-green"><div class="ml ml-green">Remaining Before This Request</div><div class="mv">{remaining_now}</div></div>
+                </div>""",unsafe_allow_html=True)
+
+                v_notes=st.text_area("Notes (optional)",key="vac_notes")
+
+                if v_return<=v_start:
+                    st.warning("Return-to-Work Date must be after the Vacation Start Date.")
+                elif st.button("Save & Send for Approval",use_container_width=True,key="vac_save_btn"):
+                    if used_now+v_days>v_entitlement:
+                        st.error(f"{v_row['full_name']} has already used {used_now} of {v_entitlement} annual leave days for {v_start.year}. This request of {v_days} day(s) would exceed the remaining {remaining_now} day(s). Adjust the dates or update their entitlement in Employee Profile → History.")
+                    else:
+                        conn=get_conn(); cur=conn.cursor()
+                        v_end=v_return-timedelta(days=1)
+                        cur.execute("""SELECT COUNT(*) FROM leave_records WHERE emp_id=? AND status != 'Cancelled'
+                            AND start_date<=? AND end_date>=?""",(v_eid,str(v_end),str(v_start)))
+                        if cur.fetchone()[0]>0:
+                            conn.close()
+                            st.error(f"{v_row['full_name']} already has a leave record overlapping this period.")
+                        else:
+                            cur.execute("SELECT basic_salary FROM employees WHERE emp_id=?",(v_eid,))
+                            sr=cur.fetchone(); dr=float(sr[0])/26 if sr and sr[0] else 0
+                            conn.execute("""INSERT INTO leave_records(emp_id,leave_type,start_date,end_date,days_taken,
+                                is_paid,daily_rate,deduction_amount,approved_by,status,notes,created_at)
+                                VALUES(?,'Annual Leave',?,?,?,1,?,0,?,'Pending Dept Head Approval',?,?)""",
+                                (v_eid,str(v_start),str(v_end),v_days,round(dr,2),
+                                 f"Vacation request by {st.session_state.full_name or st.session_state.uid}",
+                                 v_notes,datetime.now().strftime("%Y-%m-%d")))
+                            conn.commit(); conn.close()
+                            st.cache_data.clear()
+                            st.success(f"Vacation request saved: {v_days} day(s) for {v_row['full_name']}. Sent for approval.")
+                            st.session_state.vacation_subview="approvals"
+                            st.rerun()
+
+        else:  # Vacation Approvals
+            if st.session_state.role not in ("Manager","Department Head"):
+                st.info("Only Department Head or Manager can approve vacation requests.")
+            else:
+                conn=get_conn()
+                pending_vac=pg_read_sql("""SELECT lr.id,lr.emp_id,e.full_name,e.division,e.cost_center,lr.start_date,lr.end_date,
+                    lr.days_taken,lr.approved_by,lr.notes FROM leave_records lr
+                    JOIN employees e ON lr.emp_id=e.emp_id
+                    WHERE lr.leave_type='Annual Leave' AND lr.status='Pending Dept Head Approval'
+                    ORDER BY lr.created_at ASC""",conn)
+                conn.close()
+                st.markdown(f'<div class="mg" style="grid-template-columns:1fr"><div class="mb mg-amber"><div class="ml ml-amber">Pending Vacation Requests</div><div class="mv">{len(pending_vac)}</div></div></div>',unsafe_allow_html=True)
+                if len(pending_vac)==0:
+                    st.info("No vacation requests waiting for approval.")
+                else:
+                    for _,vr in pending_vac.iterrows():
+                        with st.expander(f"{vr['emp_id']} — {vr['full_name']} — {vr['days_taken']} days ({vr['start_date']} to {vr['end_date']})"):
+                            st.markdown(f"""<div style="font-size:12px;color:#94A8C8">
+                              Division: <b style="color:#F0C96B">{vr['division']}</b> &nbsp;|&nbsp;
+                              Cost Center: <b style="color:#F0C96B">{vr['cost_center'] or '—'}</b> &nbsp;|&nbsp;
+                              Requested by: {vr['approved_by']}
+                            </div>
+                            <div style="font-size:12px;color:#C8D8F0;margin-top:6px">Notes: {vr['notes'] or '—'}</div>""",unsafe_allow_html=True)
+                            vac1,vac2=st.columns(2)
+                            with vac1:
+                                if st.button("Approve",key=f"appr_vac_{vr['id']}",use_container_width=True):
+                                    conn=get_conn()
+                                    conn.execute("UPDATE leave_records SET status='Approved',approved_by=? WHERE id=?",
+                                        (f"Dept Head: {st.session_state.uid}",vr['id']))
+                                    conn.commit(); conn.close()
+                                    st.cache_data.clear()
+                                    st.success("Vacation approved — leave balance, profile history, and payroll will reflect it automatically."); st.rerun()
+                            with vac2:
+                                if st.button("Reject",key=f"rej_vac_{vr['id']}",use_container_width=True):
+                                    conn=get_conn()
+                                    conn.execute("UPDATE leave_records SET status='Rejected',approved_by=? WHERE id=?",
+                                        (f"Dept Head: {st.session_state.uid}",vr['id']))
+                                    conn.commit(); conn.close()
+                                    st.warning("Vacation request rejected."); st.rerun()
 
     # ════════════════════════════════════════════════════════
     # PUBLIC HOLIDAYS
