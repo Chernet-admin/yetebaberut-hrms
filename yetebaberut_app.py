@@ -9,19 +9,160 @@ import sys
 import calendar
 import json
 from datetime import datetime, date, timedelta
+import re
 
 import xlsxwriter
+import psycopg2
+import psycopg2.extensions
 
 st.set_page_config(page_title="Yetebaberut GSP — HRMS",layout="wide",initial_sidebar_state="collapsed")
-DB_FILE="yetebaberut_enterprise.db"
+
+# ══════════════════════════════════════════════════════════════════
+# POSTGRES COMPATIBILITY SHIM
+# The rest of this app was written against sqlite3's interface
+# (conn.execute(sql,params) with "?" placeholders, PRAGMA table_info,
+# INSERT OR IGNORE, BLOB columns, sqlite3.IntegrityError, etc).
+# Rather than rewrite every one of the ~150 call sites, this shim wraps
+# a real psycopg2 connection so it behaves like sqlite3 from the rest
+# of the app's point of view — translating syntax differences at the
+# point of execute() instead.
+# ══════════════════════════════════════════════════════════════════
+
+_PRAGMA_TABLE_INFO_RE = re.compile(r"PRAGMA\s+table_info\((\w+)\)", re.IGNORECASE)
+
+def _pg_prepare_sql(sql):
+    # ? -> %s placeholders
+    sql = sql.replace("?", "%s")
+    # BLOB -> BYTEA (schema statements only; harmless elsewhere since
+    # the literal word BLOB never appears in this app's data/queries)
+    sql = re.sub(r"\bBLOB\b", "BYTEA", sql, flags=re.IGNORECASE)
+    # SQLite autoincrement -> Postgres serial
+    sql = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "SERIAL PRIMARY KEY", sql, flags=re.IGNORECASE)
+    # INSERT OR IGNORE -> INSERT ... ON CONFLICT DO NOTHING
+    if re.search(r"INSERT\s+OR\s+IGNORE", sql, flags=re.IGNORECASE):
+        sql = re.sub(r"INSERT\s+OR\s+IGNORE", "INSERT", sql, flags=re.IGNORECASE)
+        sql = sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+    return sql
+
+def _pg_prepare_params(params):
+    if not params: return params
+    out=[]
+    for p in params:
+        if isinstance(p,(bytes,memoryview)):
+            out.append(psycopg2.Binary(bytes(p)))
+        else:
+            out.append(p)
+    return type(params)(out) if not isinstance(params,list) else out
+
+class _PGCursor:
+    def __init__(self, real_cursor, conn_wrapper):
+        self._c=real_cursor
+        self._w=conn_wrapper
+        self._pragma_rows=None
+
+    def execute(self, sql, params=()):
+        m=_PRAGMA_TABLE_INFO_RE.search(sql)
+        if m:
+            table=m.group(1)
+            try:
+                self._c.execute("""SELECT column_name,data_type,is_nullable
+                    FROM information_schema.columns WHERE table_name=%s ORDER BY ordinal_position""",(table,))
+                rows=self._c.fetchall()
+                # Shape like sqlite's PRAGMA table_info: (cid,name,type,notnull,dflt,pk)
+                self._pragma_rows=[(i,r[0],r[1],0 if r[2]=='YES' else 1,None,0) for i,r in enumerate(rows)]
+            except Exception:
+                self._pragma_rows=[]
+            return self
+        if re.match(r"^\s*PRAGMA", sql, flags=re.IGNORECASE):
+            return self  # no-op: PRAGMA journal_mode/synchronous/etc has no Postgres equivalent needed
+        self._pragma_rows=None
+        prepped=_pg_prepare_sql(sql)
+        pparams=_pg_prepare_params(params)
+        try:
+            self._c.execute(prepped, pparams)
+        except psycopg2.errors.UniqueViolation as e:
+            self._w._conn.rollback(); raise sqlite3.IntegrityError(str(e))
+        except psycopg2.errors.NotNullViolation as e:
+            self._w._conn.rollback(); raise sqlite3.IntegrityError(str(e))
+        except psycopg2.errors.ForeignKeyViolation as e:
+            self._w._conn.rollback(); raise sqlite3.IntegrityError(str(e))
+        except psycopg2.IntegrityError as e:
+            self._w._conn.rollback(); raise sqlite3.IntegrityError(str(e))
+        except psycopg2.Error as e:
+            self._w._conn.rollback(); raise sqlite3.OperationalError(str(e))
+        return self
+
+    def executemany(self, sql, params_seq):
+        if re.search(r"INSERT\s+OR\s+IGNORE|INSERT\s+INTO", sql, flags=re.IGNORECASE):
+            prepped=_pg_prepare_sql(sql)
+            try:
+                for p in params_seq:
+                    self._c.execute(prepped,_pg_prepare_params(p))
+            except psycopg2.Error as e:
+                self._w._conn.rollback(); raise sqlite3.OperationalError(str(e))
+            return self
+        prepped=_pg_prepare_sql(sql)
+        try:
+            self._c.executemany(prepped,[_pg_prepare_params(p) for p in params_seq])
+        except psycopg2.Error as e:
+            self._w._conn.rollback(); raise sqlite3.OperationalError(str(e))
+        return self
+
+    def fetchone(self):
+        if self._pragma_rows is not None:
+            return self._pragma_rows.pop(0) if self._pragma_rows else None
+        return self._c.fetchone()
+
+    def fetchall(self):
+        if self._pragma_rows is not None:
+            r=self._pragma_rows; self._pragma_rows=[]; return r
+        return self._c.fetchall()
+
+    @property
+    def description(self): return self._c.description
+    @property
+    def rowcount(self): return self._c.rowcount
+
+class _PGConnWrapper:
+    """Mimics sqlite3.Connection's interface (execute/executemany shortcuts,
+    commit/close/cursor) on top of a real psycopg2 connection."""
+    def __init__(self, real_conn):
+        self._conn=real_conn
+
+    def cursor(self):
+        return _PGCursor(self._conn.cursor(), self)
+
+    def execute(self, sql, params=()):
+        cur=self.cursor(); cur.execute(sql, params); return cur
+
+    def executemany(self, sql, params_seq):
+        cur=self.cursor(); cur.executemany(sql, params_seq); return cur
+
+    def commit(self): self._conn.commit()
+    def rollback(self): self._conn.rollback()
+    def close(self): self._conn.close()
+
+def pg_read_sql(sql, conn, params=None):
+    """Drop-in replacement for pd.read_sql_query against our Postgres shim
+    (pandas' read_sql_query only special-cases sqlite3.Connection/SQLAlchemy,
+    so a plain wrapped psycopg2 connection needs this instead)."""
+    cur=conn.cursor()
+    cur.execute(sql, params or ())
+    cols=[d[0] for d in cur.description] if cur.description else []
+    rows=cur.fetchall()
+    return pd.DataFrame(rows, columns=cols)
 
 def get_conn():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=-64000")
-    conn.execute("PRAGMA temp_store=MEMORY")
-    return conn
+    real_conn = psycopg2.connect(
+        host=st.secrets["postgres"]["host"],
+        port=st.secrets["postgres"]["port"],
+        dbname=st.secrets["postgres"]["database"],
+        user=st.secrets["postgres"]["user"],
+        password=st.secrets["postgres"]["password"],
+        sslmode="require",
+        connect_timeout=10,
+    )
+    return _PGConnWrapper(real_conn)
 
 @st.cache_data
 def get_holidays(year):
@@ -75,7 +216,7 @@ def init_db():
         "medical_doc_name":"TEXT","medical_doc_data":"BLOB","guarantee_letter_name":"TEXT",
         "guarantee_letter_data":"BLOB","police_clearance_name":"TEXT","police_clearance_data":"BLOB",
         "contract_doc_name":"TEXT","contract_doc_data":"BLOB","first_doc_name":"TEXT","first_doc_data":"BLOB",
-        "department":"TEXT"}
+        "department":"TEXT","annual_leave_entitlement":"INTEGER DEFAULT 20"}
     for col,typ in migrations.items():
         if col not in ex:
             try: c.execute(f"ALTER TABLE employees ADD COLUMN {col} {typ}"); conn.commit()
@@ -86,6 +227,23 @@ def init_db():
         if c.fetchone()[0]>0:
             c.execute("UPDATE employees SET division=department WHERE division IS NULL")
             conn.commit()
+    except: pass
+
+    # ── Repair legacy 'department' column: some databases still carry it
+    # as NOT NULL from an older schema version, which blocks every new
+    # employee insert (division is the real column used everywhere now).
+    try:
+        c.execute("PRAGMA table_info(employees)")
+        dept_info=[col for col in c.fetchall() if col[1]=="department"]
+        if dept_info and dept_info[0][3]==1:  # notnull flag set
+            try:
+                c.execute("ALTER TABLE employees DROP COLUMN department")
+                conn.commit()
+            except Exception:
+                # Older SQLite without DROP COLUMN support: keep the column
+                # but make sure it's never left NULL going forward.
+                c.execute("UPDATE employees SET department=division WHERE department IS NULL")
+                conn.commit()
     except: pass
 
     # ── PERFORMANCE INDEXES (critical for 10,000+ records) ──
@@ -119,7 +277,8 @@ def init_db():
         "fine_days":"INTEGER DEFAULT 0","fine_amount":"REAL DEFAULT 0",
         "sick_leave_days":"INTEGER DEFAULT 0","annual_leave_days":"INTEGER DEFAULT 0",
         "maternity_leave_days":"INTEGER DEFAULT 0","mourning_leave_days":"INTEGER DEFAULT 0",
-        "unpaid_leave_days":"INTEGER DEFAULT 0","pension_employer":"REAL DEFAULT 0"}.items():
+        "unpaid_leave_days":"INTEGER DEFAULT 0","pension_employer":"REAL DEFAULT 0",
+        "full_name":"TEXT","division":"TEXT","cost_center":"TEXT"}.items():
         if pcol not in pcols:
             try: c.execute(f"ALTER TABLE payroll ADD COLUMN {pcol} {ptyp}"); conn.commit()
             except: pass
@@ -171,7 +330,7 @@ def init_db():
         status TEXT DEFAULT 'Approved',notes TEXT,created_at TEXT)""")
     c.execute("PRAGMA table_info(leave_records)")
     lrc=[col[1] for col in c.fetchall()]
-    for lrcol,lrtyp in {"edited_by":"TEXT","edited_at":"TEXT","cancelled_by":"TEXT","cancelled_at":"TEXT","cancel_reason":"TEXT"}.items():
+    for lrcol,lrtyp in {"edited_by":"TEXT","edited_at":"TEXT","cancelled_by":"TEXT","cancelled_at":"TEXT","cancel_reason":"TEXT","doc_name":"TEXT","doc_data":"BLOB"}.items():
         if lrcol not in lrc:
             try: c.execute(f"ALTER TABLE leave_records ADD COLUMN {lrcol} {lrtyp}"); conn.commit()
             except: pass
@@ -276,11 +435,7 @@ def init_db():
 
     conn.commit(); conn.close()
 
-try: init_db()
-except Exception as _e:
-    import os
-    if os.path.exists(DB_FILE): os.remove(DB_FILE)
-    init_db()
+init_db()
 
 # ════════════════════════════════════════════════════════
 # SMART DAY-OFF CALCULATOR
@@ -310,14 +465,14 @@ def count_dayoffs_in_month(weekday_name, year, month):
 @st.cache_data(ttl=20)
 def get_stats():
     conn=get_conn()
-    df=pd.read_sql_query("SELECT current_status,COUNT(*) as c FROM employees GROUP BY current_status",conn)
+    df=pg_read_sql("SELECT current_status,COUNT(*) as c FROM employees GROUP BY current_status",conn)
     conn.close()
     return dict(zip(df['current_status'],df['c']))
 
 @st.cache_data(ttl=20)
 def get_division_list():
     conn=get_conn()
-    df=pd.read_sql_query("SELECT DISTINCT division FROM employees WHERE division IS NOT NULL ORDER BY division",conn)
+    df=pg_read_sql("SELECT DISTINCT division FROM employees WHERE division IS NOT NULL ORDER BY division",conn)
     conn.close()
     base=["Catering","MRO","Appearance","Ramp","Cargo"]
     extra=[d for d in df['division'].tolist() if d not in base]
@@ -327,16 +482,16 @@ def get_division_list():
 def get_cost_centers(division=None):
     conn=get_conn()
     if division and division!="All":
-        df=pd.read_sql_query("SELECT * FROM cost_centers WHERE division=? AND is_active=1 ORDER BY code",conn,params=(division,))
+        df=pg_read_sql("SELECT * FROM cost_centers WHERE division=? AND is_active=1 ORDER BY code",conn,params=(division,))
     else:
-        df=pd.read_sql_query("SELECT * FROM cost_centers WHERE is_active=1 ORDER BY division,code",conn)
+        df=pg_read_sql("SELECT * FROM cost_centers WHERE is_active=1 ORDER BY division,code",conn)
     conn.close()
     return df
 
 @st.cache_data(ttl=20)
 def get_emp_list_cached():
     conn=get_conn()
-    df=pd.read_sql_query("SELECT emp_id,full_name,division,cost_center,current_status FROM employees ORDER BY emp_id LIMIT 5000",conn)
+    df=pg_read_sql("SELECT emp_id,full_name,division,cost_center,current_status FROM employees ORDER BY emp_id LIMIT 5000",conn)
     conn.close(); return df
 
 @st.cache_data(ttl=15)
@@ -348,7 +503,7 @@ def count_records(status_filter,div_filter,cc_filter,search):
     if div_filter and div_filter!="All": q+=" AND division=?"; p.append(div_filter)
     if cc_filter and cc_filter!="All": q+=" AND cost_center=?"; p.append(cc_filter)
     if search: q+=" AND (full_name LIKE ? OR emp_id LIKE ?)"; p.extend([f"%{search}%",f"%{search}%"])
-    total=pd.read_sql_query(q,conn,params=p).iloc[0]['c']; conn.close(); return int(total)
+    total=pg_read_sql(q,conn,params=p).iloc[0]['c']; conn.close(); return int(total)
 
 @st.cache_data(ttl=15)
 def query_records(status_filter,div_filter,cc_filter,search,page=1,page_size=50):
@@ -362,7 +517,7 @@ def query_records(status_filter,div_filter,cc_filter,search,page=1,page_size=50)
     if search: q+=" AND (full_name LIKE ? OR emp_id LIKE ?)"; p.extend([f"%{search}%",f"%{search}%"])
     offset = max(page-1,0)*page_size
     q+=" ORDER BY emp_id LIMIT ? OFFSET ?"; p.extend([page_size,offset])
-    df=pd.read_sql_query(q,conn,params=p); conn.close()
+    df=pg_read_sql(q,conn,params=p); conn.close()
     # Replace database NULLs with a clean placeholder instead of showing literal "None"
     df = df.fillna("—")
     for col in df.columns:
@@ -380,7 +535,7 @@ def get_employee(eid):
 def get_active_employee_payroll_summary():
     """All active employees (incl. on leave types) with their current month financial summary."""
     conn=get_conn()
-    df=pd.read_sql_query("""SELECT emp_id,full_name,division,cost_center,basic_salary,current_status
+    df=pg_read_sql("""SELECT emp_id,full_name,division,cost_center,basic_salary,current_status
         FROM employees WHERE current_status != 'Terminated' ORDER BY emp_id LIMIT 5000""",conn)
     conn.close(); return df
 
@@ -421,6 +576,16 @@ def calc_pay(basic,transport,housing,other,fine,unpaid,absent,extra):
 def b64file(data,name):
     if not data or not name: return None,None
     return base64.b64encode(bytes(data)).decode(), name.split(".")[-1].lower()
+
+def get_annual_leave_balance(emp_id, year, entitlement):
+    """Returns (used_days, remaining_days) of Annual Leave for emp_id in the given year."""
+    conn=get_conn()
+    used=pg_read_sql("""SELECT COALESCE(SUM(days_taken),0) as used FROM leave_records
+        WHERE emp_id=? AND leave_type='Annual Leave' AND status != 'Cancelled'
+        AND start_date LIKE ?""",conn,params=(emp_id,f"{year}%"))
+    conn.close()
+    used_days=int(used.iloc[0]['used']) if len(used)>0 else 0
+    return used_days, max(entitlement-used_days,0)
 
 def preview_html(data,name,label="Document"):
     if not data or not name:
@@ -514,63 +679,24 @@ def export_excel(df):
 # SEED DATA — Professional sample dataset (only runs once)
 # ════════════════════════════════════════════════════════
 def seed_if_empty():
+    # NOTE: this no longer generates random sample employees — the employee
+    # table starts empty so real staff can be entered via Applicant Intake.
+    # It seeds the default division/cost-center reference rows ONLY the very
+    # first time (when cost_centers is completely empty). Without this guard
+    # it would re-run on every page click and silently recreate any cost
+    # center a Manager deletes.
     conn=get_conn(); c=conn.cursor()
-    c.execute("SELECT COUNT(*) FROM employees")
+    c.execute("SELECT COUNT(*) FROM cost_centers")
     if c.fetchone()[0]>0:
         conn.close(); return
-    F=["Abebe","Chaltu","Almaz","Yohannes","Bekele","Makeda","Tariku","Saba","Dawit","Fatuma","Selam","Elias","Hana","Tigist"]
-    FA=["Kebede","Chala","Tadesse","Tekle","Bogale","Mengistu","Assefa","Haile","Gezahagn","Zewdu"]
-    G=["Balcha","Tafa","Alemu","Desta","Kassa","Fikru","Tolossa","Girma","Woldemariam"]
-    DIVS=["Catering","MRO","Appearance","Ramp","Cargo"]
+    now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     CC_MAP={"Catering":["CC-CAT-01","CC-CAT-02"],"MRO":["CC-MRO-01","CC-MRO-02"],
             "Appearance":["CC-APP-01"],"Ramp":["CC-RMP-01","CC-RMP-02"],"Cargo":["CC-CGO-01"]}
-    E=["High School Graduate","TVET Diploma","BSc/BA Degree","MSc/MA Post-Graduate"]
-    J=["Service Agent","Ground Handler","Cargo Operator","Ramp Supervisor","Catering Staff","MRO Technician"]
-    B=["CBE","Awash Bank","Abyssinia Bank","Dashen Bank"]
-    BL=["A+","A-","B+","B-","O+","O-","AB+","AB-"]
-    SC=["Bole","Yeka","Kirkos","Nifas Silk","Akaky Kaliti","Lideta","Gulele","Kolfe"]
-    RL=["Orthodox","Muslim","Protestant","Catholic"]
-    MR=["Single","Married","Divorced","Widowed"]
-    ET=["Permanent","Contract","Temporary"]
-    WD=["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"]
-    dists={"Active Deployment":720,"Pending Screening":200,"Terminated":50,"Pre-Employment Process":20,"On Leave":10}
-    recs,gc=[],1
-    for status,count in dists.items():
-        for _ in range(count):
-            eid=f"YGS-{1000+gc}"; name=f"{random.choice(F)} {random.choice(FA)} {random.choice(G)}"
-            sal=round(random.uniform(4500,18000),2)
-            div=random.choice(DIVS)
-            cc=random.choice(CC_MAP[div])
-            recs.append((eid,name,div,cc,f"+2519{random.randint(10000000,99999999)}",
-                f"{name.split()[0].lower()}{gc}@gsp.local",f"H-No {random.randint(100,999)}",
-                f"Woreda {random.randint(1,12)}",random.choice(SC),f"0{random.randint(1,9)}",
-                f"RES-{random.randint(100000,999999)}","Addis Ababa",random.randint(20,55),
-                random.choice(["Male","Female"]),random.choice(MR),"Ethiopian",random.choice(RL),
-                random.choice(F),f"+2519{random.randint(10000000,99999999)}",random.choice(BL),
-                f"TIN-{random.randint(1000000,9999999)}",f"PEN-{random.randint(100000,999999)}",
-                random.choice(B),f"{random.randint(1000000000,9999999999)}",
-                random.choice(E),"Operational Logistics",str(random.randint(2005,2022)),
-                random.choice(["AAU","AASTU","Hawassa Univ","Mekele Univ"]),
-                status,random.choice(J),random.choice(ET),random.choice(WD),
-                f"2024-{random.randint(1,12):02d}-{random.randint(1,28):02d}",
-                f"2027-{random.randint(1,12):02d}-{random.randint(1,28):02d}",sal,
-                f"2026-05-{random.randint(10,28)}",""))
-            gc+=1
-    c.executemany("""INSERT INTO employees(emp_id,full_name,division,cost_center,contact,email,house_address,woreda,
-        subcity,kebele,resident_id,place_of_birth,age,sex,marital_status,nationality,religion,
-        emergency_contact_name,emergency_contact_phone,blood_type,tin_number,pension_number,
-        bank_name,bank_account,edu_background,field_of_graduate,graduation_year,institution_name,
-        current_status,job_title,employment_type,weekly_dayoff,start_date,contract_end_date,basic_salary,
-        registration_date,notes)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",recs)
-
-    # Seed cost centers
-    now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cc_recs=[]
     for div,ccs in CC_MAP.items():
         for cc in ccs:
-            cc_recs.append((cc,f"{div} Operations — {cc}",div,round(random.uniform(200000,800000),2),f"Primary cost center for {div} division",1,"system",now))
+            cc_recs.append((cc,f"{div} Operations — {cc}",div,0,f"Cost center for {div} division",1,"system",now))
     c.executemany("INSERT OR IGNORE INTO cost_centers(code,name,division,budget,description,is_active,created_by,created_at)VALUES(?,?,?,?,?,?,?,?)",cc_recs)
-
     conn.commit(); conn.close()
 
 seed_if_empty()
@@ -769,17 +895,17 @@ st.markdown("<hr>",unsafe_allow_html=True)
 # has no custom nav_access saved, the role default applies.
 # ════════════════════════════════════════════════════════
 ALL_NAV_VIEWS = ["Home","Applicant Intake","Employee Directory","Employee Profile",
-    "Supervisor Console","Payroll","Payroll Approvals","Leave & Discipline",
+    "Supervisor Console","Payroll","Payroll Approvals","Leave & Discipline","Leave Records",
     "Public Holidays","Cost Centers","Recycle Bin","Administration"]
 
 ROLE_DEFAULT_VIEWS = {
     "Supervisor": ["Home","Supervisor Console","Public Holidays"],
     "Payroll Section": ["Home","Payroll Approvals","Payroll","Employee Directory","Employee Profile","Public Holidays","Cost Centers"],
     "Manager": ["Home","Applicant Intake","Employee Directory","Employee Profile","Payroll",
-        "Payroll Approvals","Leave & Discipline","Public Holidays","Cost Centers","Recycle Bin","Administration"],
+        "Payroll Approvals","Leave & Discipline","Leave Records","Public Holidays","Cost Centers","Recycle Bin","Administration"],
 }
 ROLE_DEFAULT_FALLBACK = ["Home","Applicant Intake","Employee Directory","Employee Profile",
-    "Payroll","Payroll Approvals","Leave & Discipline","Public Holidays","Cost Centers"]
+    "Payroll","Payroll Approvals","Leave & Discipline","Leave Records","Public Holidays","Cost Centers"]
 
 def get_user_nav_views(role, nav_access_json):
     """Returns the ordered list of views this user can see."""
@@ -827,7 +953,7 @@ NAV_GROUPS = [
     ("RECRUITMENT", ["Applicant Intake"]),
     ("WORKFORCE", ["Employee Directory","Employee Profile","Supervisor Console"]),
     ("FINANCE", ["Payroll","Payroll Approvals","Cost Centers"]),
-    ("HR OPERATIONS", ["Leave & Discipline"]),
+    ("HR OPERATIONS", ["Leave & Discipline","Leave Records"]),
     ("REFERENCE", ["Public Holidays"]),
     ("SYSTEM", ["Recycle Bin","Administration"]),
 ]
@@ -939,16 +1065,16 @@ with main_block:
             elif seg_mode=="By Cost Center" and seg_value!="All":
                 base_filter=" AND cost_center=?"; base_param=[seg_value]
 
-            total_in_scope=pd.read_sql_query(f"SELECT COUNT(*) as c FROM employees WHERE current_status='Active Deployment'{base_filter}",conn,params=base_param).iloc[0]['c']
-            on_leave_today=pd.read_sql_query(f"""SELECT COUNT(DISTINCT lr.emp_id) as c FROM leave_records lr
+            total_in_scope=pg_read_sql(f"SELECT COUNT(*) as c FROM employees WHERE current_status='Active Deployment'{base_filter}",conn,params=base_param).iloc[0]['c']
+            on_leave_today=pg_read_sql(f"""SELECT COUNT(DISTINCT lr.emp_id) as c FROM leave_records lr
                 JOIN employees e ON lr.emp_id=e.emp_id
                 WHERE lr.status='Approved' AND lr.start_date<=? AND lr.end_date>=?{base_filter}""",
                 conn,params=[today_str,today_str]+base_param).iloc[0]['c']
-            absent_today=pd.read_sql_query(f"""SELECT COUNT(DISTINCT ar.emp_id) as c FROM absent_records ar
+            absent_today=pg_read_sql(f"""SELECT COUNT(DISTINCT ar.emp_id) as c FROM absent_records ar
                 JOIN employees e ON ar.emp_id=e.emp_id
                 WHERE ar.absent_date=? AND COALESCE(ar.record_status,'Active')='Active'{base_filter}""",
                 conn,params=[today_str]+base_param).iloc[0]['c']
-            dayoff_today=pd.read_sql_query(f"""SELECT COUNT(*) as c FROM employees
+            dayoff_today=pg_read_sql(f"""SELECT COUNT(*) as c FROM employees
                 WHERE current_status='Active Deployment' AND weekly_dayoff=?{base_filter}""",
                 conn,params=[today_weekday]+base_param).iloc[0]['c']
             conn.close()
@@ -1031,23 +1157,28 @@ with main_block:
                         a14,a15=st.columns(2)
                         with a14: ed=st.selectbox("Level",["High School Graduate","TVET Diploma","BSc/BA Degree","MSc/MA Post-Graduate"])
                         with a15: fi=st.text_input("Field of Study")
-                        up=st.file_uploader("Upload Documents (PDF/ZIP/JPG)",type=["pdf","zip","rar","jpg","png"])
+                        up=st.file_uploader("Upload Documents (PDF/ZIP/JPG) — optional",type=["pdf","zip","rar","jpg","png"])
                         if st.form_submit_button("Submit",use_container_width=True):
-                            if not(fn and fa and ph and ri and up): st.error("Fill all mandatory fields.")
+                            if not(fn and fa and ph and ri): st.error("Fill all mandatory fields (First Name, Father Name, Phone, Resident ID).")
                             else:
-                                name=f"{fn} {fa} {gf}".strip(); fb=up.read()
-                                conn=get_conn(); cur=conn.cursor()
-                                cur.execute("SELECT COUNT(*) FROM employees"); cnt=cur.fetchone()[0]
-                                nid=f"YGS-{2000+cnt}"; div=random.choice(["Catering","MRO","Appearance","Ramp","Cargo"])
-                                conn.execute("""INSERT INTO employees(emp_id,full_name,division,contact,email,house_address,
-                                    woreda,subcity,kebele,resident_id,place_of_birth,age,sex,edu_background,field_of_graduate,
-                                    current_status,registration_date,edu_doc_name,edu_doc_data)
-                                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Pending Screening',?,?,?)""",
-                                    (nid,name,div,ph,em,ha,wo,sc,ke,ri,pb,int(ag),sx,ed,fi,
-                                     datetime.now().strftime("%Y-%m-%d"),up.name,sqlite3.Binary(fb)))
-                                conn.commit(); conn.close()
-                                get_emp_list_cached.clear(); get_stats.clear()
-                                st.success(f"Application received! ID: **{nid}**  {div}"); st.balloons()
+                                name=f"{fn} {fa} {gf}".strip()
+                                doc_name = up.name if up else None
+                                doc_data = sqlite3.Binary(up.read()) if up else None
+                                try:
+                                    conn=get_conn(); cur=conn.cursor()
+                                    cur.execute("SELECT COUNT(*) FROM employees"); cnt=cur.fetchone()[0]
+                                    nid=f"YGS-{2000+cnt}"; div=random.choice(["Catering","MRO","Appearance","Ramp","Cargo"])
+                                    conn.execute("""INSERT INTO employees(emp_id,full_name,division,contact,email,house_address,
+                                        woreda,subcity,kebele,resident_id,place_of_birth,age,sex,edu_background,field_of_graduate,
+                                        current_status,registration_date,edu_doc_name,edu_doc_data)
+                                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Pending Screening',?,?,?)""",
+                                        (nid,name,div,ph,em,ha,wo,sc,ke,ri,pb,int(ag),sx,ed,fi,
+                                         datetime.now().strftime("%Y-%m-%d"),doc_name,doc_data))
+                                    conn.commit(); conn.close()
+                                    get_emp_list_cached.clear(); get_stats.clear()
+                                    st.success(f"Application received! ID: **{nid}**  {div}"); st.balloons()
+                                except sqlite3.Error as dberr:
+                                    st.error(f"Could not save application: {dberr}")
                 if st.session_state.get("show_apply"): st.session_state.show_apply=False; apply_dlg()
 
     # ════════════════════════════════════════════════════════
@@ -1079,7 +1210,7 @@ with main_block:
             st.markdown("<hr>",unsafe_allow_html=True)
 
         conn=get_conn()
-        sdf=pd.read_sql_query("SELECT emp_id,full_name,division,contact,age,sex,edu_background,current_status,registration_date FROM employees WHERE current_status='Pending Screening' ORDER BY emp_id",conn)
+        sdf=pg_read_sql("SELECT emp_id,full_name,division,contact,age,sex,edu_background,current_status,registration_date FROM employees WHERE current_status='Pending Screening' ORDER BY emp_id",conn)
         conn.close()
         if len(sdf)==0: st.info("No new applications waiting.")
         else:
@@ -1140,7 +1271,7 @@ with main_block:
                 if xst!="All": xq+=" AND current_status=?"; xp.append(xst)
                 if xdp!="All": xq+=" AND division=?"; xp.append(xdp)
                 if xcc!="All": xq+=" AND cost_center=?"; xp.append(xcc)
-                xdf=pd.read_sql_query(xq,conn,params=xp); conn.close()
+                xdf=pg_read_sql(xq,conn,params=xp); conn.close()
                 st.download_button(f"Download ({len(xdf)} employees)",export_excel(xdf),
                     file_name=f"YGSP_{xst}_{xdp}_{datetime.now().strftime('%Y%m%d')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
@@ -1228,7 +1359,7 @@ with main_block:
                                 conn.commit()
                                 st.cache_data.clear()
                                 st.success(f"Employee {aid} added.")
-                            except sqlite3.IntegrityError: st.error(f"ID {aid} already exists.")
+                            except sqlite3.IntegrityError as ie: st.error(f"Could not add employee {aid}: {ie}")
                             finally: conn.close()
             with t3:
                 if st.session_state.eid:
@@ -1250,6 +1381,9 @@ with main_block:
         st.markdown('<div class="ey">Full Profile</div>',unsafe_allow_html=True)
         st.markdown('<div class="tl">Employee Record & Documents</div>',unsafe_allow_html=True)
         emp_df=get_emp_list_cached()
+        if len(emp_df)==0:
+            st.info("No employees yet. Add one via Applicant Intake or Employee Directory → Add New Employee.")
+            st.stop()
         opts={f"{r['emp_id']} — {r['full_name']} ({r['division']})":r['emp_id'] for _,r in emp_df.iterrows()}
         def_idx=list(opts.values()).index(st.session_state.eid) if st.session_state.eid in list(opts.values()) else 0
         lbl=st.selectbox("Select Employee",list(opts.keys()),index=def_idx)
@@ -1353,7 +1487,7 @@ with main_block:
                 <div><div class="ifl">Bank/Account</div><div class="ifv">{r.get("bank_name","—")} {r.get("bank_account","—")}</div></div>
               </div></div>""",unsafe_allow_html=True)
             conn=get_conn()
-            ph=pd.read_sql_query("SELECT month,COALESCE(gross_salary,basic_salary) as gross_salary,net_salary,COALESCE(fine_amount,0) as fine_amount,COALESCE(absent_days,0) as absent_days,COALESCE(dayoff_days,4) as dayoff_days,COALESCE(holiday_days,0) as holiday_days,payment_status FROM payroll WHERE emp_id=? ORDER BY created_at DESC LIMIT 12",conn,params=(eid2,)); conn.close()
+            ph=pg_read_sql("SELECT month,COALESCE(gross_salary,basic_salary) as gross_salary,net_salary,COALESCE(fine_amount,0) as fine_amount,COALESCE(absent_days,0) as absent_days,COALESCE(dayoff_days,4) as dayoff_days,COALESCE(holiday_days,0) as holiday_days,payment_status FROM payroll WHERE emp_id=? ORDER BY created_at DESC LIMIT 12",conn,params=(eid2,)); conn.close()
             if len(ph)>0:
                 st.markdown('<div class="ey" style="margin-top:10px">Payroll History</div>',unsafe_allow_html=True)
                 st.dataframe(ph,use_container_width=True,hide_index=True)
@@ -1494,17 +1628,86 @@ with main_block:
             else: st.info("Manager role required.")
         with t6:
             st.markdown(f'<div class="card"><div class="fs">Notes</div><div style="color:#C8D8F0;font-size:12px;line-height:1.7;white-space:pre-wrap">{r.get("notes","No notes.") or "No notes."}</div></div>',unsafe_allow_html=True)
+
             conn=get_conn()
-            lv=pd.read_sql_query("SELECT leave_type,start_date,end_date,days_taken,CASE WHEN is_paid=1 THEN 'Paid' ELSE 'Unpaid' END as paid,deduction_amount,status FROM leave_records WHERE emp_id=? ORDER BY created_at DESC",conn,params=(eid2,))
-            fl=pd.read_sql_query("SELECT COALESCE(month,'—') as month,issue_date,COALESCE(fine_type,'Disciplinary') as fine_type,COALESCE(fine_reason,'') as fine_reason,fine_days,fine_amount,applied_to_payroll FROM fine_letters WHERE emp_id=? ORDER BY created_at DESC",conn,params=(eid2,))
-            ab=pd.read_sql_query("SELECT absent_date,reason,CASE WHEN is_excused=1 THEN 'Excused' ELSE 'Unexcused' END as type FROM absent_records WHERE emp_id=? ORDER BY absent_date DESC",conn,params=(eid2,))
+            lv=pg_read_sql("SELECT id,leave_type,start_date,end_date,days_taken,CASE WHEN is_paid=1 THEN 'Paid' ELSE 'Unpaid' END as paid,deduction_amount,status,doc_name FROM leave_records WHERE emp_id=? ORDER BY start_date DESC",conn,params=(eid2,))
+            fl=pg_read_sql("SELECT id,COALESCE(month,'—') as month,issue_date,COALESCE(fine_type,'Disciplinary') as fine_type,COALESCE(fine_reason,'') as fine_reason,fine_days,fine_amount,applied_to_payroll,letter_name FROM fine_letters WHERE emp_id=? ORDER BY issue_date DESC",conn,params=(eid2,))
+            ab=pg_read_sql("SELECT absent_date,reason,CASE WHEN is_excused=1 THEN 'Excused' ELSE 'Unexcused' END as type FROM absent_records WHERE emp_id=? ORDER BY absent_date DESC",conn,params=(eid2,))
             conn.close()
+
+            # ── Yearly totals: vacation used/remaining, sick leave, absences ──
+            st.markdown('<div class="ey" style="margin-top:8px">Yearly Summary</div>',unsafe_allow_html=True)
+            yr_col1,yr_col2,yr_col3=st.columns([1,2,1])
+            with yr_col1:
+                sel_year=st.number_input("Year",min_value=2015,max_value=2100,value=date.today().year,step=1,key=f"hist_year_{eid2}")
+            with yr_col2:
+                default_entitlement=int(r.get('annual_leave_entitlement') or 20)
+                annual_entitlement=st.number_input("Annual Leave Entitlement (days/year)",min_value=0,value=default_entitlement,step=1,key=f"hist_entitlement_{eid2}",help="Adjust to match this employee's contractual vacation entitlement, then click Save.")
+            with yr_col3:
+                st.markdown("<div style='height:28px'></div>",unsafe_allow_html=True)
+                if st.button("Save Entitlement",key=f"save_entitlement_{eid2}",use_container_width=True):
+                    conn=get_conn()
+                    conn.execute("UPDATE employees SET annual_leave_entitlement=? WHERE emp_id=?",(int(annual_entitlement),eid2))
+                    conn.commit(); conn.close()
+                    get_emp_list_cached.clear()
+                    st.success(f"Entitlement saved: {annual_entitlement} days/year.")
+
+            lv_y = lv[lv['start_date'].str.startswith(str(sel_year))] if len(lv)>0 else lv
+            vac_used = int(lv_y[(lv_y['leave_type']=="Annual Leave")&(lv_y['status']!="Cancelled")]['days_taken'].sum()) if len(lv_y)>0 else 0
+            sick_used = int(lv_y[(lv_y['leave_type']=="Sick Leave")&(lv_y['status']!="Cancelled")]['days_taken'].sum()) if len(lv_y)>0 else 0
+            vac_remaining = max(annual_entitlement - vac_used,0)
+            ab_y = ab[ab['absent_date'].str.startswith(str(sel_year))] if len(ab)>0 else ab
+            absent_total = len(ab_y)
+            absent_unexcused = int((ab_y['type']=="Unexcused").sum()) if len(ab_y)>0 else 0
+
+            st.markdown(f"""<div class="mg">
+              <div class="mb mg-teal"><div class="ml ml-teal">Vacation Used ({sel_year})</div><div class="mv">{vac_used}</div></div>
+              <div class="mb mg-green"><div class="ml ml-green">Vacation Remaining</div><div class="mv">{vac_remaining}</div></div>
+              <div class="mb mg-amber"><div class="ml ml-amber">Sick Leave Days ({sel_year})</div><div class="mv">{sick_used}</div></div>
+              <div class="mb mg-red"><div class="ml ml-red">Absences ({sel_year})</div><div class="mv">{absent_total}</div></div>
+            </div>""",unsafe_allow_html=True)
+            st.markdown(f'<div style="font-size:10px;color:#6B7FA3;margin:-8px 0 12px">Of the {absent_total} absences in {sel_year}, {absent_unexcused} were unexcused (deducted). Vacation remaining assumes an entitlement of {annual_entitlement} days for {sel_year} minus any leave already taken.</div>',unsafe_allow_html=True)
+
+            # ── Leave / Sick / Vacation History with attachments ──
+            st.markdown('<div class="ey" style="margin-top:8px">Leave History</div>',unsafe_allow_html=True)
             if len(lv)>0:
-                st.markdown('<div class="ey" style="margin-top:8px">Leave History</div>',unsafe_allow_html=True); st.dataframe(lv,use_container_width=True,hide_index=True)
+                st.dataframe(lv.drop(columns=["id","doc_name"]),use_container_width=True,hide_index=True)
+                lv_docs=lv[lv['doc_name'].notna()]
+                if len(lv_docs)>0:
+                    lvd_opts={f"ID {row['id']} — {row['leave_type']} ({row['start_date']} to {row['end_date']})":row['id'] for _,row in lv_docs.iterrows()}
+                    lvd_sel=st.selectbox("View Attached Leave Document",list(lvd_opts.keys()),key=f"prof_leave_doc_{eid2}")
+                    conn=get_conn(); cur=conn.cursor()
+                    cur.execute("SELECT doc_name,doc_data FROM leave_records WHERE id=?",(lvd_opts[lvd_sel],))
+                    ldrow=cur.fetchone(); conn.close()
+                    if ldrow and ldrow[1]:
+                        st.markdown(f'<div class="pb">{preview_html(ldrow[1],ldrow[0],"Leave Document")}</div>',unsafe_allow_html=True)
+                        st.download_button("Download Leave Document",data=bytes(ldrow[1]),file_name=ldrow[0],use_container_width=True,key=f"prof_leave_dl_{eid2}")
+            else:
+                st.info("No leave records yet.")
+
+            # ── Fine History with attachments ──
+            st.markdown('<div class="ey" style="margin-top:14px">Fine History</div>',unsafe_allow_html=True)
             if len(fl)>0:
-                st.markdown('<div class="ey" style="margin-top:8px">Fine History</div>',unsafe_allow_html=True); st.dataframe(fl,use_container_width=True,hide_index=True)
+                st.dataframe(fl.drop(columns=["id","letter_name"]),use_container_width=True,hide_index=True)
+                fl_docs=fl[fl['letter_name'].notna()]
+                if len(fl_docs)>0:
+                    fld_opts={f"ID {row['id']} — {row['fine_type']} ({row['issue_date']})":row['id'] for _,row in fl_docs.iterrows()}
+                    fld_sel=st.selectbox("View Attached Fine Letter",list(fld_opts.keys()),key=f"prof_fine_doc_{eid2}")
+                    conn=get_conn(); cur=conn.cursor()
+                    cur.execute("SELECT letter_name,letter_data FROM fine_letters WHERE id=?",(fld_opts[fld_sel],))
+                    fdrow=cur.fetchone(); conn.close()
+                    if fdrow and fdrow[1]:
+                        st.markdown(f'<div class="pb">{preview_html(fdrow[1],fdrow[0],"Fine Letter")}</div>',unsafe_allow_html=True)
+                        st.download_button("Download Fine Letter",data=bytes(fdrow[1]),file_name=fdrow[0],use_container_width=True,key=f"prof_fine_dl_{eid2}")
+            else:
+                st.info("No fine letters yet.")
+
+            # ── Absent Records ──
+            st.markdown('<div class="ey" style="margin-top:14px">Absent Records</div>',unsafe_allow_html=True)
             if len(ab)>0:
-                st.markdown('<div class="ey" style="margin-top:8px">Absent Records</div>',unsafe_allow_html=True); st.dataframe(ab,use_container_width=True,hide_index=True)
+                st.dataframe(ab,use_container_width=True,hide_index=True)
+            else:
+                st.info("No absence records yet.")
 
 
     # ════════════════════════════════════════════════════════
@@ -1529,7 +1732,7 @@ with main_block:
         st.markdown(f'<div class="card card-gold">Supervising division: <b style="color:#F0C96B">{my_division}</b></div>',unsafe_allow_html=True)
 
         conn=get_conn()
-        my_emps=pd.read_sql_query(
+        my_emps=pg_read_sql(
             "SELECT emp_id,full_name,job_title,cost_center,weekly_dayoff,basic_salary,current_status FROM employees WHERE division=? AND current_status != 'Terminated' ORDER BY emp_id",
             conn, params=(my_division,))
         conn.close()
@@ -1574,7 +1777,7 @@ with main_block:
                             conn.commit(); conn.close()
                             st.success(f"Absence recorded for {ab_date}"); st.rerun()
                 conn=get_conn()
-                div_absences=pd.read_sql_query("""SELECT ar.emp_id,e.full_name,ar.absent_date,ar.reason,
+                div_absences=pg_read_sql("""SELECT ar.emp_id,e.full_name,ar.absent_date,ar.reason,
                     CASE WHEN ar.is_excused=1 THEN 'Excused' ELSE 'Unexcused' END as type
                     FROM absent_records ar JOIN employees e ON ar.emp_id=e.emp_id
                     WHERE e.division=? ORDER BY ar.absent_date DESC LIMIT 100""",conn,params=(my_division,))
@@ -1609,9 +1812,17 @@ with main_block:
                             conn.close()
                             st.error(f"{l_emp} already has a leave record overlapping {l_start} to {l_end}.")
                             st.stop()
-                        cur.execute("SELECT basic_salary FROM employees WHERE emp_id=?",(l_eid,))
+                        cur.execute("SELECT basic_salary,annual_leave_entitlement FROM employees WHERE emp_id=?",(l_eid,))
                         sr=cur.fetchone(); dr=float(sr[0])/26 if sr and sr[0] else 0
+                        entitlement_sup=int(sr[1]) if sr and sr[1] else 20
                         days=max((l_end-l_start).days+1,0)
+                        if l_type=="Annual Leave":
+                            conn.close()
+                            used_so_far_sup,remaining_sup=get_annual_leave_balance(l_eid,l_start.year,entitlement_sup)
+                            if used_so_far_sup+days>entitlement_sup:
+                                st.error(f"{l_emp} has already used {used_so_far_sup} of {entitlement_sup} annual leave days for {l_start.year}. This request of {days} day(s) would exceed the remaining {remaining_sup} day(s).")
+                                st.stop()
+                            conn=get_conn()
                         is_paid=0 if l_type=="Unpaid Leave" else 1
                         ded=0.0 if is_paid else round(dr*days,2)
                         conn.execute("INSERT INTO leave_records(emp_id,leave_type,start_date,end_date,days_taken,is_paid,daily_rate,deduction_amount,approved_by,status,notes,created_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1620,7 +1831,7 @@ with main_block:
                         conn.commit(); conn.close()
                         st.success(f"{l_type} submitted for Department Head approval: {days} days"); st.rerun()
                 conn=get_conn()
-                div_leave=pd.read_sql_query("""SELECT lr.emp_id,e.full_name,lr.leave_type,lr.start_date,lr.end_date,lr.days_taken,lr.status
+                div_leave=pg_read_sql("""SELECT lr.emp_id,e.full_name,lr.leave_type,lr.start_date,lr.end_date,lr.days_taken,lr.status
                     FROM leave_records lr JOIN employees e ON lr.emp_id=e.emp_id
                     WHERE e.division=? ORDER BY lr.created_at DESC LIMIT 100""",conn,params=(my_division,))
                 conn.close()
@@ -1660,7 +1871,7 @@ with main_block:
                         conn.commit(); conn.close()
                         st.success(f"Fine submitted for Department Head approval: {fn_days} days = ETB {fine_amt:,.2f}"); st.rerun()
                 conn=get_conn()
-                div_fines=pd.read_sql_query("""SELECT fl.emp_id,e.full_name,fl.fine_type,fl.fine_days,fl.fine_amount,fl.applied_to_payroll
+                div_fines=pg_read_sql("""SELECT fl.emp_id,e.full_name,fl.fine_type,fl.fine_days,fl.fine_amount,fl.applied_to_payroll
                     FROM fine_letters fl JOIN employees e ON fl.emp_id=e.emp_id
                     WHERE e.division=? ORDER BY fl.created_at DESC LIMIT 100""",conn,params=(my_division,))
                 conn.close()
@@ -1700,8 +1911,8 @@ with main_block:
                 submit_month_str=f"{submit_yr}-{submit_mo:02d}"
 
                 conn=get_conn()
-                cc_emps=pd.read_sql_query("SELECT emp_id,full_name,basic_salary,weekly_dayoff FROM employees WHERE cost_center=? AND current_status != 'Terminated'",conn,params=(submit_cc,))
-                existing_sub=pd.read_sql_query("SELECT * FROM payroll_submissions WHERE cost_center=? AND month=?",conn,params=(submit_cc,submit_month_str))
+                cc_emps=pg_read_sql("SELECT emp_id,full_name,basic_salary,weekly_dayoff FROM employees WHERE cost_center=? AND current_status != 'Terminated'",conn,params=(submit_cc,))
+                existing_sub=pg_read_sql("SELECT * FROM payroll_submissions WHERE cost_center=? AND month=?",conn,params=(submit_cc,submit_month_str))
                 conn.close()
 
                 if len(existing_sub)>0:
@@ -1753,7 +1964,7 @@ with main_block:
         st.markdown('<div class="ey">Human Resources</div>',unsafe_allow_html=True)
         st.markdown('<div class="tl">Payroll Processing System</div>',unsafe_allow_html=True)
         conn=get_conn()
-        el=pd.read_sql_query("SELECT emp_id,full_name,division,cost_center,basic_salary,weekly_dayoff FROM employees WHERE current_status='Active Deployment' ORDER BY emp_id LIMIT 5000",conn); conn.close()
+        el=pg_read_sql("SELECT emp_id,full_name,division,cost_center,basic_salary,weekly_dayoff FROM employees WHERE current_status='Active Deployment' ORDER BY emp_id LIMIT 5000",conn); conn.close()
         if len(el)==0: st.warning("No active employees."); st.stop()
         pt1,pt2,pt3,pt4=st.tabs(["Process Payroll","History","Day-Off Calendar","Cost Center Sheet"])
         with pt1:
@@ -1766,18 +1977,18 @@ with main_block:
                 yr=datetime.now().year
                 pay_month=st.selectbox("Month",[f"{yr}-{m:02d}" for m in range(1,13)]+[f"{yr+1}-{m:02d}" for m in range(1,4)],index=datetime.now().month-1)
             conn=get_conn()
-            er=pd.read_sql_query("SELECT * FROM employees WHERE emp_id=?",conn,params=(seid,))
-            fines_df=pd.read_sql_query("""SELECT id,emp_id,COALESCE(month,'—') as month,issue_date,
+            er=pg_read_sql("SELECT * FROM employees WHERE emp_id=?",conn,params=(seid,))
+            fines_df=pg_read_sql("""SELECT id,emp_id,COALESCE(month,'—') as month,issue_date,
                 COALESCE(fine_type,'Disciplinary') as fine_type,COALESCE(fine_reason,'') as fine_reason,
                 fine_days,fine_amount,letter_name,applied_to_payroll
                 FROM fine_letters WHERE emp_id=? AND applied_to_payroll='No'
                 AND COALESCE(record_status,'Active')='Active'""",conn,params=(seid,))
             # Absences for this month — excluding Cancelled and Compensated records automatically
-            ab_count=pd.read_sql_query("""SELECT COUNT(*) as c FROM absent_records
+            ab_count=pg_read_sql("""SELECT COUNT(*) as c FROM absent_records
                 WHERE emp_id=? AND is_excused=0 AND substr(absent_date,1,7)=?
                 AND COALESCE(record_status,'Active')='Active'""",conn,params=(seid,pay_month)).iloc[0]['c']
             # Leave days for this month — auto-collected from approved leave records, excluding Cancelled
-            leave_this_month=pd.read_sql_query("""SELECT leave_type, SUM(days_taken) as total_days FROM leave_records
+            leave_this_month=pg_read_sql("""SELECT leave_type, SUM(days_taken) as total_days FROM leave_records
                 WHERE emp_id=? AND status IN ('Approved') AND
                 ((substr(start_date,1,7)=?) OR (substr(end_date,1,7)=?))
                 GROUP BY leave_type""",conn,params=(seid,pay_month,pay_month))
@@ -1888,11 +2099,13 @@ with main_block:
                         conn.execute("""INSERT INTO payroll(emp_id,month,basic_salary,transport_allowance,housing_allowance,
                             other_allowance,income_tax,pension_employee,pension_employer,other_deductions,fine_amount,fine_days,
                             sick_leave_days,annual_leave_days,maternity_leave_days,mourning_leave_days,unpaid_leave_days,
-                            absent_days,holiday_days,dayoff_days,gross_salary,net_salary,payment_status,notes,created_at)
-                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Processed',?,?)""",
+                            absent_days,holiday_days,dayoff_days,gross_salary,net_salary,payment_status,notes,created_at,
+                            full_name,division,cost_center)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Processed',?,?,?,?,?)""",
                             (seid,pay_month,base,transport,housing,other_al,tax,pen_emp,pen_er,other_ded,
                              total_fine_amt,total_fine_days,sick_days,annual_days,mat_days,mourning_days,
-                             unpaid_days,absent_input,hol_count,dayoff_count,gross,net,notes_pay,datetime.now().strftime("%Y-%m-%d")))
+                             unpaid_days,absent_input,hol_count,dayoff_count,gross,net,notes_pay,datetime.now().strftime("%Y-%m-%d"),
+                             er.iloc[0]['full_name'] if len(er)>0 else None,er.iloc[0]['division'] if len(er)>0 else None,er.iloc[0]['cost_center'] if len(er)>0 else None))
                         if apply_all and len(fines_df)>0:
                             ids=tuple(fines_df["id"].tolist())
                             if len(ids)==1: conn.execute("UPDATE fine_letters SET applied_to_payroll='Yes' WHERE id=?",(ids[0],))
@@ -1913,7 +2126,11 @@ with main_block:
                 st.markdown(f'<a href="data:text/html;base64,{b64_slip}" download="Payroll_{seid}_{pay_month}.html" target="_blank"><button style="width:100%;background:linear-gradient(135deg,#7B2FBE,#9333EA);color:#fff;border:none;border-radius:8px;padding:10px;font-weight:600;font-size:12px;cursor:pointer"> Print / Download Payroll Statement</button></a>',unsafe_allow_html=True)
         with pt2:
             conn=get_conn()
-            hist=pd.read_sql_query("""SELECT p.emp_id,e.full_name,e.division,p.month,p.basic_salary,
+            hist=pg_read_sql("""SELECT p.id,p.emp_id,
+                COALESCE(p.full_name,e.full_name,'(Deleted Employee)') as full_name,
+                COALESCE(p.division,e.division,'—') as division,
+                COALESCE(p.cost_center,e.cost_center,'—') as cost_center,
+                p.month,p.basic_salary,
                 COALESCE(p.gross_salary,p.basic_salary) as gross_salary,p.net_salary,
                 COALESCE(p.fine_amount,0) as fine_amount,COALESCE(p.absent_days,0) as absent_days,
                 COALESCE(p.holiday_days,0) as holiday_days,COALESCE(p.dayoff_days,4) as dayoff_days,
@@ -1922,16 +2139,30 @@ with main_block:
             conn.close()
             if len(hist)==0: st.info("No payroll records yet.")
             else:
-                hf1,hf2=st.columns(2)
+                hf1,hf2,hf3=st.columns(3)
                 with hf1: hist_month=st.selectbox("Filter by Month",["All"]+sorted(hist['month'].unique().tolist(),reverse=True))
-                with hf2: hist_div=st.selectbox("Filter by Division",["All"]+get_division_list())
+                with hf2: hist_cc=st.selectbox("Filter by Cost Center",["All"]+sorted(hist['cost_center'].unique().tolist()))
+                with hf3: hist_div=st.selectbox("Filter by Division",["All"]+sorted([d for d in hist['division'].unique().tolist() if d and d!="—"]))
                 fhist=hist.copy()
                 if hist_month!="All": fhist=fhist[fhist['month']==hist_month]
+                if hist_cc!="All": fhist=fhist[fhist['cost_center']==hist_cc]
                 if hist_div!="All": fhist=fhist[fhist['division']==hist_div]
+
+                display_df=fhist.rename(columns={
+                    "emp_id":"Employee ID","full_name":"Full Name","division":"Division","cost_center":"Cost Center",
+                    "month":"Month","basic_salary":"Basic Salary","gross_salary":"Gross Salary","net_salary":"Net Salary",
+                    "fine_amount":"Fine (ETB)","absent_days":"Absent Days","holiday_days":"Holiday Days","dayoff_days":"Day-Off Days",
+                    "income_tax":"Income Tax","pension_employee":"Pension (Employee)","payment_status":"Status","created_at":"Processed On"
+                })[["Employee ID","Full Name","Division","Cost Center","Month","Basic Salary","Gross Salary",
+                    "Fine (ETB)","Absent Days","Holiday Days","Day-Off Days","Income Tax","Pension (Employee)",
+                    "Net Salary","Status","Processed On"]]
+
+                st.markdown(f'<div style="font-size:12px;color:#94A8C8;margin-bottom:8px">Showing {len(display_df)} record(s){"" if hist_cc=="All" else f" for cost center {hist_cc}"}{"" if hist_month=="All" else f" — {hist_month}"}</div>',unsafe_allow_html=True)
+
                 hbuf=io.BytesIO()
-                with pd.ExcelWriter(hbuf,engine="xlsxwriter") as w: fhist.to_excel(w,index=False,sheet_name="Payroll")
-                st.download_button("Export Payroll History",hbuf.getvalue(),file_name=f"Payroll_{datetime.now().strftime('%Y%m%d')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                st.dataframe(fhist,use_container_width=True,hide_index=True)
+                with pd.ExcelWriter(hbuf,engine="xlsxwriter") as w: display_df.to_excel(w,index=False,sheet_name="Payroll")
+                st.download_button("Export Payroll History",hbuf.getvalue(),file_name=f"Payroll_History_{datetime.now().strftime('%Y%m%d')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+                st.dataframe(display_df,use_container_width=True,hide_index=True)
                 # Bulk print all
                 if hist_month!="All" and st.button(f"Print All Payslips for {hist_month}",use_container_width=True):
                     st.info(f"Use the individual employee payslip print button in 'Process Payroll' tab for each employee, or export to Excel above for a bulk register.")
@@ -1946,9 +2177,9 @@ with main_block:
                 cal_mo=st.selectbox("Month",list(range(1,13)),index=datetime.now().month-1,format_func=lambda m: calendar.month_name[m],key="cal_mo")
             conn=get_conn()
             if cal_div!="All":
-                cal_emps=pd.read_sql_query("SELECT emp_id,full_name,division,weekly_dayoff FROM employees WHERE current_status='Active Deployment' AND division=? ORDER BY emp_id",conn,params=(cal_div,))
+                cal_emps=pg_read_sql("SELECT emp_id,full_name,division,weekly_dayoff FROM employees WHERE current_status='Active Deployment' AND division=? ORDER BY emp_id",conn,params=(cal_div,))
             else:
-                cal_emps=pd.read_sql_query("SELECT emp_id,full_name,division,weekly_dayoff FROM employees WHERE current_status='Active Deployment' ORDER BY emp_id LIMIT 500",conn)
+                cal_emps=pg_read_sql("SELECT emp_id,full_name,division,weekly_dayoff FROM employees WHERE current_status='Active Deployment' ORDER BY emp_id LIMIT 500",conn)
             conn.close()
             if len(cal_emps)>0:
                 cal_emps['Day-Off Dates This Month']=cal_emps['weekly_dayoff'].apply(
@@ -2021,8 +2252,8 @@ with main_block:
                 sheet_mo=st.selectbox("Month",list(range(1,13)),index=datetime.now().month-1,format_func=lambda m: calendar.month_name[m],key="sheet_mo")
 
             conn=get_conn()
-            cc_info=pd.read_sql_query("SELECT * FROM cost_centers WHERE code=?",conn,params=(sheet_cc,))
-            sheet_emps=pd.read_sql_query(
+            cc_info=pg_read_sql("SELECT * FROM cost_centers WHERE code=?",conn,params=(sheet_cc,))
+            sheet_emps=pg_read_sql(
                 "SELECT emp_id,full_name,job_title,weekly_dayoff,basic_salary FROM employees WHERE cost_center=? AND current_status != 'Terminated' ORDER BY emp_id",
                 conn, params=(sheet_cc,))
             cc_division = cc_info.iloc[0]['division'] if len(cc_info)>0 else None
@@ -2041,11 +2272,11 @@ with main_block:
 
                 conn=get_conn()
                 if len(emp_ids_tuple)==1:
-                    leave_df=pd.read_sql_query("SELECT emp_id,leave_type,start_date,end_date FROM leave_records WHERE emp_id=? AND status='Approved'",conn,params=(emp_ids_tuple[0],))
-                    absent_df=pd.read_sql_query("SELECT emp_id,absent_date FROM absent_records WHERE emp_id=? AND is_excused=0 AND COALESCE(record_status,'Active')='Active'",conn,params=(emp_ids_tuple[0],))
+                    leave_df=pg_read_sql("SELECT emp_id,leave_type,start_date,end_date FROM leave_records WHERE emp_id=? AND status='Approved'",conn,params=(emp_ids_tuple[0],))
+                    absent_df=pg_read_sql("SELECT emp_id,absent_date FROM absent_records WHERE emp_id=? AND is_excused=0 AND COALESCE(record_status,'Active')='Active'",conn,params=(emp_ids_tuple[0],))
                 else:
-                    leave_df=pd.read_sql_query(f"SELECT emp_id,leave_type,start_date,end_date FROM leave_records WHERE emp_id IN {emp_ids_tuple} AND status='Approved'",conn)
-                    absent_df=pd.read_sql_query(f"SELECT emp_id,absent_date FROM absent_records WHERE emp_id IN {emp_ids_tuple} AND is_excused=0 AND COALESCE(record_status,'Active')='Active'",conn)
+                    leave_df=pg_read_sql(f"SELECT emp_id,leave_type,start_date,end_date FROM leave_records WHERE emp_id IN {emp_ids_tuple} AND status='Approved'",conn)
+                    absent_df=pg_read_sql(f"SELECT emp_id,absent_date FROM absent_records WHERE emp_id IN {emp_ids_tuple} AND is_excused=0 AND COALESCE(record_status,'Active')='Active'",conn)
                 conn.close()
 
                 leave_lookup={}
@@ -2106,6 +2337,7 @@ with main_block:
                     <tbody>{"".join(rows_html)}</tbody>
                   </table>
                 </div>'''
+                st.markdown('<div class="fs" style="font-size:16px">📋 Employee Attendance</div>',unsafe_allow_html=True)
                 st.markdown(sheet_html, unsafe_allow_html=True)
 
                 # ── Legend ──
@@ -2115,7 +2347,38 @@ with main_block:
                 legend_html+='</div>'
                 st.markdown(legend_html, unsafe_allow_html=True)
 
+                # ── Attendance-only export & print ──
+                att_only_rows=[]
+                for _,emp in sheet_emps.iterrows():
+                    row_d={"EMP ID":emp['emp_id'],"NAME":emp['full_name']}
+                    for dt in month_dates:
+                        row_d[dt.strftime("%d %a")]=build_attendance_code(emp['emp_id'],dt,emp['weekly_dayoff'] or "Sunday",holidays_dict,leave_lookup,absent_lookup)
+                    att_only_rows.append(row_d)
+                att_only_df=pd.DataFrame(att_only_rows)
+                att_buf=io.BytesIO()
+                with pd.ExcelWriter(att_buf,engine="xlsxwriter") as w: att_only_df.to_excel(w,index=False,sheet_name="Attendance")
+                atc1,atc2=st.columns(2)
+                with atc1:
+                    st.download_button("Export Employee Attendance to Excel",att_buf.getvalue(),file_name=f"{sheet_cc}_{month_str}_Attendance.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,key="att_export_only")
+                with atc2:
+                    att_print_html=f'''<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
+                    body{{font-family:Arial,sans-serif;margin:0;padding:16px;color:#000}}
+                    h2{{text-align:center;margin-bottom:2px}}
+                    .sub{{text-align:center;color:#666;font-size:11px;margin-bottom:12px}}
+                    table{{border-collapse:collapse;width:100%;font-size:9px}}
+                    th,td{{border:1px solid #ccc;padding:3px;text-align:center}}
+                    th{{background:#0D1526;color:#D4A847}}
+                    @media print{{body{{margin:0}}}}
+                    </style></head><body>
+                    <h2>YETEBABERUT GENERAL SERVICE PROVIDER</h2>
+                    <div class="sub">Employee Attendance — Cost Center: {sheet_cc} — {month_str}</div>
+                    {sheet_html}
+                    <script>window.onload=function(){{window.print();}}</script>
+                    </body></html>'''
+                    st.download_button("🖨 Print Employee Attendance",att_print_html.encode(),file_name=f"{sheet_cc}_{month_str}_Attendance_Print.html",mime="text/html",use_container_width=True,key="att_print_only")
+
                 st.markdown("<hr>",unsafe_allow_html=True)
+                st.markdown('<div class="fs" style="font-size:16px">💰 Employee Payment</div>',unsafe_allow_html=True)
 
                 # Summary data kept for export and net payroll calc, but not displayed here
                 # to avoid duplicating the Payroll History page.
@@ -2145,7 +2408,7 @@ with main_block:
                 st.markdown(f'<div class="ps"><div class="pr"><span class="pl" style="font-size:14px;font-weight:600;color:#E8EEF7">TOTAL NET PAYROLL — {sheet_cc} ({month_str})</span><span class="pn">ETB {total_net:,.2f}</span></div></div>',unsafe_allow_html=True)
 
                 st.markdown("<hr>",unsafe_allow_html=True)
-                st.markdown('<div class="fs">Export, Save, and Print</div>',unsafe_allow_html=True)
+                st.markdown('<div class="fs">Employee Payment — Export, Save, and Print</div>',unsafe_allow_html=True)
 
                 # Build Excel bytes immediately — do not wrap in a column or button click
                 xbuf=io.BytesIO()
@@ -2197,7 +2460,7 @@ with main_block:
                 ec1,ec2,ec3=st.columns(3)
                 with ec1:
                     st.download_button(
-                        "Export Attendance & Payroll to Excel",
+                        "Export Combined Attendance + Payment (Excel)",
                         data=xbuf_val,
                         file_name=f"{sheet_cc}_{month_str}_AttendancePayroll.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2214,8 +2477,9 @@ with main_block:
                             conn.execute("""INSERT INTO payroll(emp_id,month,basic_salary,transport_allowance,housing_allowance,
                                 other_allowance,income_tax,pension_employee,pension_employer,other_deductions,fine_amount,fine_days,
                                 sick_leave_days,annual_leave_days,maternity_leave_days,mourning_leave_days,unpaid_leave_days,
-                                absent_days,holiday_days,dayoff_days,gross_salary,net_salary,payment_status,notes,created_at)
-                                VALUES(?,?,?,0,0,0,?,?,?,0,0,0,?,?,?,?,?,?,?,?,?,?,'Processed',?,?)""",
+                                absent_days,holiday_days,dayoff_days,gross_salary,net_salary,payment_status,notes,created_at,
+                                full_name,division,cost_center)
+                                VALUES(?,?,?,0,0,0,?,?,?,0,0,0,?,?,?,?,?,?,?,?,?,?,'Processed',?,?,?,?,?)""",
                                 (sr["Employee ID"],month_str,sr["Basic Salary"],sr["Income Tax"],sr["Pension (7%)"],
                                  sr["Basic Salary"]*0.11,
                                  next((s["Sick (S)"] for s in summary_rows if s["Employee ID"]==sr["Employee ID"]),0),
@@ -2226,7 +2490,8 @@ with main_block:
                                  next((s["Holiday (H)"] for s in summary_rows if s["Employee ID"]==sr["Employee ID"]),0),
                                  next((s["Day Off (D)"] for s in summary_rows if s["Employee ID"]==sr["Employee ID"]),0),
                                  sr["Basic Salary"],sr["Net Salary"],
-                                 f"Bulk cost center sheet — {sheet_cc}",datetime.now().strftime("%Y-%m-%d")))
+                                 f"Bulk cost center sheet — {sheet_cc}",datetime.now().strftime("%Y-%m-%d"),
+                                 sr["Full Name"],cc_division,sheet_cc))
                             saved_count+=1
                         conn.commit(); conn.close()
                         if skipped_count>0:
@@ -2278,9 +2543,9 @@ with main_block:
           </div></div>""",unsafe_allow_html=True)
 
         conn=get_conn()
-        pending=pd.read_sql_query("SELECT * FROM payroll_submissions WHERE status='Pending Approval' ORDER BY submitted_at ASC",conn)
-        approved=pd.read_sql_query("SELECT * FROM payroll_submissions WHERE status='Approved' ORDER BY reviewed_at DESC LIMIT 200",conn)
-        rejected=pd.read_sql_query("SELECT * FROM payroll_submissions WHERE status='Rejected' ORDER BY reviewed_at DESC LIMIT 200",conn)
+        pending=pg_read_sql("SELECT * FROM payroll_submissions WHERE status='Pending Approval' ORDER BY submitted_at ASC",conn)
+        approved=pg_read_sql("SELECT * FROM payroll_submissions WHERE status='Approved' ORDER BY reviewed_at DESC LIMIT 200",conn)
+        rejected=pg_read_sql("SELECT * FROM payroll_submissions WHERE status='Rejected' ORDER BY reviewed_at DESC LIMIT 200",conn)
         conn.close()
 
         st.markdown(f"""<div class="mg" style="grid-template-columns:repeat(3,1fr)">
@@ -2304,7 +2569,7 @@ with main_block:
                         </div>""",unsafe_allow_html=True)
 
                         conn=get_conn()
-                        review_emps=pd.read_sql_query(
+                        review_emps=pg_read_sql(
                             "SELECT emp_id,full_name,job_title,basic_salary,weekly_dayoff,current_status FROM employees WHERE cost_center=?",
                             conn,params=(sub['cost_center'],))
                         conn.close()
@@ -2322,11 +2587,13 @@ with main_block:
                                     conn.execute("""INSERT INTO payroll(emp_id,month,basic_salary,transport_allowance,housing_allowance,
                                         other_allowance,income_tax,pension_employee,pension_employer,other_deductions,fine_amount,fine_days,
                                         sick_leave_days,annual_leave_days,maternity_leave_days,mourning_leave_days,unpaid_leave_days,
-                                        absent_days,holiday_days,dayoff_days,gross_salary,net_salary,payment_status,notes,created_at)
-                                        VALUES(?,?,?,0,0,0,?,?,?,0,0,0,0,0,0,0,0,0,0,4,?,?,'Processed',?,?)""",
+                                        absent_days,holiday_days,dayoff_days,gross_salary,net_salary,payment_status,notes,created_at,
+                                        full_name,division,cost_center)
+                                        VALUES(?,?,?,0,0,0,?,?,?,0,0,0,0,0,0,0,0,0,0,4,?,?,'Processed',?,?,?,?,?)""",
                                         (emp['emp_id'],month_str,basic,tax,pen,pen_er,gross,net,
                                          f"Approved via Payroll Approvals workflow — Cost Center {sub['cost_center']}",
-                                         datetime.now().strftime("%Y-%m-%d")))
+                                         datetime.now().strftime("%Y-%m-%d"),
+                                         emp['full_name'],sub['division'],sub['cost_center']))
                                 conn.execute("UPDATE payroll_submissions SET status='Approved',reviewed_by=?,reviewed_at=?,review_notes=? WHERE id=?",
                                     (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),review_notes,sub['id']))
                                 conn.commit(); conn.close()
@@ -2366,8 +2633,11 @@ with main_block:
         st.markdown('<div class="ey">HR Management</div>',unsafe_allow_html=True)
         st.markdown('<div class="tl">Leave Records, Fine Letters & Absences</div>',unsafe_allow_html=True)
         conn=get_conn()
-        emp_opts=pd.read_sql_query("SELECT emp_id,full_name FROM employees WHERE current_status='Active Deployment' ORDER BY emp_id LIMIT 5000",conn); conn.close()
+        emp_opts=pg_read_sql("SELECT emp_id,full_name FROM employees WHERE current_status='Active Deployment' ORDER BY emp_id LIMIT 5000",conn); conn.close()
         elo={f"{r['emp_id']} — {r['full_name']}":r['emp_id'] for _,r in emp_opts.iterrows()}
+        if len(elo)==0:
+            st.info("No active employees yet. Add employees first via Applicant Intake or Employee Directory.")
+            st.stop()
         lf1,lf2,lf3,lf4=st.tabs(["Leave Records","Fine Letters","Absent Records","Pending Dept Head Approval"])
         with lf1:
             st.markdown('<div class="fs">Submit New Leave</div>',unsafe_allow_html=True)
@@ -2384,6 +2654,7 @@ with main_block:
                 l_by = f"{st.session_state.role}: {st.session_state.full_name or st.session_state.uid}"
                 st.markdown(f'<div style="font-size:11px;color:#6B7FA3;margin:-4px 0 8px">Recorded by: <b style="color:#10B981">{l_by}</b></div>',unsafe_allow_html=True)
                 l_notes=st.text_area("Notes",placeholder="Reason...")
+                l_doc=st.file_uploader("Attach Supporting Document (medical certificate, leave application, etc. — optional)",type=["pdf","jpg","jpeg","png"],key="leave_doc_upload")
                 if st.form_submit_button("Save Leave",use_container_width=True):
                     l_eid=elo[l_emp]
                     conn=get_conn(); cur=conn.cursor()
@@ -2395,12 +2666,22 @@ with main_block:
                         conn.close()
                         st.error(f"{l_emp} already has a leave record overlapping {l_start} to {l_end}. Edit the existing record below instead of creating a duplicate.")
                         st.stop()
-                    cur.execute("SELECT basic_salary FROM employees WHERE emp_id=?",(l_eid,))
+                    cur.execute("SELECT basic_salary,annual_leave_entitlement FROM employees WHERE emp_id=?",(l_eid,))
                     sr=cur.fetchone(); dr=float(sr[0])/26 if sr and sr[0] else 0
+                    entitlement=int(sr[1]) if sr and sr[1] else 20
                     days=max((l_end-l_start).days+1,0)
+                    if l_type=="Annual Leave":
+                        conn.close()
+                        used_so_far,remaining=get_annual_leave_balance(l_eid,l_start.year,entitlement)
+                        if used_so_far+days>entitlement:
+                            st.error(f"{l_emp} has already used {used_so_far} of {entitlement} annual leave days for {l_start.year}. This request of {days} day(s) would exceed the remaining {remaining} day(s). Adjust the dates or increase their entitlement in Employee Profile → History.")
+                            st.stop()
+                        conn=get_conn()
                     is_paid=0 if l_type=="Unpaid Leave" else 1; ded=0.0 if is_paid else round(dr*days,2)
-                    conn.execute("INSERT INTO leave_records(emp_id,leave_type,start_date,end_date,days_taken,is_paid,daily_rate,deduction_amount,approved_by,status,notes,created_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (l_eid,l_type,str(l_start),str(l_end),days,is_paid,round(dr,2),ded,l_by,l_status,l_notes,datetime.now().strftime("%Y-%m-%d")))
+                    ldoc_name=l_doc.name if l_doc else None
+                    ldoc_data=l_doc.getvalue() if l_doc else None
+                    conn.execute("INSERT INTO leave_records(emp_id,leave_type,start_date,end_date,days_taken,is_paid,daily_rate,deduction_amount,approved_by,status,notes,created_at,doc_name,doc_data)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (l_eid,l_type,str(l_start),str(l_end),days,is_paid,round(dr,2),ded,l_by,l_status,l_notes,datetime.now().strftime("%Y-%m-%d"),ldoc_name,ldoc_data))
                     conn.commit(); conn.close()
                     if l_type in ["Maternity Leave","Sick Leave"] and days>=7:
                         conn=get_conn(); conn.execute("UPDATE employees SET current_status='On Leave' WHERE emp_id=?",(l_eid,)); conn.commit(); conn.close()
@@ -2411,7 +2692,7 @@ with main_block:
             st.markdown('<div class="fs">Manage Existing Leave Records</div>',unsafe_allow_html=True)
             st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Edit dates, change status, or cancel a leave record. Cancelling removes its effect from payroll.</div>',unsafe_allow_html=True)
             conn=get_conn()
-            lv_full=pd.read_sql_query("""SELECT lr.id,lr.emp_id,e.full_name,e.division,lr.leave_type,lr.start_date,lr.end_date,
+            lv_full=pg_read_sql("""SELECT lr.id,lr.emp_id,e.full_name,e.division,lr.leave_type,lr.start_date,lr.end_date,
                 lr.days_taken,lr.is_paid,lr.deduction_amount,lr.status,lr.approved_by,lr.notes
                 FROM leave_records lr LEFT JOIN employees e ON lr.emp_id=e.emp_id
                 WHERE lr.status != 'Cancelled' ORDER BY lr.created_at DESC LIMIT 500""",conn); conn.close()
@@ -2437,6 +2718,7 @@ with main_block:
                         e_lstatus=st.selectbox("Status",status_opts3,index=status_opts3.index(lv_row['status']) if lv_row['status'] in status_opts3 else 0,key=f"elst_{sel_lv_id}")
                     with el5:
                         e_lnotes=st.text_input("Notes",value=lv_row['notes'] or "",key=f"eln_{sel_lv_id}")
+                    e_ldoc=st.file_uploader("Replace/Attach Supporting Document (optional)",type=["pdf","jpg","jpeg","png"],key=f"eldoc_{sel_lv_id}")
                     elc1,elc2=st.columns(2)
                     with elc1:
                         if st.form_submit_button("Save Changes",use_container_width=True):
@@ -2446,10 +2728,16 @@ with main_block:
                             sr=cur.fetchone(); dr2=float(sr[0])/26 if sr and sr[0] else 0
                             new_is_paid = 0 if e_ltype=="Unpaid Leave" else 1
                             new_ded = 0.0 if new_is_paid else round(dr2*new_days,2)
-                            conn.execute("""UPDATE leave_records SET leave_type=?,start_date=?,end_date=?,days_taken=?,
-                                is_paid=?,deduction_amount=?,status=?,notes=?,edited_by=?,edited_at=? WHERE id=?""",
-                                (e_ltype,str(e_lstart),str(e_lend),new_days,new_is_paid,new_ded,e_lstatus,e_lnotes,
-                                 st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),sel_lv_id))
+                            if e_ldoc is not None:
+                                conn.execute("""UPDATE leave_records SET leave_type=?,start_date=?,end_date=?,days_taken=?,
+                                    is_paid=?,deduction_amount=?,status=?,notes=?,edited_by=?,edited_at=?,doc_name=?,doc_data=? WHERE id=?""",
+                                    (e_ltype,str(e_lstart),str(e_lend),new_days,new_is_paid,new_ded,e_lstatus,e_lnotes,
+                                     st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),e_ldoc.name,e_ldoc.getvalue(),sel_lv_id))
+                            else:
+                                conn.execute("""UPDATE leave_records SET leave_type=?,start_date=?,end_date=?,days_taken=?,
+                                    is_paid=?,deduction_amount=?,status=?,notes=?,edited_by=?,edited_at=? WHERE id=?""",
+                                    (e_ltype,str(e_lstart),str(e_lend),new_days,new_is_paid,new_ded,e_lstatus,e_lnotes,
+                                     st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),sel_lv_id))
                             conn.commit(); conn.close()
                             st.success("Leave record updated."); st.rerun()
                     with elc2:
@@ -2468,7 +2756,7 @@ with main_block:
 
             st.markdown("<hr>",unsafe_allow_html=True)
             conn=get_conn()
-            lv=pd.read_sql_query("""SELECT lr.emp_id,e.full_name,e.division,lr.leave_type,lr.start_date,lr.end_date,lr.days_taken,
+            lv=pg_read_sql("""SELECT lr.emp_id,e.full_name,e.division,lr.leave_type,lr.start_date,lr.end_date,lr.days_taken,
                 CASE WHEN lr.is_paid=1 THEN 'Paid' ELSE 'Unpaid' END as paid,lr.deduction_amount,lr.status
                 FROM leave_records lr LEFT JOIN employees e ON lr.emp_id=e.emp_id ORDER BY lr.created_at DESC LIMIT 1000""",conn); conn.close()
             if len(lv)>0:
@@ -2511,7 +2799,7 @@ with main_block:
             st.markdown('<div class="fs">Manage Fines — Cancel or Compensate</div>',unsafe_allow_html=True)
             st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px"><b>Cancel</b> voids the fine completely (e.g. issued by mistake). <b>Compensate</b> lets the employee work off the fine days instead of having pay deducted.</div>',unsafe_allow_html=True)
             conn=get_conn()
-            fl_manage=pd.read_sql_query("""SELECT fl.id,fl.emp_id,e.full_name,fl.month,fl.fine_type,fl.fine_days,fl.fine_amount,
+            fl_manage=pg_read_sql("""SELECT fl.id,fl.emp_id,e.full_name,fl.month,fl.fine_type,fl.fine_days,fl.fine_amount,
                 COALESCE(fl.record_status,'Active') as record_status,fl.applied_to_payroll,COALESCE(fl.compensated_days,0) as compensated_days
                 FROM fine_letters fl LEFT JOIN employees e ON fl.emp_id=e.emp_id
                 WHERE COALESCE(fl.record_status,'Active') != 'Cancelled' ORDER BY fl.created_at DESC LIMIT 500""",conn); conn.close()
@@ -2557,7 +2845,7 @@ with main_block:
 
             st.markdown("<hr>",unsafe_allow_html=True)
             conn=get_conn()
-            af=pd.read_sql_query("""SELECT fl.id,fl.emp_id,e.full_name,e.division,
+            af=pg_read_sql("""SELECT fl.id,fl.emp_id,e.full_name,e.division,
                 COALESCE(fl.month,'—') as month,fl.issue_date,
                 COALESCE(fl.fine_type,'Disciplinary') as fine_type,
                 COALESCE(fl.fine_reason,'') as fine_reason,
@@ -2612,7 +2900,7 @@ with main_block:
             st.markdown('<div class="fs">Manage Absences — Cancel or Compensate</div>',unsafe_allow_html=True)
             st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px"><b>Cancel</b> removes an absence recorded by mistake. <b>Compensate</b> marks the absent day as worked off, so it stops counting against the employee pay.</div>',unsafe_allow_html=True)
             conn=get_conn()
-            ab_manage=pd.read_sql_query("""SELECT ar.id,ar.emp_id,e.full_name,ar.absent_date,ar.reason,
+            ab_manage=pg_read_sql("""SELECT ar.id,ar.emp_id,e.full_name,ar.absent_date,ar.reason,
                 CASE WHEN ar.is_excused=1 THEN 'Excused' ELSE 'Unexcused' END as type,
                 COALESCE(ar.record_status,'Active') as record_status, COALESCE(ar.is_compensated,0) as is_compensated
                 FROM absent_records ar LEFT JOIN employees e ON ar.emp_id=e.emp_id
@@ -2649,15 +2937,21 @@ with main_block:
 
             st.markdown("<hr>",unsafe_allow_html=True)
             conn=get_conn()
-            aab=pd.read_sql_query("""SELECT ar.emp_id,e.full_name,e.division,ar.absent_date,ar.reason,
+            aab=pg_read_sql("""SELECT ar.emp_id,e.full_name,e.division,ar.absent_date,ar.reason,
                 CASE WHEN ar.is_excused=1 THEN 'Excused' ELSE 'Unexcused' END as type,
                 COALESCE(ar.record_status,'Active') as record_status
                 FROM absent_records ar LEFT JOIN employees e ON ar.emp_id=e.emp_id ORDER BY ar.absent_date DESC LIMIT 1000""",conn); conn.close()
-            if len(aab)>0:
+            show_orphaned_ab=st.checkbox("Show records for deleted employees too",value=False,key="show_orphan_absent")
+            aab_clean=aab if show_orphaned_ab else aab[aab['full_name'].notna()]
+            if show_orphaned_ab:
+                aab_clean=aab_clean.copy()
+                aab_clean['full_name']=aab_clean['full_name'].fillna("(Deleted Employee)")
+                aab_clean['division']=aab_clean['division'].fillna("—")
+            if len(aab_clean)>0:
                 buf5=io.BytesIO()
-                with pd.ExcelWriter(buf5,engine="xlsxwriter") as w: aab.to_excel(w,index=False,sheet_name="Absences")
+                with pd.ExcelWriter(buf5,engine="xlsxwriter") as w: aab_clean.to_excel(w,index=False,sheet_name="Absences")
                 st.download_button("Export",buf5.getvalue(),file_name=f"Absences_{datetime.now().strftime('%Y%m%d')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                st.dataframe(aab,use_container_width=True,hide_index=True)
+                st.dataframe(aab_clean,use_container_width=True,hide_index=True)
             else: st.info("No absent records yet.")
 
         with lf4:
@@ -2666,11 +2960,11 @@ with main_block:
             else:
                 st.markdown('<div style="color:#6B7FA3;font-size:12px;margin-bottom:12px">Leave records and fine letters submitted by Supervisors wait here until reviewed. Approving makes them effective; rejecting sends them back.</div>',unsafe_allow_html=True)
                 conn=get_conn()
-                pending_leave=pd.read_sql_query("""SELECT lr.id,lr.emp_id,e.full_name,e.division,lr.leave_type,lr.start_date,lr.end_date,
+                pending_leave=pg_read_sql("""SELECT lr.id,lr.emp_id,e.full_name,e.division,lr.leave_type,lr.start_date,lr.end_date,
                     lr.days_taken,lr.approved_by,lr.notes FROM leave_records lr
                     JOIN employees e ON lr.emp_id=e.emp_id
                     WHERE lr.status='Pending Dept Head Approval' ORDER BY lr.created_at ASC""",conn)
-                pending_fines=pd.read_sql_query("""SELECT fl.id,fl.emp_id,e.full_name,e.division,fl.fine_type,fl.fine_reason,
+                pending_fines=pg_read_sql("""SELECT fl.id,fl.emp_id,e.full_name,e.division,fl.fine_type,fl.fine_reason,
                     fl.fine_days,fl.fine_amount FROM fine_letters fl
                     JOIN employees e ON fl.emp_id=e.emp_id
                     WHERE fl.applied_to_payroll='Pending Dept Head Approval' ORDER BY fl.created_at ASC""",conn)
@@ -2730,6 +3024,70 @@ with main_block:
                                     conn.execute("UPDATE fine_letters SET applied_to_payroll='Rejected' WHERE id=?",(fn['id'],))
                                     conn.commit(); conn.close()
                                     st.warning("Fine rejected."); st.rerun()
+
+    # ════════════════════════════════════════════════════════
+    # LEAVE RECORDS — reporting view: who is absent/on leave, by date range
+    # ════════════════════════════════════════════════════════
+    elif V=="Leave Records":
+        st.markdown('<div class="tl">Leave Records</div>',unsafe_allow_html=True)
+        st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:12px">Pick a date range, cost center, and leave type to see which employees were absent or on leave.</div>',unsafe_allow_html=True)
+
+        lr1,lr2,lr3=st.columns(3)
+        with lr1:
+            range_pick=st.selectbox("Date Range",["Today","This Week","Custom Range"],key="lr_range_pick")
+        with lr2:
+            all_ccs_lr=get_cost_centers()
+            cc_opts_lr=["All"]+(all_ccs_lr['code'].tolist() if len(all_ccs_lr)>0 else [])
+            lr_cc=st.selectbox("Cost Center",cc_opts_lr,key="lr_cc")
+        with lr3:
+            lr_type=st.selectbox("Leave Type",["All","Absent","Sick Leave","Annual Leave","Maternity Leave","Mourning Leave","Unpaid Leave"],key="lr_type")
+
+        if range_pick=="Today":
+            lr_from=lr_to=date.today()
+        elif range_pick=="This Week":
+            lr_from=date.today()-timedelta(days=date.today().weekday()); lr_to=lr_from+timedelta(days=6)
+        else:
+            crc1,crc2=st.columns(2)
+            with crc1: lr_from=st.date_input("From Date",value=date.today()-timedelta(days=7),key="lr_from")
+            with crc2: lr_to=st.date_input("To Date",value=date.today(),key="lr_to")
+
+        conn=get_conn()
+        lv_all=pg_read_sql("""SELECT lr.emp_id,e.full_name,e.division,e.cost_center,lr.leave_type as record_type,
+            lr.start_date,lr.end_date,lr.status FROM leave_records lr LEFT JOIN employees e ON lr.emp_id=e.emp_id
+            WHERE lr.status != 'Cancelled'""",conn)
+        ab_all=pg_read_sql("""SELECT ar.emp_id,e.full_name,e.division,e.cost_center,'Absent' as record_type,
+            ar.absent_date as start_date,ar.absent_date as end_date,COALESCE(ar.record_status,'Active') as status
+            FROM absent_records ar LEFT JOIN employees e ON ar.emp_id=e.emp_id
+            WHERE COALESCE(ar.record_status,'Active')='Active'""",conn)
+        conn.close()
+        combined=pd.concat([lv_all,ab_all],ignore_index=True)
+        combined=combined[combined['full_name'].notna()]
+
+        def _overlaps(row):
+            try:
+                sd=datetime.strptime(row['start_date'],"%Y-%m-%d").date()
+                ed=datetime.strptime(row['end_date'],"%Y-%m-%d").date()
+                return sd<=lr_to and ed>=lr_from
+            except: return False
+
+        if len(combined)>0:
+            combined=combined[combined.apply(_overlaps,axis=1)]
+            if lr_cc!="All": combined=combined[combined['cost_center']==lr_cc]
+            if lr_type!="All": combined=combined[combined['record_type']==lr_type]
+
+        st.markdown(f'<div style="font-size:12px;color:#94A8C8;margin:6px 0">Showing records from <b style="color:#F0C96B">{lr_from}</b> to <b style="color:#F0C96B">{lr_to}</b>{"" if lr_cc=="All" else f" — Cost Center {lr_cc}"}{"" if lr_type=="All" else f" — {lr_type}"}</div>',unsafe_allow_html=True)
+
+        if len(combined)==0:
+            st.info("No matching absence/leave records for this selection.")
+        else:
+            display_lr=combined.rename(columns={
+                "emp_id":"Employee ID","full_name":"Full Name","division":"Division","cost_center":"Cost Center",
+                "record_type":"Type","start_date":"Start Date","end_date":"End Date","status":"Status"
+            })[["Employee ID","Full Name","Division","Cost Center","Type","Start Date","End Date","Status"]].sort_values("Start Date",ascending=False)
+            st.dataframe(display_lr,use_container_width=True,hide_index=True)
+            lr_buf=io.BytesIO()
+            with pd.ExcelWriter(lr_buf,engine="xlsxwriter") as w: display_lr.to_excel(w,index=False,sheet_name="Leave Records")
+            st.download_button("Export to Excel",lr_buf.getvalue(),file_name=f"LeaveRecords_{lr_from}_to_{lr_to}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
     # ════════════════════════════════════════════════════════
     # PUBLIC HOLIDAYS
@@ -2812,7 +3170,7 @@ with main_block:
         st.markdown('<div class="ey">Financial Structure</div>',unsafe_allow_html=True)
         st.markdown('<div class="tl">Division Cost Centers</div>',unsafe_allow_html=True)
         conn=get_conn()
-        cc_all=pd.read_sql_query("SELECT * FROM cost_centers ORDER BY division,code",conn); conn.close()
+        cc_all=pg_read_sql("SELECT * FROM cost_centers ORDER BY division,code",conn); conn.close()
         st.markdown(f'<div class="card"><span style="color:#D4A847;font-weight:600"> Total Cost Centers:</span> <b style="color:#E8EEF7">{len(cc_all)}</b></div>',unsafe_allow_html=True)
         if len(cc_all)>0:
             for div in cc_all['division'].unique():
@@ -2900,7 +3258,7 @@ with main_block:
           </div></div>""",unsafe_allow_html=True)
 
         conn=get_conn()
-        bin_items=pd.read_sql_query("SELECT * FROM recycle_bin WHERE restored=0 ORDER BY deleted_at DESC LIMIT 300",conn)
+        bin_items=pg_read_sql("SELECT * FROM recycle_bin WHERE restored=0 ORDER BY deleted_at DESC LIMIT 300",conn)
         conn.close()
 
         type_counts = bin_items['record_type'].value_counts().to_dict() if len(bin_items)>0 else {}
@@ -3038,8 +3396,8 @@ with main_block:
         </style>""",unsafe_allow_html=True)
 
         conn=get_conn()
-        total_users=pd.read_sql_query("SELECT COUNT(*) as c FROM system_users",conn).iloc[0]['c']
-        active_users=pd.read_sql_query("SELECT COUNT(*) as c FROM system_users WHERE is_active=1",conn).iloc[0]['c']
+        total_users=pg_read_sql("SELECT COUNT(*) as c FROM system_users",conn).iloc[0]['c']
+        active_users=pg_read_sql("SELECT COUNT(*) as c FROM system_users WHERE is_active=1",conn).iloc[0]['c']
         conn.close()
 
         st.markdown(f"""<div class="admin-hero">
@@ -3099,7 +3457,7 @@ with main_block:
 
         with at1:
             conn=get_conn()
-            all_users_df=pd.read_sql_query(
+            all_users_df=pg_read_sql(
                 "SELECT id,username,full_name,role,permissions,is_active,email,created_by,created_at,last_login,assigned_division FROM system_users ORDER BY created_at DESC",conn)
             conn.close()
             for _,u in all_users_df.iterrows():
@@ -3126,7 +3484,7 @@ with main_block:
             st.markdown("<hr>",unsafe_allow_html=True)
             st.markdown('<div class="fs">Enable / Disable Account</div>',unsafe_allow_html=True)
             conn=get_conn()
-            toggle_df=pd.read_sql_query("SELECT username,full_name,role,is_active FROM system_users WHERE username != ? ORDER BY username",conn,params=(st.session_state.uid,))
+            toggle_df=pg_read_sql("SELECT username,full_name,role,is_active FROM system_users WHERE username != ? ORDER BY username",conn,params=(st.session_state.uid,))
             conn.close()
             if len(toggle_df)>0:
                 tog_opts={f"@{r['username']} — {r['full_name'] or ''} ({r['role']}) [{' Active' if r['is_active'] else ' Disabled'}]":r['username'] for _,r in toggle_df.iterrows()}
@@ -3153,7 +3511,7 @@ with main_block:
                         st.error(f"@{tog_uid} moved to Recycle Bin."); st.rerun()
             st.markdown("<hr>",unsafe_allow_html=True)
             conn=get_conn()
-            exp_u=pd.read_sql_query("SELECT id,username,full_name,role,permissions,is_active,email,created_by,created_at,last_login FROM system_users",conn); conn.close()
+            exp_u=pg_read_sql("SELECT id,username,full_name,role,permissions,is_active,email,created_by,created_at,last_login FROM system_users",conn); conn.close()
             buf_u=io.BytesIO()
             with pd.ExcelWriter(buf_u,engine="xlsxwriter") as w: exp_u.to_excel(w,index=False,sheet_name="Users")
             st.download_button("Export User Registry",buf_u.getvalue(),file_name=f"Users_{datetime.now().strftime('%Y%m%d')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
@@ -3230,7 +3588,7 @@ with main_block:
 
         with at3:
             conn=get_conn()
-            edit_df=pd.read_sql_query("SELECT username,full_name,role,permissions,email,is_active FROM system_users WHERE username != ? ORDER BY username",conn,params=(st.session_state.uid,))
+            edit_df=pg_read_sql("SELECT username,full_name,role,permissions,email,is_active FROM system_users WHERE username != ? ORDER BY username",conn,params=(st.session_state.uid,))
             conn.close()
             if len(edit_df)==0: st.info("No other users to edit.")
             else:
@@ -3300,3 +3658,21 @@ with main_block:
                                     conn.execute("UPDATE system_users SET full_name=?,email=?,role=?,permissions=?,assigned_division=?,nav_access=? WHERE username=?",(e_fullname,e_email,e_role,new_perm2,division_to_save,nav_access_to_save,edit_uid))
                                 conn.commit(); conn.close()
                                 st.success(f"@{edit_uid} updated."); st.rerun()
+
+        # ════════════════════════════════════════════════════════
+        # DANGER ZONE — clear sample/incorrect employee data
+        # ════════════════════════════════════════════════════════
+        st.markdown("<hr>",unsafe_allow_html=True)
+        with st.expander("⚠ Danger Zone — Reset Employee Records"):
+            conn=get_conn()
+            emp_count=pg_read_sql("SELECT COUNT(*) as c FROM employees",conn).iloc[0]['c']
+            conn.close()
+            st.markdown(f'<div style="color:#EF4444;font-size:13px;margin-bottom:10px">This permanently deletes all {emp_count} employee records currently in the system (e.g. leftover sample data). This cannot be undone — use only before entering your real employee list.</div>',unsafe_allow_html=True)
+            confirm_wipe=st.checkbox("I understand this will permanently delete ALL employee records.")
+            if st.button("Delete ALL Employee Records",use_container_width=True,disabled=not confirm_wipe):
+                conn=get_conn()
+                conn.execute("DELETE FROM employees")
+                conn.commit(); conn.close()
+                st.cache_data.clear()
+                st.success("All employee records deleted. You can now add real employees via Applicant Intake.")
+                st.rerun()
