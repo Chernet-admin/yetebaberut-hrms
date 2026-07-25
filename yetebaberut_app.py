@@ -1841,7 +1841,7 @@ with main_block:
         elo_sup={f"{r['emp_id']} — {r['full_name']}":r['emp_id'] for _,r in my_emps.iterrows()}
 
         with sup1:
-            st.markdown('<div style="color:#6B7FA3;font-size:12px;margin-bottom:10px">Record an absence for any employee in your division. Unexcused absences are automatically deducted from salary.</div>',unsafe_allow_html=True)
+            st.markdown('<div style="color:#6B7FA3;font-size:12px;margin-bottom:10px">Record an absence for any employee in your division. This now routes through General Supervisor and HR approval before it becomes final — it no longer saves directly.</div>',unsafe_allow_html=True)
             if len(elo_sup)==0:
                 st.info("No employees currently assigned to your division.")
             else:
@@ -1851,26 +1851,28 @@ with main_block:
                     with a2: ab_date=st.date_input("Date",value=date.today())
                     with a3: ab_type=st.selectbox("Type",["Unexcused (Deducted)","Excused (Not Deducted)"])
                     ab_reason=st.text_input("Reason")
-                    if st.form_submit_button("Record Absence",use_container_width=True):
+                    if st.form_submit_button("Submit for General Supervisor Review",use_container_width=True):
                         ab_eid_sup=elo_sup[ab_emp]
                         conn=get_conn(); cur=conn.cursor()
-                        cur.execute("""SELECT COUNT(*) FROM absent_records WHERE emp_id=? AND absent_date=?
-                            AND COALESCE(record_status,'Active')='Active'""",(ab_eid_sup,str(ab_date)))
+                        cur.execute("""SELECT COUNT(*) FROM daily_status_records WHERE emp_id=? AND start_date<=? AND end_date>=?
+                            AND workflow_stage NOT IN ('Rejected by General Supervisor','Rejected by HR','Returned for Correction')""",(ab_eid_sup,str(ab_date),str(ab_date)))
                         dup_count_sup=cur.fetchone()[0]
                         cur.execute("""SELECT leave_type FROM leave_records WHERE emp_id=? AND status='Approved'
                             AND start_date<=? AND end_date>=?""",(ab_eid_sup,str(ab_date),str(ab_date)))
                         leave_conflict_sup=cur.fetchone()
                         if dup_count_sup>0:
                             conn.close()
-                            st.error(f"{ab_emp} already has an absence recorded for {ab_date}. The system blocks duplicate entries automatically.")
+                            st.error(f"{ab_emp} already has a submitted status record for {ab_date}. The system blocks duplicate entries automatically.")
                         elif leave_conflict_sup:
                             conn.close()
                             st.error(f"{ab_emp} is on approved {leave_conflict_sup[0]} on {ab_date}. An employee already on approved leave cannot also be marked absent for the same date.")
                         else:
-                            conn.execute("INSERT INTO absent_records(emp_id,absent_date,reason,is_excused,record_status,created_at)VALUES(?,?,?,?,'Active',?)",
-                                (ab_eid_sup,str(ab_date),f"Supervisor {st.session_state.full_name or st.session_state.uid}: {ab_reason}",1 if "Excused" in ab_type else 0,datetime.now().strftime("%Y-%m-%d")))
+                            conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
+                                reason,supervisor_id,submitted_at,workflow_stage)
+                                VALUES(?,'Absent',?,?,?,1,?,?,?,'Pending General Supervisor Review')""",
+                                (ab_eid_sup,"Excused" if "Excused" in ab_type else "Unexcused",str(ab_date),str(ab_date),ab_reason,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                             conn.commit(); conn.close()
-                            st.success(f"Absence recorded for {ab_date}"); st.rerun()
+                            st.success(f"Absence for {ab_date} submitted for General Supervisor review."); st.rerun()
                 conn=get_conn()
                 div_absences=pg_read_sql("""SELECT ar.emp_id,e.full_name,ar.absent_date,ar.reason,
                     CASE WHEN ar.is_excused=1 THEN 'Excused' ELSE 'Unexcused' END as type
@@ -1878,7 +1880,7 @@ with main_block:
                     WHERE e.division=? ORDER BY ar.absent_date DESC LIMIT 100""",conn,params=(my_division,))
                 conn.close()
                 if len(div_absences)>0:
-                    st.markdown('<div class="ey" style="margin-top:10px">Recent Absences — Your Division</div>',unsafe_allow_html=True)
+                    st.markdown('<div class="ey" style="margin-top:10px">Recent Absences — Your Division (HR-approved only)</div>',unsafe_allow_html=True)
                     st.dataframe(div_absences,use_container_width=True,hide_index=True)
 
         with sup2:
@@ -1886,7 +1888,7 @@ with main_block:
             if len(elo_sup)==0:
                 st.info("No employees currently assigned to your division.")
             else:
-                st.markdown('<div style="font-size:11px;color:#F59E0B;margin-bottom:8px">Leave records you submit are sent to the Department Head for approval before they take effect on payroll.</div>',unsafe_allow_html=True)
+                st.markdown('<div style="font-size:11px;color:#F59E0B;margin-bottom:8px">Leave records you submit now go through General Supervisor review and HR validation before they take effect on payroll — no leave is final until both stages are complete.</div>',unsafe_allow_html=True)
                 with st.form("sup_leave_form"):
                     l1,l2=st.columns(2)
                     with l1: l_emp=st.selectbox("Employee",list(elo_sup.keys()),key="sup_l_emp")
@@ -1897,41 +1899,42 @@ with main_block:
                     with l4: l_start=st.date_input("Start",value=date.today(),key="sup_l_start")
                     with l5: l_end=st.date_input("End",value=date.today(),key="sup_l_end")
                     l_notes=st.text_area("Notes")
-                    if st.form_submit_button("Submit Leave for Approval",use_container_width=True):
+                    if st.form_submit_button("Submit for General Supervisor Review",use_container_width=True):
                         l_eid=elo_sup[l_emp]
                         conn=get_conn(); cur=conn.cursor()
                         cur.execute("""SELECT COUNT(*) FROM leave_records WHERE emp_id=? AND status != 'Cancelled'
                             AND start_date<=? AND end_date>=?""",(l_eid,str(l_end),str(l_start)))
                         overlap_count_sup=cur.fetchone()[0]
+                        cur.execute("""SELECT COUNT(*) FROM daily_status_records WHERE emp_id=? AND start_date<=? AND end_date>=?
+                            AND workflow_stage NOT IN ('Rejected by General Supervisor','Rejected by HR','Returned for Correction')""",(l_eid,str(l_end),str(l_start)))
+                        overlap_count_sup+=cur.fetchone()[0]
                         if overlap_count_sup>0:
                             conn.close()
-                            st.error(f"{l_emp} already has a leave record overlapping {l_start} to {l_end}.")
+                            st.error(f"{l_emp} already has a leave/status record overlapping {l_start} to {l_end}.")
                             st.stop()
-                        cur.execute("SELECT basic_salary,annual_leave_entitlement FROM employees WHERE emp_id=?",(l_eid,))
-                        sr=cur.fetchone(); dr=float(sr[0])/26 if sr and sr[0] else 0
-                        entitlement_sup=int(sr[1]) if sr and sr[1] else 20
+                        cur.execute("SELECT annual_leave_entitlement FROM employees WHERE emp_id=?",(l_eid,))
+                        sr=cur.fetchone()
+                        entitlement_sup=int(sr[0]) if sr and sr[0] else 20
                         days=max((l_end-l_start).days+1,0)
                         if l_type=="Annual Leave":
-                            conn.close()
                             used_so_far_sup,remaining_sup=get_annual_leave_balance(l_eid,l_start.year,entitlement_sup)
                             if used_so_far_sup+days>entitlement_sup:
+                                conn.close()
                                 st.error(f"{l_emp} has already used {used_so_far_sup} of {entitlement_sup} annual leave days for {l_start.year}. This request of {days} day(s) would exceed the remaining {remaining_sup} day(s).")
                                 st.stop()
-                            conn=get_conn()
-                        is_paid=0 if l_type=="Unpaid Leave" else 1
-                        ded=0.0 if is_paid else round(dr*days,2)
-                        conn.execute("INSERT INTO leave_records(emp_id,leave_type,start_date,end_date,days_taken,is_paid,daily_rate,deduction_amount,approved_by,status,notes,created_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (l_eid,l_type,str(l_start),str(l_end),days,is_paid,round(dr,2),ded,
-                             f"Supervisor: {st.session_state.full_name or st.session_state.uid}","Pending Dept Head Approval",l_notes,datetime.now().strftime("%Y-%m-%d")))
+                        conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
+                            reason,supervisor_id,submitted_at,workflow_stage)
+                            VALUES(?,?,?,?,?,?,?,?,?,'Pending General Supervisor Review')""",
+                            (l_eid,l_type,l_type,str(l_start),str(l_end),days,l_notes,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                         conn.commit(); conn.close()
-                        st.success(f"{l_type} submitted for Department Head approval: {days} days"); st.rerun()
+                        st.success(f"{l_type} submitted for General Supervisor review: {days} days"); st.rerun()
                 conn=get_conn()
                 div_leave=pg_read_sql("""SELECT lr.emp_id,e.full_name,lr.leave_type,lr.start_date,lr.end_date,lr.days_taken,lr.status
                     FROM leave_records lr JOIN employees e ON lr.emp_id=e.emp_id
                     WHERE e.division=? ORDER BY lr.created_at DESC LIMIT 100""",conn,params=(my_division,))
                 conn.close()
                 if len(div_leave)>0:
-                    st.markdown('<div class="ey" style="margin-top:10px">Recent Leave — Your Division</div>',unsafe_allow_html=True)
+                    st.markdown('<div class="ey" style="margin-top:10px">Recent Leave — Your Division (HR-approved only)</div>',unsafe_allow_html=True)
                     st.dataframe(div_leave,use_container_width=True,hide_index=True)
 
         with sup3:
@@ -2395,14 +2398,16 @@ with main_block:
         }
 
         with pt4:
-            st.markdown('<div style="color:#6B7FA3;font-size:12px;margin-bottom:12px">Official monthly attendance and payroll register. Select a cost center and month — every employee in that cost center appears as one row with the full month as columns. All leave, absence, holiday and day-off records are automatically pulled in.</div>',unsafe_allow_html=True)
+            st.markdown('<div style="color:#6B7FA3;font-size:12px;margin-bottom:12px">Official monthly attendance and payroll register. Optionally filter by Division, then pick a cost center and month — every employee in that cost center appears as one row with the full month as columns. Only General Supervisor + HR approved leave, absence, holiday and day-off records are automatically pulled in.</div>',unsafe_allow_html=True)
 
-            sheet_c1,sheet_c2,sheet_c3=st.columns(3)
+            sheet_c0,sheet_c1,sheet_c2,sheet_c3=st.columns(4)
+            with sheet_c0:
+                sheet_div_filter=st.selectbox("Division (optional)",["All Divisions"]+get_division_list(),key="sheet_div_filter")
             with sheet_c1:
-                all_ccs=get_cost_centers()
+                all_ccs=get_cost_centers(sheet_div_filter if sheet_div_filter!="All Divisions" else None)
                 cc_pick_opts = all_ccs['code'].tolist() if len(all_ccs)>0 else []
                 if not cc_pick_opts:
-                    st.warning("No cost centers exist yet. Create one in the Cost Centers module first.")
+                    st.warning("No cost centers match this filter. Create one in the Cost Centers module, or choose a different Division.")
                     st.stop()
                 sheet_cc=st.selectbox("Select Cost Center",cc_pick_opts,key="sheet_cc")
             with sheet_c2:
@@ -2830,52 +2835,51 @@ with main_block:
         lf1,lf2,lf3,lf4=st.tabs(["Leave Records","Fine Letters","Absent Records","Pending Dept Head Approval"])
         with lf1:
             st.markdown('<div class="fs">Submit New Leave</div>',unsafe_allow_html=True)
+            st.markdown('<div style="font-size:11px;color:#F59E0B;margin-bottom:8px">All new leave now routes through General Supervisor review, then HR validation, before it becomes final — it can no longer be saved as directly Approved from here.</div>',unsafe_allow_html=True)
             with st.form("lf"):
-                lc1,lc2,lc3=st.columns(3)
+                lc1,lc2=st.columns(2)
                 with lc1: l_emp=st.selectbox("Employee",list(elo.keys()))
                 with lc2:
                     ltypes=["Sick Leave","Annual Leave","Maternity Leave","Paternity Leave","Mourning Leave","Unpaid Leave","Emergency Leave","Study Leave"]
                     l_type=st.selectbox("Leave Type",ltypes)
-                with lc3: l_status=st.selectbox("Status",["Approved","Pending","Rejected"])
                 lc4,lc5=st.columns(2)
                 with lc4: l_start=st.date_input("Start",value=date.today())
                 with lc5: l_end=st.date_input("End",value=date.today())
-                l_by = f"{st.session_state.role}: {st.session_state.full_name or st.session_state.uid}"
-                st.markdown(f'<div style="font-size:11px;color:#6B7FA3;margin:-4px 0 8px">Recorded by: <b style="color:#10B981">{l_by}</b></div>',unsafe_allow_html=True)
+                l_by = st.session_state.uid
+                st.markdown(f'<div style="font-size:11px;color:#6B7FA3;margin:-4px 0 8px">Submitted by: <b style="color:#10B981">{st.session_state.role}: {st.session_state.full_name or st.session_state.uid}</b></div>',unsafe_allow_html=True)
                 l_notes=st.text_area("Notes",placeholder="Reason...")
                 l_doc=st.file_uploader("Attach Supporting Document (medical certificate, leave application, etc. — optional)",type=["pdf","jpg","jpeg","png"],key="leave_doc_upload")
-                if st.form_submit_button("Save Leave",use_container_width=True):
+                if st.form_submit_button("Submit for General Supervisor Review",use_container_width=True):
                     l_eid=elo[l_emp]
                     conn=get_conn(); cur=conn.cursor()
-                    # Block true duplicates automatically: same employee, overlapping dates, not cancelled.
                     cur.execute("""SELECT COUNT(*) FROM leave_records WHERE emp_id=? AND status != 'Cancelled'
                         AND start_date<=? AND end_date>=?""",(l_eid,str(l_end),str(l_start)))
                     overlap_count=cur.fetchone()[0]
+                    cur.execute("""SELECT COUNT(*) FROM daily_status_records WHERE emp_id=? AND start_date<=? AND end_date>=?
+                        AND workflow_stage NOT IN ('Rejected by General Supervisor','Rejected by HR','Returned for Correction')""",(l_eid,str(l_end),str(l_start)))
+                    overlap_count+=cur.fetchone()[0]
                     if overlap_count>0:
                         conn.close()
-                        st.error(f"{l_emp} already has a leave record overlapping {l_start} to {l_end}. Edit the existing record below instead of creating a duplicate.")
+                        st.error(f"{l_emp} already has a leave/status record overlapping {l_start} to {l_end}.")
                         st.stop()
-                    cur.execute("SELECT basic_salary,annual_leave_entitlement FROM employees WHERE emp_id=?",(l_eid,))
-                    sr=cur.fetchone(); dr=float(sr[0])/26 if sr and sr[0] else 0
-                    entitlement=int(sr[1]) if sr and sr[1] else 20
+                    cur.execute("SELECT annual_leave_entitlement FROM employees WHERE emp_id=?",(l_eid,))
+                    sr=cur.fetchone()
+                    entitlement=int(sr[0]) if sr and sr[0] else 20
                     days=max((l_end-l_start).days+1,0)
                     if l_type=="Annual Leave":
-                        conn.close()
                         used_so_far,remaining=get_annual_leave_balance(l_eid,l_start.year,entitlement)
                         if used_so_far+days>entitlement:
+                            conn.close()
                             st.error(f"{l_emp} has already used {used_so_far} of {entitlement} annual leave days for {l_start.year}. This request of {days} day(s) would exceed the remaining {remaining} day(s). Adjust the dates or increase their entitlement in Employee Profile → History.")
                             st.stop()
-                        conn=get_conn()
-                    is_paid=0 if l_type=="Unpaid Leave" else 1; ded=0.0 if is_paid else round(dr*days,2)
                     ldoc_name=l_doc.name if l_doc else None
                     ldoc_data=l_doc.getvalue() if l_doc else None
-                    conn.execute("INSERT INTO leave_records(emp_id,leave_type,start_date,end_date,days_taken,is_paid,daily_rate,deduction_amount,approved_by,status,notes,created_at,doc_name,doc_data)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (l_eid,l_type,str(l_start),str(l_end),days,is_paid,round(dr,2),ded,l_by,l_status,l_notes,datetime.now().strftime("%Y-%m-%d"),ldoc_name,ldoc_data))
+                    conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
+                        reason,doc_name,doc_data,supervisor_id,submitted_at,workflow_stage)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,'Pending General Supervisor Review')""",
+                        (l_eid,l_type,l_type,str(l_start),str(l_end),days,l_notes,ldoc_name,ldoc_data,l_by,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                     conn.commit(); conn.close()
-                    if l_type in ["Maternity Leave","Sick Leave"] and days>=7:
-                        conn=get_conn(); conn.execute("UPDATE employees SET current_status='On Leave' WHERE emp_id=?",(l_eid,)); conn.commit(); conn.close()
-                        st.cache_data.clear()
-                    st.success(f"{l_type}: {days} days {'(Paid)' if is_paid else f'(Unpaid — ETB {ded:,.2f})'}"); st.rerun()
+                    st.success(f"{l_type}: {days} days submitted for General Supervisor review."); st.rerun()
 
             st.markdown("<hr>",unsafe_allow_html=True)
             st.markdown('<div class="fs">Manage Existing Leave Records</div>',unsafe_allow_html=True)
@@ -3065,31 +3069,35 @@ with main_block:
                 st.dataframe(af.drop(columns=["id","letter_name"]),use_container_width=True,hide_index=True)
         with lf3:
             st.markdown('<div class="fs">Record New Absence</div>',unsafe_allow_html=True)
+            st.markdown('<div style="font-size:11px;color:#F59E0B;margin-bottom:8px">Absences now route through General Supervisor review and HR validation before they count against pay.</div>',unsafe_allow_html=True)
             with st.form("abf"):
                 ab1,ab2,ab3=st.columns(3)
                 with ab1: ab_emp=st.selectbox("Employee",list(elo.keys()))
                 with ab2: ab_date=st.date_input("Absent Date",value=date.today())
                 with ab3: ab_ex=st.selectbox("Type",["Unexcused (Deducted)","Excused (Not Deducted)"])
                 ab_reason=st.text_input("Reason",placeholder="Reason for absence...")
-                if st.form_submit_button("Record Absent",use_container_width=True):
+                if st.form_submit_button("Submit for General Supervisor Review",use_container_width=True):
                     ab_eid_chosen=elo[ab_emp]
                     conn=get_conn(); cur=conn.cursor()
-                    cur.execute("""SELECT COUNT(*) FROM absent_records WHERE emp_id=? AND absent_date=?
-                        AND COALESCE(record_status,'Active')='Active'""",(ab_eid_chosen,str(ab_date)))
+                    cur.execute("""SELECT COUNT(*) FROM daily_status_records WHERE emp_id=? AND start_date<=? AND end_date>=?
+                        AND workflow_stage NOT IN ('Rejected by General Supervisor','Rejected by HR','Returned for Correction')""",(ab_eid_chosen,str(ab_date),str(ab_date)))
                     dup_count=cur.fetchone()[0]
                     cur.execute("""SELECT leave_type FROM leave_records WHERE emp_id=? AND status='Approved'
                         AND start_date<=? AND end_date>=?""",(ab_eid_chosen,str(ab_date),str(ab_date)))
                     leave_conflict=cur.fetchone()
                     if dup_count>0:
                         conn.close()
-                        st.error(f"{ab_emp} already has an absence recorded for {ab_date}. The system blocks duplicate entries automatically — edit or cancel the existing record below instead.")
+                        st.error(f"{ab_emp} already has a submitted status record for {ab_date}. The system blocks duplicate entries automatically.")
                     elif leave_conflict:
                         conn.close()
                         st.error(f"{ab_emp} is on approved {leave_conflict[0]} on {ab_date}. An employee already on approved leave cannot also be marked absent for the same date.")
                     else:
-                        conn.execute("INSERT INTO absent_records(emp_id,absent_date,reason,is_excused,record_status,created_at)VALUES(?,?,?,?,'Active',?)",
-                            (ab_eid_chosen,str(ab_date),ab_reason,1 if "Excused" in ab_ex else 0,datetime.now().strftime("%Y-%m-%d")))
-                        conn.commit(); conn.close(); st.success(f"Absent recorded: {ab_date}"); st.rerun()
+                        conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
+                            reason,supervisor_id,submitted_at,workflow_stage)
+                            VALUES(?,'Absent',?,?,?,1,?,?,?,'Pending General Supervisor Review')""",
+                            (ab_eid_chosen,"Excused" if "Excused" in ab_ex else "Unexcused",str(ab_date),str(ab_date),
+                             ab_reason,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                        conn.commit(); conn.close(); st.success(f"Absence for {ab_date} submitted for General Supervisor review."); st.rerun()
 
             st.markdown("<hr>",unsafe_allow_html=True)
             st.markdown('<div class="fs">Manage Absences — Cancel or Compensate</div>',unsafe_allow_html=True)
@@ -3153,7 +3161,7 @@ with main_block:
             if st.session_state.role not in ("Manager","Department Head"):
                 st.info("Only Department Head or Manager can review and approve submissions here.")
             else:
-                st.markdown('<div style="color:#6B7FA3;font-size:12px;margin-bottom:12px">Leave records and fine letters submitted by Supervisors wait here until reviewed. Approving makes them effective; rejecting sends them back.</div>',unsafe_allow_html=True)
+                st.markdown('<div style="color:#6B7FA3;font-size:12px;margin-bottom:12px">Fine letters submitted by Supervisors wait here until reviewed. New leave requests now route through GS Review → HR Validation instead — this tab only shows older leave requests submitted before that change.</div>',unsafe_allow_html=True)
                 conn=get_conn()
                 pending_leave=pg_read_sql("""SELECT lr.id,lr.emp_id,e.full_name,e.division,lr.leave_type,lr.start_date,lr.end_date,
                     lr.days_taken,lr.approved_by,lr.notes FROM leave_records lr
@@ -3345,7 +3353,7 @@ with main_block:
 
                 if v_return<=v_start:
                     st.warning("Return-to-Work Date must be after the Vacation Start Date.")
-                elif st.button("Save & Send for Approval",use_container_width=True,key="vac_save_btn"):
+                elif st.button("Save & Send for General Supervisor Review",use_container_width=True,key="vac_save_btn"):
                     if used_now+v_days>v_entitlement:
                         st.error(f"{v_row['full_name']} has already used {used_now} of {v_entitlement} annual leave days for {v_start.year}. This request of {v_days} day(s) would exceed the remaining {remaining_now} day(s). Adjust the dates or update their entitlement in Employee Profile → History.")
                     else:
@@ -3353,25 +3361,26 @@ with main_block:
                         v_end=v_return-timedelta(days=1)
                         cur.execute("""SELECT COUNT(*) FROM leave_records WHERE emp_id=? AND status != 'Cancelled'
                             AND start_date<=? AND end_date>=?""",(v_eid,str(v_end),str(v_start)))
-                        if cur.fetchone()[0]>0:
+                        overlap_v=cur.fetchone()[0]
+                        cur.execute("""SELECT COUNT(*) FROM daily_status_records WHERE emp_id=? AND start_date<=? AND end_date>=?
+                            AND workflow_stage NOT IN ('Rejected by General Supervisor','Rejected by HR','Returned for Correction')""",(v_eid,str(v_end),str(v_start)))
+                        overlap_v+=cur.fetchone()[0]
+                        if overlap_v>0:
                             conn.close()
-                            st.error(f"{v_row['full_name']} already has a leave record overlapping this period.")
+                            st.error(f"{v_row['full_name']} already has a leave/status record overlapping this period.")
                         else:
-                            cur.execute("SELECT basic_salary FROM employees WHERE emp_id=?",(v_eid,))
-                            sr=cur.fetchone(); dr=float(sr[0])/26 if sr and sr[0] else 0
-                            conn.execute("""INSERT INTO leave_records(emp_id,leave_type,start_date,end_date,days_taken,
-                                is_paid,daily_rate,deduction_amount,approved_by,status,notes,created_at)
-                                VALUES(?,'Annual Leave',?,?,?,1,?,0,?,'Pending Dept Head Approval',?,?)""",
-                                (v_eid,str(v_start),str(v_end),v_days,round(dr,2),
-                                 f"Vacation request by {st.session_state.full_name or st.session_state.uid}",
-                                 v_notes,datetime.now().strftime("%Y-%m-%d")))
+                            conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
+                                reason,supervisor_id,submitted_at,workflow_stage)
+                                VALUES(?,'Vacation','Annual Leave',?,?,?,?,?,?,'Pending General Supervisor Review')""",
+                                (v_eid,str(v_start),str(v_end),v_days,v_notes,
+                                 st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                             conn.commit(); conn.close()
                             st.cache_data.clear()
-                            st.success(f"Vacation request saved: {v_days} day(s) for {v_row['full_name']}. Sent for approval.")
-                            st.session_state.vacation_subview="approvals"
+                            st.success(f"Vacation request saved: {v_days} day(s) for {v_row['full_name']}. Sent to General Supervisor for review (GS Review page), then HR.")
                             st.rerun()
 
         else:  # Vacation Approvals
+            st.markdown('<div style="font-size:11px;color:#F59E0B;margin-bottom:8px">New vacation requests now route through GS Review, then HR Validation. This tab only handles any older requests submitted before that change.</div>',unsafe_allow_html=True)
             if st.session_state.role not in ("Manager","Department Head"):
                 st.info("Only Department Head or Manager can approve vacation requests.")
             else:
@@ -3528,8 +3537,8 @@ with main_block:
                                 if rec['status']=="Present":
                                     pass  # nothing further to record
                                 elif rec['status']=="Absent":
-                                    conn.execute("INSERT INTO absent_records(emp_id,absent_date,reason,is_excused,record_status,created_at)VALUES(?,?,?,0,'Active',?)",
-                                        (rec['emp_id'],rec['start_date'],rec['reason'],datetime.now().strftime("%Y-%m-%d")))
+                                    conn.execute("INSERT INTO absent_records(emp_id,absent_date,reason,is_excused,record_status,created_at)VALUES(?,?,?,?,'Active',?)",
+                                        (rec['emp_id'],rec['start_date'],rec['reason'],1 if rec['leave_type']=="Excused" else 0,datetime.now().strftime("%Y-%m-%d")))
                                 else:
                                     cur.execute("SELECT basic_salary FROM employees WHERE emp_id=?",(rec['emp_id'],))
                                     sr=cur.fetchone(); dr=float(sr[0])/26 if sr and sr[0] else 0
