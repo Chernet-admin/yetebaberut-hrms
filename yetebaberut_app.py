@@ -992,7 +992,7 @@ NAV_GROUPS = [
 ]
 
 st.markdown("""<style>
-.nav-sidebar{padding-right:4px}
+.nav-sidebar{padding-right:4px;position:sticky;top:44px;max-height:calc(100vh - 60px);overflow-y:auto}
 .nav-group-label{font-size:8px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
     color:#6B7FA3;margin:10px 0 4px 4px}
 .nav-group-label:first-child{margin-top:0}
@@ -1013,7 +1013,8 @@ st.markdown("""<style>
     font-size:9px;color:#6B7FA3;text-align:center}
 .hamburger-bar{display:flex;align-items:center;background:#0D1526;
     border-bottom:1px solid rgba(212,168,71,0.2);padding:6px 14px;
-    margin:-1rem -1rem 0 -1rem;gap:12px}
+    margin:-1rem -1rem 0 -1rem;gap:12px;
+    position:sticky;top:0;z-index:9999;}
 .hamburger-bar .hb-title{font-size:11px;color:#6B7FA3;letter-spacing:.06em;
     text-transform:uppercase;font-weight:600}
 div[data-testid="stHorizontalBlock"] > div:first-child div.stButton button[kind="secondary"]{
@@ -1129,12 +1130,6 @@ with main_block:
             </div>""",unsafe_allow_html=True)
             st.markdown("<hr>",unsafe_allow_html=True)
 
-        st.markdown('<div class="ey">Who We Are</div>',unsafe_allow_html=True)
-        st.markdown('<div class="tl">Engineering Workforce Excellence</div>',unsafe_allow_html=True)
-        st.markdown("""<div class="card card-gold"><p style="font-size:14px;line-height:1.85;color:#C8D8F0;margin:0">
-        Yetebaberut General Service Provider specializes in engineering high-capacity workforce deployment models.
-        We eliminate operational downtime for tier-one organizations by sourcing, verifying, and routing vetted manpower
-        assets across key regional stations and global industrial hubs.</p></div>""",unsafe_allow_html=True)
         c1,c2,c3=st.columns(3)
         for col,ic,ttl,col_hex,txt in [
             (c1,"","Our Mission","#60C8F8","To seamlessly bridge the gap between heavy industrial demand and verified talent arrays through real-time matching pipelines."),
