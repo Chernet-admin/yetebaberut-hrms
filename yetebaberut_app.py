@@ -1835,9 +1835,15 @@ with main_block:
                         cur.execute("""SELECT COUNT(*) FROM absent_records WHERE emp_id=? AND absent_date=?
                             AND COALESCE(record_status,'Active')='Active'""",(ab_eid_sup,str(ab_date)))
                         dup_count_sup=cur.fetchone()[0]
+                        cur.execute("""SELECT leave_type FROM leave_records WHERE emp_id=? AND status='Approved'
+                            AND start_date<=? AND end_date>=?""",(ab_eid_sup,str(ab_date),str(ab_date)))
+                        leave_conflict_sup=cur.fetchone()
                         if dup_count_sup>0:
                             conn.close()
                             st.error(f"{ab_emp} already has an absence recorded for {ab_date}. The system blocks duplicate entries automatically.")
+                        elif leave_conflict_sup:
+                            conn.close()
+                            st.error(f"{ab_emp} is on approved {leave_conflict_sup[0]} on {ab_date}. An employee already on approved leave cannot also be marked absent for the same date.")
                         else:
                             conn.execute("INSERT INTO absent_records(emp_id,absent_date,reason,is_excused,record_status,created_at)VALUES(?,?,?,?,'Active',?)",
                                 (ab_eid_sup,str(ab_date),f"Supervisor {st.session_state.full_name or st.session_state.uid}: {ab_reason}",1 if "Excused" in ab_type else 0,datetime.now().strftime("%Y-%m-%d")))
@@ -2985,9 +2991,15 @@ with main_block:
                     cur.execute("""SELECT COUNT(*) FROM absent_records WHERE emp_id=? AND absent_date=?
                         AND COALESCE(record_status,'Active')='Active'""",(ab_eid_chosen,str(ab_date)))
                     dup_count=cur.fetchone()[0]
+                    cur.execute("""SELECT leave_type FROM leave_records WHERE emp_id=? AND status='Approved'
+                        AND start_date<=? AND end_date>=?""",(ab_eid_chosen,str(ab_date),str(ab_date)))
+                    leave_conflict=cur.fetchone()
                     if dup_count>0:
                         conn.close()
                         st.error(f"{ab_emp} already has an absence recorded for {ab_date}. The system blocks duplicate entries automatically — edit or cancel the existing record below instead.")
+                    elif leave_conflict:
+                        conn.close()
+                        st.error(f"{ab_emp} is on approved {leave_conflict[0]} on {ab_date}. An employee already on approved leave cannot also be marked absent for the same date.")
                     else:
                         conn.execute("INSERT INTO absent_records(emp_id,absent_date,reason,is_excused,record_status,created_at)VALUES(?,?,?,?,'Active',?)",
                             (ab_eid_chosen,str(ab_date),ab_reason,1 if "Excused" in ab_ex else 0,datetime.now().strftime("%Y-%m-%d")))
@@ -3688,23 +3700,7 @@ with main_block:
                 rc=role_cls(u['role']); is_active=int(u['is_active'])==1
                 _ll=u['last_login']; last="Never logged in" if (_ll is None or (isinstance(_ll,float))) else str(_ll); perm=u['permissions'] or "view_only"
                 div_badge = f'<span style="font-size:10px;color:#38BDF8">Division: {u["assigned_division"]}</span>' if u.get("assigned_division") else ''
-                st.markdown(f"""<div class="user-card uc-{rc}">
-                  <div class="user-avatar ua-{rc}">{role_init(u["full_name"])}</div>
-                  <div class="user-info">
-                    <div class="user-name">{u["full_name"] or u["username"]}</div>
-                    <div class="user-uid">@{u["username"]} &nbsp;·&nbsp; {u["email"] or "No email"}</div>
-                    <div style="margin-top:5px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-                      <span class="role-badge rb-{rc}">{u["role"]}</span>
-                      <span style="font-size:10px;color:#6B7FA3"><span class="active-dot {"dot-active" if is_active else "dot-inactive"}"></span>{"Active" if is_active else "Disabled"}</span>
-                      <span style="font-size:10px;color:#6B7FA3"> {last[:16] if last!="Never logged in" else "Never"}</span>
-                      {div_badge}
-                    </div>
-                  </div>
-                  <div style="text-align:right;flex-shrink:0">
-                    <div style="font-size:9px;color:#6B7FA3;text-transform:uppercase;letter-spacing:.07em">Permissions</div>
-                    <div style="font-size:11px;color:{"#10B981" if perm=="full" else "#94A8C8"};font-weight:500">{perm}</div>
-                  </div>
-                </div>""",unsafe_allow_html=True)
+                st.markdown(f'<div class="user-card uc-{rc}"><div class="user-avatar ua-{rc}">{role_init(u["full_name"])}</div><div class="user-info"><div class="user-name">{u["full_name"] or u["username"]}</div><div class="user-uid">@{u["username"]} &nbsp;·&nbsp; {u["email"] or "No email"}</div><div style="margin-top:5px;display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span class="role-badge rb-{rc}">{u["role"]}</span><span style="font-size:10px;color:#6B7FA3"><span class="active-dot {"dot-active" if is_active else "dot-inactive"}"></span>{"Active" if is_active else "Disabled"}</span><span style="font-size:10px;color:#6B7FA3"> {last[:16] if last!="Never logged in" else "Never"}</span>{div_badge}</div></div><div style="text-align:right;flex-shrink:0"><div style="font-size:9px;color:#6B7FA3;text-transform:uppercase;letter-spacing:.07em">PERMISSIONS</div><div style="font-size:11px;color:{"#10B981" if perm=="full" else "#94A8C8"};font-weight:500">{perm}</div></div></div>',unsafe_allow_html=True)
             st.markdown("<hr>",unsafe_allow_html=True)
             st.markdown('<div class="fs">Enable / Disable Account</div>',unsafe_allow_html=True)
             conn=get_conn()
@@ -3773,17 +3769,19 @@ with main_block:
                 </div>""",unsafe_allow_html=True)
 
                 st.markdown('<div class="fs" style="margin-top:14px">Navigation Access — Set Authority Per Module</div>',unsafe_allow_html=True)
-                st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">For every module, choose the authority this user has: Role Default (use the permission level above), View (read-only), Edit (change data, no delete), Both (view and edit), or Full Control (view, edit and delete).</div>',unsafe_allow_html=True)
-                custom_nav_selection = {}
-                PERM_LEVEL_OPTIONS = ["Role Default","View","Edit","Both","Full Control"]
-                for nv in ALL_NAV_VIEWS:
-                    nvc1,nvc2 = st.columns([1,1])
-                    with nvc1:
-                        st.markdown(f'<div style="padding-top:9px;font-size:13px;color:#E8EEF7">{nv}</div>',unsafe_allow_html=True)
-                    with nvc2:
-                        nv_perm = st.selectbox(" ",PERM_LEVEL_OPTIONS,key=f"cu_perm_{nv}",label_visibility="collapsed")
-                        if nv_perm != "Role Default":
-                            custom_nav_selection[nv] = nv_perm.lower().replace(" ","_")
+                st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Role Default uses the permission level above. Otherwise, override per module: View (read-only), Edit (change data, no delete), Both (view and edit), or Full Control (view, edit and delete). Click a cell in the Access Level column to change it.</div>',unsafe_allow_html=True)
+                nav_matrix_df = pd.DataFrame({"Module":ALL_NAV_VIEWS,"Access Level":["Role Default"]*len(ALL_NAV_VIEWS)})
+                edited_nav_matrix = st.data_editor(
+                    nav_matrix_df,
+                    hide_index=True, use_container_width=True, key="cu_nav_matrix",
+                    disabled=["Module"],
+                    column_config={
+                        "Module": st.column_config.TextColumn("Module",width="medium"),
+                        "Access Level": st.column_config.SelectboxColumn("Access Level",
+                            options=["Role Default","View","Edit","Both","Full Control"],width="medium"),
+                    })
+                custom_nav_selection = {row["Module"]:row["Access Level"].lower().replace(" ","_")
+                    for _,row in edited_nav_matrix.iterrows() if row["Access Level"]!="Role Default"}
 
                 if st.form_submit_button("Create User Account",use_container_width=True):
                     if not(new_uname and new_pw and new_fullname): st.error("Username, password and full name required.")
@@ -3824,10 +3822,7 @@ with main_block:
                 eu=cur.fetchone(); conn.close()
                 if eu:
                     rc2=role_cls(eu[2])
-                    st.markdown(f"""<div class="user-card uc-{rc2}">
-                      <div class="user-avatar ua-{rc2}">{role_init(eu[1])}</div>
-                      <div class="user-info"><div class="user-name">{eu[1] or eu[0]}</div>
-                      <div class="user-uid">@{eu[0]}</div></div></div>""",unsafe_allow_html=True)
+                    st.markdown(f'<div class="user-card uc-{rc2}"><div class="user-avatar ua-{rc2}">{role_init(eu[1])}</div><div class="user-info"><div class="user-name">{eu[1] or eu[0]}</div><div class="user-uid">@{eu[0]}</div></div></div>',unsafe_allow_html=True)
                     try:
                         existing_nav_access = json.loads(eu[7]) if eu[7] else {}
                     except: existing_nav_access = {}
@@ -3849,21 +3844,21 @@ with main_block:
                         with ep2: e_confirmpw=st.text_input("Confirm Password",type="password")
 
                         st.markdown('<div class="fs" style="margin-top:14px">Navigation Access — Set Authority Per Module</div>',unsafe_allow_html=True)
-                        st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">For every module, choose this user\'s authority: Role Default, View (read-only), Edit (change data, no delete), Both (view and edit), or Full Control (view, edit and delete).</div>',unsafe_allow_html=True)
-                        edit_nav_selection = {}
-                        PERM_LEVEL_OPTIONS_EDIT = ["Role Default","View","Edit","Both","Full Control"]
+                        st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Role Default uses this user\'s role permission level. Otherwise, override per module: View (read-only), Edit (change data, no delete), Both (view and edit), or Full Control (view, edit and delete). Click a cell in the Access Level column to change it.</div>',unsafe_allow_html=True)
                         perm_levels_map = {"view":"View","edit":"Edit","both":"Both","full_control":"Full Control","delete":"Full Control"}
-                        for ev in ALL_NAV_VIEWS:
-                            evc1,evc2 = st.columns([1,1])
-                            with evc1:
-                                st.markdown(f'<div style="padding-top:9px;font-size:13px;color:#E8EEF7">{ev}</div>',unsafe_allow_html=True)
-                            with evc2:
-                                existing_raw = existing_nav_access.get(ev)
-                                existing_display = perm_levels_map.get(existing_raw,"Role Default") if existing_raw else "Role Default"
-                                default_perm_idx = PERM_LEVEL_OPTIONS_EDIT.index(existing_display) if existing_display in PERM_LEVEL_OPTIONS_EDIT else 0
-                                ev_perm = st.selectbox(" ",PERM_LEVEL_OPTIONS_EDIT,index=default_perm_idx,key=f"eu_perm_{ev}",label_visibility="collapsed")
-                                if ev_perm != "Role Default":
-                                    edit_nav_selection[ev] = ev_perm.lower().replace(" ","_")
+                        existing_levels = [perm_levels_map.get(existing_nav_access.get(ev),"Role Default") if existing_nav_access.get(ev) else "Role Default" for ev in ALL_NAV_VIEWS]
+                        edit_nav_matrix_df = pd.DataFrame({"Module":ALL_NAV_VIEWS,"Access Level":existing_levels})
+                        edited_edit_nav_matrix = st.data_editor(
+                            edit_nav_matrix_df,
+                            hide_index=True, use_container_width=True, key="eu_nav_matrix",
+                            disabled=["Module"],
+                            column_config={
+                                "Module": st.column_config.TextColumn("Module",width="medium"),
+                                "Access Level": st.column_config.SelectboxColumn("Access Level",
+                                    options=["Role Default","View","Edit","Both","Full Control"],width="medium"),
+                            })
+                        edit_nav_selection = {row["Module"]:row["Access Level"].lower().replace(" ","_")
+                            for _,row in edited_edit_nav_matrix.iterrows() if row["Access Level"]!="Role Default"}
 
                         perm_map={"Data Officer":"view_only","HR Staff":"hr_edit","Payroll Officer":"payroll_edit",
                             "Department Head":"dept_view","Manager":"full","Supervisor":"division_control","Payroll Section":"payroll_approve"}
