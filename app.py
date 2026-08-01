@@ -812,6 +812,8 @@ seed_if_empty()
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Cinzel:wght@700&display=swap');
 *{box-sizing:border-box}
+.st-key-sticky_header{position:sticky !important;top:0 !important;z-index:9998 !important;
+  background:#060B18 !important;padding-top:2px !important}
 .stApp{background:#060B18 !important;color:#E8EEF7 !important;font-family:'Inter',sans-serif !important}
 .yh{background:linear-gradient(135deg,#0D1526,#0A1020,#0D1830);border-bottom:1px solid rgba(212,168,71,0.25);
   padding:14px 28px;margin:-1rem -1rem 0;position:relative}
@@ -923,74 +925,77 @@ for k,v in {"role":None,"uid":None,"view":"Home","eid":None,"full_name":"","assi
     if k not in st.session_state: st.session_state[k]=v
 
 # ════════════════════════════════════════════════════════
-# HEADER
+# HEADER — wrapped in a sticky container so it (and the
+# contact bar below it) stays visible while the page scrolls.
 # ════════════════════════════════════════════════════════
-h1,h2=st.columns([3.5,1])
-with h1:
-    welcome_text = f"Welcome, {st.session_state.full_name}" if st.session_state.role else "Welcome"
-    st.markdown(f"""<div class="yh">
-      <div style="font-size:11px;color:#10B981;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px">{welcome_text}</div>
-      <div class="hb">YETEBABERUT · GENERAL SERVICE PROVIDER</div>
-      <div class="ht">Human Resource Management System | Addis Ababa, Ethiopia | Est. 2015</div>
-    </div>""",unsafe_allow_html=True)
-with h2:
-    st.write(""); st.write("")
-    if not st.session_state.role:
-        if st.button("LOGIN",use_container_width=True): st.session_state.show_login=True
-        @st.dialog("Portal Login")
-        def login():
-            st.markdown("""<style>
-            div[data-testid="stDialog"] input{
-                background:#FFFFFF !important;color:#0D1526 !important;
-                border:1px solid #D4A847 !important;border-radius:8px !important}
-            div[data-testid="stDialog"] label{color:#10B981 !important;font-weight:600 !important}
-            div[data-testid="stDialog"] button[kind="formSubmit"],
-            div[data-testid="stDialog"] div.stFormSubmitButton button{
-                background:linear-gradient(135deg,#1A6B3C,#22C55E) !important;
-                color:#FFFFFF !important;border:none !important}
-            </style>""",unsafe_allow_html=True)
-            st.markdown('<div class="gt" style="color:#10B981 !important">Yetebaberut Login</div>',unsafe_allow_html=True)
-            with st.form("lf"):
-                st.markdown('<div class="gl" style="color:#10B981 !important">User ID</div>',unsafe_allow_html=True)
-                u=st.text_input("u",label_visibility="collapsed")
-                st.markdown('<div class="gl" style="color:#10B981 !important">Password</div>',unsafe_allow_html=True)
-                p=st.text_input("p",type="password",label_visibility="collapsed")
-                if st.form_submit_button("Enter",use_container_width=True):
-                    conn_l=get_conn(); cur_l=conn_l.cursor()
-                    cur_l.execute("SELECT username,password,role,full_name,is_active,assigned_division,nav_access FROM system_users WHERE username=?",(u,))
-                    db_user=cur_l.fetchone()
-                    if db_user and db_user[1]==p and db_user[4]==1:
-                        st.session_state.role=db_user[2]; st.session_state.uid=db_user[0]
-                        st.session_state.full_name=db_user[3] or db_user[0]
-                        st.session_state.assigned_division=db_user[5]
-                        st.session_state.nav_access_json=db_user[6]
-                        cur_l.execute("UPDATE system_users SET last_login=? WHERE username=?",(datetime.now().strftime("%Y-%m-%d %H:%M:%S"),u,))
-                        conn_l.commit(); conn_l.close()
-                        st.session_state.view="Applicant Intake"; st.toast(f"Welcome {st.session_state.full_name}!"); st.rerun()
-                    else:
-                        conn_l.close()
-                        ur=st.session_state['572']['ur']
-                        if u in ur and ur[u]['pw']==p:
-                            st.session_state.role=ur[u]['role']; st.session_state.uid=u
-                            st.session_state.full_name=u
-                            st.session_state.view="Applicant Intake"; st.toast(f"Welcome {st.session_state.role}!"); st.rerun()
-                        else: st.error("Invalid credentials or account disabled.")
-        if st.session_state.get("show_login"): st.session_state.show_login=False; login()
-    else:
-        st.markdown(f'<div class="sb"> <b>{st.session_state.role}</b><br><span style="font-size:10px;color:#6B7FA3">{st.session_state.uid}</span></div>',unsafe_allow_html=True)
-        if st.button("LOGOUT",use_container_width=True):
-            st.session_state.role=None; st.session_state.uid=None
-            st.session_state.eid=None; st.session_state.view="Home"
-            st.session_state.nav_access_json=None; st.session_state.assigned_division=None
-            st.rerun()
+sticky_header = st.container(key="sticky_header")
+with sticky_header:
+    h1,h2=st.columns([3.5,1])
+    with h1:
+        welcome_text = f"Welcome, {st.session_state.full_name}" if st.session_state.role else "Welcome"
+        st.markdown(f"""<div class="yh">
+          <div style="font-size:11px;color:#10B981;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px">{welcome_text}</div>
+          <div class="hb">YETEBABERUT · GENERAL SERVICE PROVIDER</div>
+          <div class="ht">Human Resource Management System | Addis Ababa, Ethiopia | Est. 2015</div>
+        </div>""",unsafe_allow_html=True)
+    with h2:
+        st.write(""); st.write("")
+        if not st.session_state.role:
+            if st.button("LOGIN",use_container_width=True): st.session_state.show_login=True
+            @st.dialog("Portal Login")
+            def login():
+                st.markdown("""<style>
+                div[data-testid="stDialog"] input{
+                    background:#FFFFFF !important;color:#0D1526 !important;
+                    border:1px solid #D4A847 !important;border-radius:8px !important}
+                div[data-testid="stDialog"] label{color:#10B981 !important;font-weight:600 !important}
+                div[data-testid="stDialog"] button[kind="formSubmit"],
+                div[data-testid="stDialog"] div.stFormSubmitButton button{
+                    background:linear-gradient(135deg,#1A6B3C,#22C55E) !important;
+                    color:#FFFFFF !important;border:none !important}
+                </style>""",unsafe_allow_html=True)
+                st.markdown('<div class="gt" style="color:#10B981 !important">Yetebaberut Login</div>',unsafe_allow_html=True)
+                with st.form("lf"):
+                    st.markdown('<div class="gl" style="color:#10B981 !important">User ID</div>',unsafe_allow_html=True)
+                    u=st.text_input("u",label_visibility="collapsed")
+                    st.markdown('<div class="gl" style="color:#10B981 !important">Password</div>',unsafe_allow_html=True)
+                    p=st.text_input("p",type="password",label_visibility="collapsed")
+                    if st.form_submit_button("Enter",use_container_width=True):
+                        conn_l=get_conn(); cur_l=conn_l.cursor()
+                        cur_l.execute("SELECT username,password,role,full_name,is_active,assigned_division,nav_access FROM system_users WHERE username=?",(u,))
+                        db_user=cur_l.fetchone()
+                        if db_user and db_user[1]==p and db_user[4]==1:
+                            st.session_state.role=db_user[2]; st.session_state.uid=db_user[0]
+                            st.session_state.full_name=db_user[3] or db_user[0]
+                            st.session_state.assigned_division=db_user[5]
+                            st.session_state.nav_access_json=db_user[6]
+                            cur_l.execute("UPDATE system_users SET last_login=? WHERE username=?",(datetime.now().strftime("%Y-%m-%d %H:%M:%S"),u,))
+                            conn_l.commit(); conn_l.close()
+                            st.session_state.view="Applicant Intake"; st.toast(f"Welcome {st.session_state.full_name}!"); st.rerun()
+                        else:
+                            conn_l.close()
+                            ur=st.session_state['572']['ur']
+                            if u in ur and ur[u]['pw']==p:
+                                st.session_state.role=ur[u]['role']; st.session_state.uid=u
+                                st.session_state.full_name=u
+                                st.session_state.view="Applicant Intake"; st.toast(f"Welcome {st.session_state.role}!"); st.rerun()
+                            else: st.error("Invalid credentials or account disabled.")
+            if st.session_state.get("show_login"): st.session_state.show_login=False; login()
+        else:
+            st.markdown(f'<div class="sb"> <b>{st.session_state.role}</b><br><span style="font-size:10px;color:#6B7FA3">{st.session_state.uid}</span></div>',unsafe_allow_html=True)
+            if st.button("LOGOUT",use_container_width=True):
+                st.session_state.role=None; st.session_state.uid=None
+                st.session_state.eid=None; st.session_state.view="Home"
+                st.session_state.nav_access_json=None; st.session_state.assigned_division=None
+                st.rerun()
 
-st.markdown("""<div class="cs">
-  <div class="ci"> Addis Ababa, Ethiopia</div>
-  <div class="ci"> info@yetebaberut.com</div>
-  <div class="ci"> +251 911 000 000</div>
-  <div class="ci"> @YGSP_Global</div>
-</div>""",unsafe_allow_html=True)
-st.markdown("<hr>",unsafe_allow_html=True)
+    st.markdown("""<div class="cs">
+      <div class="ci"> Addis Ababa, Ethiopia</div>
+      <div class="ci"> yetebaberutgsp2018@gmail.com</div>
+      <div class="ci"> +251 91 184 8179 / +251 92 016 2327</div>
+      <div class="ci"> +251 91 055 6909 / 018-68-87-70</div>
+    </div>""",unsafe_allow_html=True)
+    st.markdown("<hr style='margin:6px 0 !important'>",unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════
 # NAVIGATION ACCESS DEFINITIONS
@@ -1066,7 +1071,7 @@ NAV_GROUPS = [
 ]
 
 st.markdown("""<style>
-.nav-sidebar{padding-right:4px;position:sticky;top:44px;max-height:calc(100vh - 60px);overflow-y:auto}
+.nav-sidebar{padding-right:4px;position:sticky;top:200px;max-height:calc(100vh - 210px);overflow-y:auto}
 .nav-group-label{font-size:8px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
     color:#6B7FA3;margin:10px 0 4px 4px}
 .nav-group-label:first-child{margin-top:0}
@@ -1085,11 +1090,10 @@ st.markdown("""<style>
     border-color:transparent !important;}
 .nav-footer{margin-top:10px;padding:6px 8px;border-top:1px solid rgba(255,255,255,0.07);
     font-size:9px;color:#6B7FA3;text-align:center}
-.hamburger-bar{display:flex;align-items:center;background:#0D1526;
+.st-key-nav_toggle_bar{display:flex;align-items:center;background:#0D1526;
     border-bottom:1px solid rgba(212,168,71,0.2);padding:6px 14px;
-    margin:-1rem -1rem 0 -1rem;gap:12px;
-    position:sticky;top:0;z-index:9999;}
-.hamburger-bar .hb-title{font-size:11px;color:#6B7FA3;letter-spacing:.06em;
+    gap:12px;position:sticky !important;top:156px !important;z-index:9997 !important;}
+.hb-title{font-size:11px;color:#6B7FA3;letter-spacing:.06em;
     text-transform:uppercase;font-weight:600}
 div[data-testid="stHorizontalBlock"] > div:first-child div.stButton button[kind="secondary"]{
     background:#0D1526 !important;border:1px solid rgba(212,168,71,0.35) !important;
@@ -1100,17 +1104,19 @@ div[data-testid="stHorizontalBlock"] > div:first-child div.stButton button[kind=
 
 if "sidebar_open" not in st.session_state: st.session_state.sidebar_open = True
 
-# ── Hamburger toggle sits in a dedicated bar at the very top, before the columns split ──
+# ── Hamburger toggle sits in a dedicated bar, sticky just below the header ──
 if st.session_state.role:
-    hb_col, hb_label = st.columns([0.08, 1])
-    with hb_col:
-        toggle_icon = "☰"
-        if st.button(toggle_icon, key="nav_toggle", help="Toggle navigation menu"):
-            st.session_state.sidebar_open = not st.session_state.sidebar_open
-            st.rerun()
-    with hb_label:
-        current_view_label = st.session_state.view or "Home"
-        st.markdown(f'<div class="hb-title" style="padding-top:6px">Navigation &nbsp;|&nbsp; <span style="color:#F0C96B">{current_view_label}</span></div>', unsafe_allow_html=True)
+    toggle_bar = st.container(key="nav_toggle_bar")
+    with toggle_bar:
+        hb_col, hb_label = st.columns([0.08, 1])
+        with hb_col:
+            toggle_icon = "☰"
+            if st.button(toggle_icon, key="nav_toggle", help="Toggle navigation menu"):
+                st.session_state.sidebar_open = not st.session_state.sidebar_open
+                st.rerun()
+        with hb_label:
+            current_view_label = st.session_state.view or "Home"
+            st.markdown(f'<div class="hb-title" style="padding-top:6px">Navigation &nbsp;|&nbsp; <span style="color:#F0C96B">{current_view_label}</span></div>', unsafe_allow_html=True)
 
 if st.session_state.role and st.session_state.sidebar_open:
     nav_col, main_col = st.columns([1, 5.5])
