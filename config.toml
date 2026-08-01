@@ -1,0 +1,5 @@
+[server]
+maxUploadSize = 8
+
+[theme]
+base = "dark"
