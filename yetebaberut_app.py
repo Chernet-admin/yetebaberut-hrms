@@ -423,6 +423,30 @@ def init_db():
             ("ygs_payroll","payroll2026","Payroll Section","Payroll Officer","payroll_approve",None,now),
         ]); conn.commit()
 
+    # ── DEMOTION & STATUS MANAGEMENT ──
+    # HR submits a grade/title/salary change request; Manager approves it;
+    # once approved, Finance is considered notified and the employee record
+    # (job_title, grade if tracked via job_title, basic_salary) is updated.
+    c.execute("""CREATE TABLE IF NOT EXISTS demotion_records(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        emp_id TEXT NOT NULL,
+        change_type TEXT DEFAULT 'Demotion',
+        previous_title TEXT,
+        previous_salary REAL,
+        new_title TEXT,
+        new_salary REAL,
+        reason TEXT,
+        submitted_by TEXT,
+        submitted_at TEXT,
+        status TEXT DEFAULT 'Pending Manager Approval',
+        reviewed_by TEXT,
+        reviewed_at TEXT,
+        review_notes TEXT,
+        finance_notified INTEGER DEFAULT 0,
+        applied INTEGER DEFAULT 0)""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_demotion_emp ON demotion_records(emp_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_demotion_status ON demotion_records(status)")
+
     # ── COST CENTERS table (manually created per division) ──
     c.execute("""CREATE TABLE IF NOT EXISTS cost_centers(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -927,18 +951,18 @@ st.markdown("<hr>",unsafe_allow_html=True)
 # ════════════════════════════════════════════════════════
 ALL_NAV_VIEWS = ["Home","Applicant Intake","Employee Directory","Employee Profile",
     "Supervisor Console","Payroll","Payroll Approvals","Leave & Discipline","Leave Records","Vacation",
-    "GS Review","HR Validation","Public Holidays","Cost Centers","Recycle Bin","Administration"]
+    "GS Review","HR Validation","Demotion","Public Holidays","Cost Centers","Recycle Bin","Administration"]
 
 ROLE_DEFAULT_VIEWS = {
     "Supervisor": ["Home","Supervisor Console","Public Holidays"],
     "Payroll Section": ["Home","Payroll Approvals","Payroll","Employee Directory","Employee Profile","Public Holidays","Cost Centers"],
     "Department Head": ["Home","GS Review","Vacation","Employee Directory","Employee Profile","Public Holidays"],
-    "HR Staff": ["Home","HR Validation","Applicant Intake","Employee Directory","Employee Profile","Leave & Discipline","Leave Records","Vacation","Public Holidays"],
+    "HR Staff": ["Home","HR Validation","Applicant Intake","Employee Directory","Employee Profile","Leave & Discipline","Leave Records","Vacation","Demotion","Public Holidays"],
     "Manager": ["Home","Applicant Intake","Employee Directory","Employee Profile","Payroll",
-        "Payroll Approvals","Leave & Discipline","Leave Records","Vacation","GS Review","HR Validation","Public Holidays","Cost Centers","Recycle Bin","Administration"],
+        "Payroll Approvals","Leave & Discipline","Leave Records","Vacation","GS Review","HR Validation","Demotion","Public Holidays","Cost Centers","Recycle Bin","Administration"],
 }
 ROLE_DEFAULT_FALLBACK = ["Home","Applicant Intake","Employee Directory","Employee Profile",
-    "Payroll","Payroll Approvals","Leave & Discipline","Leave Records","Vacation","GS Review","HR Validation","Public Holidays","Cost Centers"]
+    "Payroll","Payroll Approvals","Leave & Discipline","Leave Records","Vacation","GS Review","HR Validation","Demotion","Public Holidays","Cost Centers"]
 
 def get_user_nav_views(role, nav_access_json):
     """Returns the ordered list of views this user can see."""
@@ -986,7 +1010,7 @@ NAV_GROUPS = [
     ("RECRUITMENT", ["Applicant Intake"]),
     ("WORKFORCE", ["Employee Directory","Employee Profile","Supervisor Console"]),
     ("FINANCE", ["Payroll","Payroll Approvals","Cost Centers"]),
-    ("HR OPERATIONS", ["Leave & Discipline","Leave Records","Vacation","GS Review","HR Validation"]),
+    ("HR OPERATIONS", ["Leave & Discipline","Leave Records","Vacation","GS Review","HR Validation","Demotion"]),
     ("REFERENCE", ["Public Holidays"]),
     ("SYSTEM", ["Recycle Bin","Administration"]),
 ]
@@ -2123,7 +2147,7 @@ with main_block:
         conn=get_conn()
         el=pg_read_sql("SELECT emp_id,full_name,division,cost_center,basic_salary,weekly_dayoff FROM employees WHERE current_status='Active Deployment' ORDER BY emp_id LIMIT 5000",conn); conn.close()
         if len(el)==0: st.warning("No active employees."); st.stop()
-        pt1,pt2,pt3,pt4=st.tabs(["Process Payroll","History","Day-Off Calendar","Cost Center Sheet"])
+        pt1,pt2,pt3,pt4,pt5=st.tabs(["Process Payroll","History","Day-Off Calendar","Cost Center Sheet","Pension & Tax Reports"])
         with pt1:
             ps1,ps2=st.columns(2)
             with ps1:
@@ -2686,6 +2710,83 @@ with main_block:
                     </body></html>'''
                     b64_print=base64.b64encode(print_html.encode()).decode()
                     st.markdown(f'<a href="data:text/html;base64,{b64_print}" download="{sheet_cc}_{month_str}_Register.html" target="_blank"><button style="width:100%;background:linear-gradient(135deg,#7B2FBE,#9333EA);color:#fff;border:none;border-radius:8px;padding:10px;font-weight:600;font-size:12px;cursor:pointer">Print Cost Center Payroll Register</button></a>',unsafe_allow_html=True)
+
+        with pt5:
+            st.markdown('<div style="color:#6B7FA3;font-size:12px;margin-bottom:12px">Pension contribution and PAYE tax filing summaries, drawn from processed payroll records. Filter by period, division, or cost center, then export for submission to the pension authority or tax office.</div>',unsafe_allow_html=True)
+
+            rp1,rp2,rp3,rp4=st.columns(4)
+            with rp1:
+                rp_from=st.text_input("From Month (YYYY-MM)",value=f"{datetime.now().year}-01",key="rp_from")
+            with rp2:
+                rp_to=st.text_input("To Month (YYYY-MM)",value=datetime.now().strftime("%Y-%m"),key="rp_to")
+            with rp3:
+                rp_div=st.selectbox("Division",["All"]+get_division_list(),key="rp_div")
+            with rp4:
+                rp_cc_list=get_cost_centers(rp_div if rp_div!="All" else None)
+                rp_cc_opts=["All"]+(rp_cc_list['code'].tolist() if len(rp_cc_list)>0 else [])
+                rp_cc=st.selectbox("Cost Center",rp_cc_opts,key="rp_cc")
+
+            conn=get_conn()
+            rp_q="""SELECT p.emp_id,COALESCE(p.full_name,e.full_name,'(Deleted Employee)') as full_name,
+                COALESCE(p.division,e.division,'—') as division,COALESCE(p.cost_center,e.cost_center,'—') as cost_center,
+                p.month,COALESCE(p.gross_salary,p.basic_salary) as gross_salary,p.income_tax,
+                p.pension_employee,p.pension_employer,p.net_salary,e.tin_number,e.pension_number
+                FROM payroll p LEFT JOIN employees e ON p.emp_id=e.emp_id
+                WHERE p.month>=? AND p.month<=?"""
+            rp_p=[rp_from,rp_to]
+            if rp_div!="All": rp_q+=" AND COALESCE(p.division,e.division)=?"; rp_p.append(rp_div)
+            if rp_cc!="All": rp_q+=" AND COALESCE(p.cost_center,e.cost_center)=?"; rp_p.append(rp_cc)
+            rp_q+=" ORDER BY p.month,e.full_name"
+            rp_df=pg_read_sql(rp_q,conn,params=rp_p)
+            conn.close()
+
+            if len(rp_df)==0:
+                st.info("No processed payroll records in this range/filter yet.")
+            else:
+                rp_t1,rp_t2=st.tabs(["Pension Contributions","PAYE Tax Filing"])
+
+                with rp_t1:
+                    pension_df=rp_df.rename(columns={
+                        "emp_id":"Employee ID","full_name":"Full Name","division":"Division","cost_center":"Cost Center",
+                        "month":"Month","pension_number":"Pension No.","pension_employee":"Employee Contribution (7%)",
+                        "pension_employer":"Employer Contribution (11%)",
+                    }).copy()
+                    pension_df["Total Contribution"]=pension_df["Employee Contribution (7%)"]+pension_df["Employer Contribution (11%)"]
+                    pension_cols=["Employee ID","Full Name","Division","Cost Center","Pension No.","Month",
+                        "Employee Contribution (7%)","Employer Contribution (11%)","Total Contribution"]
+                    pension_df=pension_df[pension_cols]
+
+                    pc1,pc2,pc3=st.columns(3)
+                    pc1.metric("Total Employee Contributions",f"ETB {pension_df['Employee Contribution (7%)'].sum():,.2f}")
+                    pc2.metric("Total Employer Contributions",f"ETB {pension_df['Employer Contribution (11%)'].sum():,.2f}")
+                    pc3.metric("Grand Total",f"ETB {pension_df['Total Contribution'].sum():,.2f}")
+
+                    st.dataframe(pension_df,use_container_width=True,hide_index=True)
+                    st.caption("Pension rates (employee 7% / employer 11%) reflect this app's payroll calculation — confirm against the current official rate before submitting to the pension authority.")
+                    pen_buf=io.BytesIO()
+                    with pd.ExcelWriter(pen_buf,engine="xlsxwriter") as w: pension_df.to_excel(w,index=False,sheet_name="Pension")
+                    st.download_button("Export Pension Report (Excel)",pen_buf.getvalue(),
+                        file_name=f"Pension_Report_{rp_from}_to_{rp_to}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+
+                with rp_t2:
+                    tax_df=rp_df.rename(columns={
+                        "emp_id":"Employee ID","full_name":"Full Name","division":"Division","cost_center":"Cost Center",
+                        "month":"Month","tin_number":"TIN","gross_salary":"Gross Salary","income_tax":"PAYE Withheld",
+                        "net_salary":"Net Salary",
+                    })[["Employee ID","Full Name","Division","Cost Center","TIN","Month","Gross Salary","PAYE Withheld","Net Salary"]]
+
+                    tc1,tc2=st.columns(2)
+                    tc1.metric("Total Gross Salary",f"ETB {tax_df['Gross Salary'].sum():,.2f}")
+                    tc2.metric("Total PAYE Withheld",f"ETB {tax_df['PAYE Withheld'].sum():,.2f}")
+
+                    st.dataframe(tax_df,use_container_width=True,hide_index=True)
+                    st.caption("PAYE brackets reflect this app's built-in tax table — confirm against the current official tax table before filing.")
+                    tax_buf=io.BytesIO()
+                    with pd.ExcelWriter(tax_buf,engine="xlsxwriter") as w: tax_df.to_excel(w,index=False,sheet_name="PAYE")
+                    st.download_button("Export PAYE Tax Summary (Excel)",tax_buf.getvalue(),
+                        file_name=f"PAYE_Summary_{rp_from}_to_{rp_to}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
 
     # ════════════════════════════════════════════════════════
@@ -3557,6 +3658,138 @@ with main_block:
                                     (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),hr_comment,rec['id']))
                                 conn.commit(); conn.close()
                                 st.warning("Rejected."); st.rerun()
+
+    # ════════════════════════════════════════════════════════
+    # DEMOTION & STATUS MANAGEMENT
+    # HR Staff (or Manager) submits a grade/title/salary change.
+    # Manager gives final sign-off; approval marks Finance as
+    # notified and applies the new title/salary to the employee
+    # record so the next payroll run picks it up automatically.
+    # ════════════════════════════════════════════════════════
+    elif V=="Demotion":
+        st.markdown('<div class="ey">HR Lifecycle</div>',unsafe_allow_html=True)
+        st.markdown('<div class="tl">Demotion & Status Management</div>',unsafe_allow_html=True)
+        st.markdown("""<div class="card card-gold">
+          <div style="font-size:12px;color:#C8D8F0;line-height:1.7">
+            HR submits a demotion, promotion, or grade/salary change request here. Once the
+            Manager gives final approval, the employee's job title and salary tier update
+            automatically and Finance is considered notified for the next payroll run.
+          </div></div>""",unsafe_allow_html=True)
+
+        dsub1,dsub2=st.columns(2)
+        if "demotion_subview" not in st.session_state: st.session_state.demotion_subview="submit"
+        with dsub1:
+            if st.button("📝 Submit Change",use_container_width=True,type="primary" if st.session_state.demotion_subview=="submit" else "secondary"):
+                st.session_state.demotion_subview="submit"; st.rerun()
+        with dsub2:
+            if st.button("✅ Manager Approval",use_container_width=True,type="primary" if st.session_state.demotion_subview=="approve" else "secondary"):
+                st.session_state.demotion_subview="approve"; st.rerun()
+        st.markdown("<hr>",unsafe_allow_html=True)
+
+        if st.session_state.demotion_subview=="submit":
+            conn=get_conn()
+            dm_emps=pg_read_sql("SELECT emp_id,full_name,job_title,basic_salary,division FROM employees WHERE current_status != 'Terminated' ORDER BY full_name",conn)
+            conn.close()
+            if len(dm_emps)==0:
+                st.info("No active employees yet.")
+            else:
+                dmlo={f"{r['emp_id']} — {r['full_name']}":r for _,r in dm_emps.iterrows()}
+                dm_emp_lbl=st.selectbox("Employee",list(dmlo.keys()),key="dm_emp_sel")
+                dm_row=dmlo[dm_emp_lbl]
+                st.markdown(f"""<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">
+                  Current job title: <b style="color:#F0C96B">{dm_row['job_title'] or '—'}</b> &nbsp;|&nbsp;
+                  Current basic salary: <b style="color:#10B981">ETB {float(dm_row['basic_salary'] or 0):,.2f}</b>
+                </div>""",unsafe_allow_html=True)
+
+                with st.form("demotion_form",clear_on_submit=True):
+                    dm1,dm2=st.columns(2)
+                    with dm1: dm_type=st.selectbox("Change Type",["Demotion","Promotion","Grade Change","Salary Adjustment"])
+                    with dm2: dm_new_title=st.text_input("New Job Title",value=dm_row['job_title'] or "")
+                    dm_new_salary=st.number_input("New Basic Salary (ETB)",min_value=0.0,value=float(dm_row['basic_salary'] or 0),step=100.0)
+                    dm_reason=st.text_area("Reason",placeholder="Explain the reason for this change...")
+                    if st.form_submit_button("Submit for Manager Approval",use_container_width=True):
+                        if not dm_reason:
+                            st.error("Please provide a reason.")
+                        else:
+                            conn=get_conn()
+                            conn.execute("""INSERT INTO demotion_records(emp_id,change_type,previous_title,previous_salary,
+                                new_title,new_salary,reason,submitted_by,submitted_at,status,finance_notified,applied)
+                                VALUES(?,?,?,?,?,?,?,?,?,'Pending Manager Approval',0,0)""",
+                                (dm_row['emp_id'],dm_type,dm_row['job_title'],float(dm_row['basic_salary'] or 0),
+                                 dm_new_title,dm_new_salary,dm_reason,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                            conn.commit(); conn.close()
+                            st.success(f"{dm_type} request submitted for {dm_row['full_name']} — awaiting Manager approval."); st.rerun()
+
+            st.markdown("<hr>",unsafe_allow_html=True)
+            st.markdown('<div class="fs">My Submitted Requests</div>',unsafe_allow_html=True)
+            conn=get_conn()
+            my_dm=pg_read_sql("""SELECT dr.id,dr.emp_id,e.full_name,dr.change_type,dr.previous_title,dr.new_title,
+                dr.previous_salary,dr.new_salary,dr.status,dr.submitted_at
+                FROM demotion_records dr LEFT JOIN employees e ON dr.emp_id=e.emp_id
+                WHERE dr.submitted_by=? ORDER BY dr.submitted_at DESC LIMIT 100""",conn,params=(st.session_state.uid,))
+            conn.close()
+            if len(my_dm)==0:
+                st.info("No requests submitted yet.")
+            else:
+                st.dataframe(my_dm,use_container_width=True,hide_index=True)
+
+        else:  # Manager Approval
+            if st.session_state.role!="Manager":
+                st.info("Only the Manager can give final approval on demotion/status changes.")
+            else:
+                conn=get_conn()
+                dm_pending=pg_read_sql("""SELECT dr.*,e.full_name,e.division FROM demotion_records dr
+                    LEFT JOIN employees e ON dr.emp_id=e.emp_id
+                    WHERE dr.status='Pending Manager Approval' ORDER BY dr.submitted_at ASC""",conn)
+                conn.close()
+                st.markdown(f'<div class="mg" style="grid-template-columns:1fr"><div class="mb mg-amber"><div class="ml ml-amber">Pending Approval</div><div class="mv">{len(dm_pending)}</div></div></div>',unsafe_allow_html=True)
+                if len(dm_pending)==0:
+                    st.info("No demotion/status change requests waiting for approval.")
+                else:
+                    for _,dm in dm_pending.iterrows():
+                        with st.expander(f"{dm['emp_id']} — {dm['full_name']} — {dm['change_type']} — {dm['previous_title'] or '—'} → {dm['new_title'] or '—'}"):
+                            st.markdown(f"""<div style="font-size:12px;color:#94A8C8;line-height:1.8">
+                              Division: <b style="color:#F0C96B">{dm['division'] or '—'}</b><br>
+                              Salary: <b style="color:#10B981">ETB {float(dm['previous_salary'] or 0):,.2f}</b> → <b style="color:#10B981">ETB {float(dm['new_salary'] or 0):,.2f}</b><br>
+                              Submitted by: {dm['submitted_by']} on {dm['submitted_at']}<br>
+                              Reason: {dm['reason'] or '—'}
+                            </div>""",unsafe_allow_html=True)
+                            dm_notes=st.text_input("Approval Notes",key=f"dm_notes_{dm['id']}")
+                            dmc1,dmc2=st.columns(2)
+                            with dmc1:
+                                if st.button("Approve & Apply",key=f"dm_appr_{dm['id']}",use_container_width=True):
+                                    conn=get_conn()
+                                    conn.execute("UPDATE employees SET job_title=?,basic_salary=? WHERE emp_id=?",
+                                        (dm['new_title'],float(dm['new_salary'] or 0),dm['emp_id']))
+                                    conn.execute("""UPDATE demotion_records SET status='Approved',reviewed_by=?,reviewed_at=?,
+                                        review_notes=?,finance_notified=1,applied=1 WHERE id=?""",
+                                        (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),dm_notes,dm['id']))
+                                    conn.commit(); conn.close()
+                                    st.cache_data.clear(); get_employee.clear()
+                                    st.success(f"Approved. {dm['full_name']}'s record updated — Finance notified for the next payroll run."); st.rerun()
+                            with dmc2:
+                                if st.button("Reject",key=f"dm_rej_{dm['id']}",use_container_width=True):
+                                    conn=get_conn()
+                                    conn.execute("UPDATE demotion_records SET status='Rejected',reviewed_by=?,reviewed_at=?,review_notes=? WHERE id=?",
+                                        (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),dm_notes,dm['id']))
+                                    conn.commit(); conn.close()
+                                    st.warning("Rejected."); st.rerun()
+
+                st.markdown("<hr>",unsafe_allow_html=True)
+                st.markdown('<div class="fs">Approved / Rejected History</div>',unsafe_allow_html=True)
+                conn=get_conn()
+                dm_hist=pg_read_sql("""SELECT dr.emp_id,e.full_name,dr.change_type,dr.previous_title,dr.new_title,
+                    dr.previous_salary,dr.new_salary,dr.status,dr.reviewed_by,dr.reviewed_at,dr.review_notes
+                    FROM demotion_records dr LEFT JOIN employees e ON dr.emp_id=e.emp_id
+                    WHERE dr.status != 'Pending Manager Approval' ORDER BY dr.reviewed_at DESC LIMIT 300""",conn)
+                conn.close()
+                if len(dm_hist)==0:
+                    st.info("No history yet.")
+                else:
+                    st.dataframe(dm_hist,use_container_width=True,hide_index=True)
+                    dm_buf=io.BytesIO()
+                    with pd.ExcelWriter(dm_buf,engine="xlsxwriter") as w: dm_hist.to_excel(w,index=False,sheet_name="Demotion_History")
+                    st.download_button("Export History",dm_buf.getvalue(),file_name=f"Demotion_History_{datetime.now().strftime('%Y%m%d')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     # ════════════════════════════════════════════════════════
     # PUBLIC HOLIDAYS
