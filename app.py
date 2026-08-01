@@ -16,7 +16,7 @@ import xlsxwriter
 import psycopg2
 import psycopg2.extensions
 
-st.set_page_config(page_title="Yetebaberut GSP — HRMS",layout="wide",initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Yetebaberut GSP — HRMS",page_icon="🏢",layout="wide",initial_sidebar_state="collapsed")
 
 # ══════════════════════════════════════════════════════════════════
 # POSTGRES COMPATIBILITY SHIM
@@ -603,10 +603,38 @@ def query_records(status_filter,div_filter,cc_filter,search,page=1,page_size=50)
 
 @st.cache_data(ttl=10)
 def get_employee(eid):
+    """Loads the employee's core profile + document NAMES, but deliberately
+    excludes the heavy document BLOB columns (edu_doc_data, id_scan_data,
+    etc.) so a routine profile view doesn't drag megabytes of file bytes
+    across the network on every load. Use get_employee_document_blob() to
+    fetch one specific document's bytes only when the user asks to view it.
+    photo_data is kept since the profile header always shows a thumbnail."""
+    heavy_blob_cols = {
+        "edu_doc_data","forensic_doc_data","id_scan_data","medical_doc_data",
+        "guarantee_letter_data","police_clearance_data","contract_doc_data","first_doc_data",
+    }
     conn=get_conn(); cur=conn.cursor()
-    cur.execute("SELECT * FROM employees WHERE emp_id=?",(eid,))
-    cols=[d[0] for d in cur.description]; row=cur.fetchone(); conn.close()
-    return dict(zip(cols,row)) if row else None
+    cur.execute("PRAGMA table_info(employees)")
+    all_cols=[c[1] for c in cur.fetchall()]
+    select_cols=[c for c in all_cols if c not in heavy_blob_cols]
+    cur.execute(f"SELECT {','.join(select_cols)} FROM employees WHERE emp_id=?",(eid,))
+    row=cur.fetchone(); conn.close()
+    if not row:
+        return None
+    result = dict(zip(select_cols,row))
+    for c in heavy_blob_cols:
+        result[c] = None  # placeholder; fetched on demand via get_employee_document_blob()
+    return result
+
+def get_employee_document_blob(eid, data_col):
+    """Fetch a single document's bytes on demand — called only when the
+    user clicks to preview/download that specific document, not as part
+    of the routine profile load."""
+    conn=get_conn(); cur=conn.cursor()
+    cur.execute(f"SELECT {data_col} FROM employees WHERE emp_id=?",(eid,))
+    row=cur.fetchone(); conn.close()
+    return row[0] if row else None
+
 
 @st.cache_data(ttl=15)
 def get_active_employee_payroll_summary():
@@ -1589,9 +1617,24 @@ with main_block:
             </div>""",unsafe_allow_html=True)
             st.markdown("<hr>",unsafe_allow_html=True)
             for lbl2,nk,dk,allowed in doc_defs:
-                fname=r.get(nk); fdata=r.get(dk)
+                fname=r.get(nk)
                 with st.expander(f"{lbl2}  {' Preview available' if fname else ' Not uploaded'}",expanded=False):
-                    st.markdown(f'<div class="pb">{preview_html(fdata,fname,lbl2)}</div>',unsafe_allow_html=True)
+                    if dk=="photo_data":
+                        # Photo is small and already loaded eagerly with the profile.
+                        fdata=r.get(dk)
+                        st.markdown(f'<div class="pb">{preview_html(fdata,fname,lbl2)}</div>',unsafe_allow_html=True)
+                    elif not fname:
+                        st.markdown(f'<div class="pb">{preview_html(None,None,lbl2)}</div>',unsafe_allow_html=True)
+                    else:
+                        blob_key=f"_docblob_{dk}_{eid2}"
+                        fdata=st.session_state.get(blob_key)
+                        if fdata is None:
+                            st.caption("Uploaded — click below to load the preview (kept out of the normal profile load to stay fast at scale).")
+                            if st.button(f"Load preview — {lbl2}",key=f"loadprev_{dk}_{eid2}",use_container_width=True):
+                                st.session_state[blob_key]=get_employee_document_blob(eid2,dk)
+                                st.rerun()
+                        else:
+                            st.markdown(f'<div class="pb">{preview_html(fdata,fname,lbl2)}</div>',unsafe_allow_html=True)
                     if fname and fdata:
                         dcol1,dcol2=st.columns(2)
                         with dcol1:
@@ -1603,6 +1646,7 @@ with main_block:
                                     conn.execute(f"UPDATE employees SET {nk}=NULL,{dk}=NULL WHERE emp_id=?",(eid2,))
                                     conn.commit(); conn.close()
                                     get_employee.clear()
+                                    st.session_state.pop(f"_docblob_{dk}_{eid2}",None)
                                     st.success(f"{lbl2} deleted."); st.rerun()
                     if st.session_state.role=="Manager":
                         st.markdown('<div style="font-size:10px;color:#6B7FA3;margin:8px 0 5px"> Upload new / replace — from scanner, camera or file</div>',unsafe_allow_html=True)
@@ -1612,7 +1656,9 @@ with main_block:
                             conn=get_conn()
                             conn.execute(f"UPDATE employees SET {nk}=?,{dk}=? WHERE emp_id=?",(upl.name,sqlite3.Binary(fb),eid2))
                             conn.commit(); conn.close()
-                            get_employee.clear(); st.success(f"{lbl2} saved!"); st.rerun()
+                            get_employee.clear()
+                            st.session_state.pop(f"_docblob_{dk}_{eid2}",None)
+                            st.success(f"{lbl2} saved!"); st.rerun()
         with t5:
             if st.session_state.role=="Manager":
                 with st.form(f"fe_{eid2}"):
