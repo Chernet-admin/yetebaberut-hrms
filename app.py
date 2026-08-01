@@ -16,7 +16,7 @@ import xlsxwriter
 import psycopg2
 import psycopg2.extensions
 
-st.set_page_config(page_title="Yetebaberut GSP — HRMS",page_icon="🏢",layout="wide",initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Yetebaberut GSP — HRMS",page_icon="🏢",layout="wide",initial_sidebar_state="expanded")
 
 # ══════════════════════════════════════════════════════════════════
 # POSTGRES COMPATIBILITY SHIM
@@ -1071,63 +1071,34 @@ NAV_GROUPS = [
 ]
 
 st.markdown("""<style>
-.nav-sidebar{padding-right:4px;position:sticky;top:200px;max-height:calc(100vh - 210px);overflow-y:auto}
+section[data-testid="stSidebar"]{background:#0D1526 !important;border-right:1px solid rgba(212,168,71,0.15) !important}
 .nav-group-label{font-size:8px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
     color:#6B7FA3;margin:10px 0 4px 4px}
 .nav-group-label:first-child{margin-top:0}
-.nav-sidebar div.stButton button{
+section[data-testid="stSidebar"] div.stButton button{
     width:100% !important; text-align:left !important; justify-content:flex-start !important;
     margin-bottom:2px !important; padding:5px 10px !important; min-height:30px !important;
-    background:#0D1526 !important; color:#94A8C8 !important; font-size:11px !important;
+    background:#131F38 !important; color:#94A8C8 !important; font-size:11px !important;
     border:1px solid rgba(255,255,255,0.06) !important;
     box-shadow:none !important; font-weight:500 !important; border-radius:6px !important;}
-.nav-sidebar div.stButton button:hover{
-    background:#131F38 !important; color:#E8EEF7 !important;
+section[data-testid="stSidebar"] div.stButton button:hover{
+    background:#1A2740 !important; color:#E8EEF7 !important;
     border-color:rgba(212,168,71,0.3) !important;}
-.nav-sidebar .nav-active button{
+.nav-active button{
     background:linear-gradient(135deg,#1A6B3C,#22C55E) !important;
     color:#fff !important; font-weight:600 !important;
     border-color:transparent !important;}
 .nav-footer{margin-top:10px;padding:6px 8px;border-top:1px solid rgba(255,255,255,0.07);
     font-size:9px;color:#6B7FA3;text-align:center}
-.st-key-nav_toggle_bar{display:flex;align-items:center;background:#0D1526;
-    border-bottom:1px solid rgba(212,168,71,0.2);padding:6px 14px;
-    gap:12px;position:sticky !important;top:156px !important;z-index:9997 !important;}
-.hb-title{font-size:11px;color:#6B7FA3;letter-spacing:.06em;
-    text-transform:uppercase;font-weight:600}
-div[data-testid="stHorizontalBlock"] > div:first-child div.stButton button[kind="secondary"]{
-    background:#0D1526 !important;border:1px solid rgba(212,168,71,0.35) !important;
-    color:#D4A847 !important;font-size:16px !important;font-weight:700 !important;
-    padding:2px 10px !important;min-height:34px !important;min-width:42px !important;
-    border-radius:6px !important;line-height:1 !important;}
 </style>""",unsafe_allow_html=True)
 
-if "sidebar_open" not in st.session_state: st.session_state.sidebar_open = True
-
-# ── Hamburger toggle sits in a dedicated bar, sticky just below the header ──
+# ── Navigation now lives in Streamlit's NATIVE sidebar instead of a
+# custom column + CSS-sticky trick. The native sidebar always stays
+# fixed/visible independent of main-content scrolling — this is a
+# built-in Streamlit behavior, not something that can silently break. ──
 if st.session_state.role:
-    toggle_bar = st.container(key="nav_toggle_bar")
-    with toggle_bar:
-        hb_col, hb_label = st.columns([0.08, 1])
-        with hb_col:
-            toggle_icon = "☰"
-            if st.button(toggle_icon, key="nav_toggle", help="Toggle navigation menu"):
-                st.session_state.sidebar_open = not st.session_state.sidebar_open
-                st.rerun()
-        with hb_label:
-            current_view_label = st.session_state.view or "Home"
-            st.markdown(f'<div class="hb-title" style="padding-top:6px">Navigation &nbsp;|&nbsp; <span style="color:#F0C96B">{current_view_label}</span></div>', unsafe_allow_html=True)
-
-if st.session_state.role and st.session_state.sidebar_open:
-    nav_col, main_col = st.columns([1, 5.5])
-elif st.session_state.role and not st.session_state.sidebar_open:
-    nav_col, main_col = None, st.container()
-else:
-    nav_col, main_col = None, st.container()
-
-if st.session_state.role and st.session_state.sidebar_open:
-    with nav_col:
-        st.markdown('<div class="nav-sidebar">', unsafe_allow_html=True)
+    with st.sidebar:
+        st.markdown(f'<div style="padding:8px 4px 4px;color:#F0C96B;font-family:\'Cinzel\',serif;font-size:13px;font-weight:700">Navigation</div>',unsafe_allow_html=True)
         for group_label, group_views in NAV_GROUPS:
             visible_in_group = [v for v in group_views if v in VIEWS]
             if not visible_in_group: continue
@@ -1139,9 +1110,10 @@ if st.session_state.role and st.session_state.sidebar_open:
                     st.session_state.view=v; st.rerun()
                 if is_active: st.markdown('</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="nav-footer">Yetebaberut HRMS<br>v2.0</div>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
 
-main_block = main_col.container() if st.session_state.role else main_col
+main_block = st.container() if st.session_state.role else st.container()
+
+
 
 def sclass(s):
     return {"Active Deployment":"sa","Pending Screening":"spe","Pre-Employment Process":"spr","On Leave":"sl","Terminated":"st"}.get(s,"spe")
