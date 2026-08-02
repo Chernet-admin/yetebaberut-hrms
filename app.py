@@ -812,8 +812,22 @@ seed_if_empty()
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Cinzel:wght@700&display=swap');
 *{box-sizing:border-box}
-.st-key-sticky_header{position:sticky !important;top:0 !important;z-index:9998 !important;
-  background:#060B18 !important;padding-top:2px !important}
+/* Shrink Streamlit's own top toolbar + default content padding — this is
+   the gap the user is seeing between the Chrome URL bar and our header. */
+header[data-testid="stHeader"]{height:2.2rem !important;min-height:2.2rem !important;background:#060B18 !important}
+.block-container{padding-top:0.5rem !important}
+
+/* True frozen header: position:fixed is anchored to the actual browser
+   viewport, not to Streamlit's internal scroll container — this does not
+   depend on Streamlit's key-to-CSS-class behavior the way position:sticky
+   did, so it should hold regardless of Streamlit version/DOM nesting. */
+.st-key-sticky_header{position:fixed !important;top:2.2rem !important;left:0 !important;right:0 !important;
+  width:100% !important;z-index:99999 !important;background:#060B18 !important;
+  padding:2px 1rem 4px !important;box-shadow:0 4px 16px rgba(0,0,0,0.5) !important}
+/* Push the rest of the page down so the fixed header doesn't cover it.
+   If content still peeks out from under the header on your screen,
+   increase this padding-top value in small steps (e.g. 195px -> 220px). */
+.stApp{padding-top:170px !important}
 .stApp{background:#060B18 !important;color:#E8EEF7 !important;font-family:'Inter',sans-serif !important}
 .yh{background:linear-gradient(135deg,#0D1526,#0A1020,#0D1830);border-bottom:1px solid rgba(212,168,71,0.25);
   padding:14px 28px;margin:-1rem -1rem 0;position:relative}
