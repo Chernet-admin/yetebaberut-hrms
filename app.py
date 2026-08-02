@@ -827,23 +827,21 @@ section[data-testid="stSidebar"]{z-index:9500 !important}
 [data-testid="stSidebarCollapsedControl"],[data-testid="stSidebarCollapseButton"]{
   background:rgba(212,168,71,0.25) !important;border-radius:6px !important;
   border:1px solid rgba(212,168,71,0.4) !important}
-/* Keep the sidebar's own "Main Menu" title pinned to the top of the
-   sidebar at all times. position:sticky did NOT hold here (same issue
-   as the main header before) — using position:fixed instead, which is
-   the technique that actually worked for the main header. It reuses the
-   same live-measured --ygsp-sbw width so it always matches the sidebar's
-   real width, whatever that is. */
-.ygsp-sidebar-title{position:fixed !important;top:2.2rem !important;left:0 !important;
-  width:var(--ygsp-sbw,21rem) !important;z-index:9600 !important;
-  background:#0D1526 !important;padding:8px 12px 6px !important;margin:0 !important;
-  border-bottom:1px solid rgba(212,168,71,0.2) !important}
+/* NOTE: attempted to keep this title pinned to the top of the sidebar
+   using both position:sticky and position:fixed — neither held correctly
+   in this deployment (sticky didn't stick; fixed floated at the wrong
+   reference point and overlapped the button list). Rather than guess a
+   third time, this now just renders as normal in-flow content, same as
+   any other sidebar element — reliable, even though it will scroll along
+   with the rest of the list instead of staying pinned. */
+.ygsp-sidebar-title{background:#0D1526 !important;padding:8px 4px 4px !important;margin:0 !important}
 /* Push down ONLY the main content's block-container (NOT the sidebar's —
    scoping to [data-testid="stAppViewContainer"] .main keeps the sidebar's
    own nav list starting at its normal position, unaffected by the header). */
 [data-testid="stAppViewContainer"] .main .block-container{padding-top:195px !important}
-/* The sidebar's own button list needs enough clearance below BOTH the
-   shrunk top toolbar AND the now-fixed "Main Menu" title bar above it. */
-section[data-testid="stSidebar"] .block-container{padding-top:3.4rem !important}
+/* The sidebar's own content still needs a little clearance below the
+   shrunk top toolbar. */
+section[data-testid="stSidebar"] .block-container{padding-top:1rem !important}
 .stApp{background:#060B18 !important;color:#E8EEF7 !important;font-family:'Inter',sans-serif !important}
 .yh{background:linear-gradient(135deg,#0D1526,#0A1020,#0D1830);border-bottom:1px solid rgba(212,168,71,0.25);
   padding:10px 28px 8px;margin:0 -1rem 0;position:relative;border-radius:8px 8px 0 0}
