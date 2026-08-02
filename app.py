@@ -815,7 +815,6 @@ st.markdown("""<style>
 /* Shrink Streamlit's own top toolbar + default content padding — this is
    the gap the user is seeing between the Chrome URL bar and our header. */
 header[data-testid="stHeader"]{height:2.2rem !important;min-height:2.2rem !important;background:#060B18 !important}
-.block-container{padding-top:0.5rem !important}
 
 /* True frozen header: position:fixed is anchored to the actual browser
    viewport, not to Streamlit's internal scroll container — this does not
@@ -832,14 +831,19 @@ header[data-testid="stHeader"]{height:2.2rem !important;min-height:2.2rem !impor
    above the header so it never renders underneath it either way. */
 section[data-testid="stSidebar"]{z-index:9500 !important}
 [data-testid="stSidebarCollapsedControl"] svg,[data-testid="stSidebarCollapseButton"] svg{
-  color:#D4A847 !important}
+  color:#FFFFFF !important;filter:drop-shadow(0 0 3px rgba(0,0,0,0.6)) !important}
+[data-testid="stSidebarCollapsedControl"],[data-testid="stSidebarCollapseButton"]{
+  background:rgba(212,168,71,0.15) !important;border-radius:6px !important}
 body:has(section[data-testid="stSidebar"][aria-expanded="true"]) .st-key-sticky_header{
   left:21rem !important;
 }
-/* Push the rest of the page down so the fixed header doesn't cover it.
-   If content still peeks out from under the header on your screen,
-   increase this padding-top value in small steps (e.g. 145px -> 165px). */
-.stApp{padding-top:145px !important}
+/* Push down ONLY the main content's block-container (NOT the sidebar's —
+   scoping to [data-testid="stAppViewContainer"] .main keeps the sidebar's
+   own nav list starting at its normal position, unaffected by the header). */
+[data-testid="stAppViewContainer"] .main .block-container{padding-top:195px !important}
+/* The sidebar's own content still needs a little clearance below the
+   shrunk top toolbar, independent of the main header's height. */
+section[data-testid="stSidebar"] .block-container{padding-top:1rem !important}
 .stApp{background:#060B18 !important;color:#E8EEF7 !important;font-family:'Inter',sans-serif !important}
 .yh{background:linear-gradient(135deg,#0D1526,#0A1020,#0D1830);border-bottom:1px solid rgba(212,168,71,0.25);
   padding:10px 28px 8px;margin:0 -1rem 0;position:relative;border-radius:8px 8px 0 0}
