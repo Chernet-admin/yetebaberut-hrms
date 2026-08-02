@@ -822,25 +822,40 @@ header[data-testid="stHeader"]{height:2.2rem !important;min-height:2.2rem !impor
    depend on Streamlit's key-to-CSS-class behavior the way position:sticky
    did, so it should hold regardless of Streamlit version/DOM nesting. */
 .st-key-sticky_header{position:fixed !important;top:2.2rem !important;left:0 !important;right:0 !important;
-  width:100% !important;z-index:99999 !important;background:#060B18 !important;
-  padding:2px 1rem 4px !important;box-shadow:0 4px 16px rgba(0,0,0,0.5) !important}
+  width:100% !important;z-index:9000 !important;background:#060B18 !important;
+  padding:2px 1rem 2px !important;box-shadow:0 4px 16px rgba(0,0,0,0.5) !important;
+  transition:left .2s ease !important}
+/* When the native sidebar is expanded, the fixed header must start AFTER
+   it — otherwise the sidebar (which sits on top, z-index-wise) covers the
+   left portion of our title. When the sidebar is collapsed, the header
+   goes back to spanning the full width. Sidebar's own z-index must stay
+   above the header so it never renders underneath it either way. */
+section[data-testid="stSidebar"]{z-index:9500 !important}
+[data-testid="stSidebarCollapsedControl"] svg,[data-testid="stSidebarCollapseButton"] svg{
+  color:#D4A847 !important}
+body:has(section[data-testid="stSidebar"][aria-expanded="true"]) .st-key-sticky_header{
+  left:21rem !important;
+}
 /* Push the rest of the page down so the fixed header doesn't cover it.
    If content still peeks out from under the header on your screen,
-   increase this padding-top value in small steps (e.g. 195px -> 220px). */
-.stApp{padding-top:170px !important}
+   increase this padding-top value in small steps (e.g. 145px -> 165px). */
+.stApp{padding-top:145px !important}
 .stApp{background:#060B18 !important;color:#E8EEF7 !important;font-family:'Inter',sans-serif !important}
 .yh{background:linear-gradient(135deg,#0D1526,#0A1020,#0D1830);border-bottom:1px solid rgba(212,168,71,0.25);
-  padding:14px 28px;margin:-1rem -1rem 0;position:relative}
+  padding:10px 28px 8px;margin:0 -1rem 0;position:relative;border-radius:8px 8px 0 0}
 .yh::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
   background:linear-gradient(90deg,transparent,#D4A847,#F0C96B,#D4A847,transparent)}
 .hb{font-family:'Cinzel',serif !important;font-size:clamp(14px,2vw,22px) !important;
   font-weight:700 !important;color:#F0C96B !important;letter-spacing:.06em !important;margin:0 !important}
 .ht{font-size:10px;color:#6B7FA3;letter-spacing:.08em;text-transform:uppercase;margin-top:2px}
-.cs{display:flex;background:#0D1526;border:1px solid rgba(212,168,71,0.15);border-radius:8px;overflow:hidden;margin:10px 0}
-.ci{flex:1;padding:7px 12px;font-size:11px;color:#94A8C8;border-right:1px solid rgba(255,255,255,0.06)}
+.cs{display:flex;background:#0D1526;border:1px solid rgba(212,168,71,0.15);border-radius:8px;overflow:hidden;margin:4px 0 2px}
+.ci{flex:1;padding:5px 12px;font-size:11px;color:#94A8C8;border-right:1px solid rgba(255,255,255,0.06)}
 .ci:last-child{border-right:none}
 .card{background:#0D1526;border:1px solid rgba(255,255,255,0.07);border-radius:12px;
   padding:16px;margin-bottom:12px;position:relative;overflow:hidden}
+.st-key-sticky_header div[data-testid="stVerticalBlock"]{gap:0.25rem !important}
+.st-key-sticky_header .sb{margin-bottom:4px !important}
+.st-key-sticky_header div[data-testid="stHorizontalBlock"]:first-of-type{align-items:center !important}
 .card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
   background:linear-gradient(90deg,transparent,rgba(212,168,71,0.3),transparent)}
 .card-gold{background:linear-gradient(135deg,#0D1526,#12192E);border:1px solid rgba(212,168,71,0.3)}
@@ -953,7 +968,6 @@ with sticky_header:
           <div class="ht">Human Resource Management System | Addis Ababa, Ethiopia | Est. 2015</div>
         </div>""",unsafe_allow_html=True)
     with h2:
-        st.write(""); st.write("")
         if not st.session_state.role:
             if st.button("LOGIN",use_container_width=True): st.session_state.show_login=True
             @st.dialog("Portal Login")
