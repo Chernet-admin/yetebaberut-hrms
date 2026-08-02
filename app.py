@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import sqlite3
 import io
@@ -781,27 +782,15 @@ def export_excel(df):
     return buf.getvalue()
 
 # ════════════════════════════════════════════════════════
-# SEED DATA — Professional sample dataset (only runs once)
+# CLEANUP — remove any auto-seeded cost centers.
+# This app used to auto-create a default set of cost centers on first
+# run. The user manages cost centers manually, so this now does the
+# opposite: it removes any leftover system-created ones instead of
+# creating new ones, and never seeds anything going forward.
 # ════════════════════════════════════════════════════════
 def seed_if_empty():
-    # NOTE: this no longer generates random sample employees — the employee
-    # table starts empty so real staff can be entered via Applicant Intake.
-    # It seeds the default division/cost-center reference rows ONLY the very
-    # first time (when cost_centers is completely empty). Without this guard
-    # it would re-run on every page click and silently recreate any cost
-    # center a Manager deletes.
-    conn=get_conn(); c=conn.cursor()
-    c.execute("SELECT COUNT(*) FROM cost_centers")
-    if c.fetchone()[0]>0:
-        conn.close(); return
-    now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    CC_MAP={"Catering":["CC-CAT-01","CC-CAT-02"],"MRO":["CC-MRO-01","CC-MRO-02"],
-            "Appearance":["CC-APP-01"],"Ramp":["CC-RMP-01","CC-RMP-02"],"Cargo":["CC-CGO-01"]}
-    cc_recs=[]
-    for div,ccs in CC_MAP.items():
-        for cc in ccs:
-            cc_recs.append((cc,f"{div} Operations — {cc}",div,0,f"Cost center for {div} division",1,"system",now))
-    c.executemany("INSERT OR IGNORE INTO cost_centers(code,name,division,budget,description,is_active,created_by,created_at)VALUES(?,?,?,?,?,?,?,?)",cc_recs)
+    conn=get_conn()
+    conn.execute("DELETE FROM cost_centers WHERE created_by='system'")
     conn.commit(); conn.close()
 
 seed_if_empty()
@@ -819,24 +808,30 @@ header[data-testid="stHeader"]{height:2.2rem !important;min-height:2.2rem !impor
 /* True frozen header: position:fixed is anchored to the actual browser
    viewport, not to Streamlit's internal scroll container — this does not
    depend on Streamlit's key-to-CSS-class behavior the way position:sticky
-   did, so it should hold regardless of Streamlit version/DOM nesting. */
-.st-key-sticky_header{position:fixed !important;top:2.2rem !important;left:0 !important;right:0 !important;
-  width:100% !important;z-index:9000 !important;background:#060B18 !important;
+   did, so it should hold regardless of Streamlit version/DOM nesting.
+   --ygsp-sbw is kept in sync with the sidebar's REAL, live width by a
+   small JS snippet below — no more guessing a fixed rem value, which is
+   what caused the overlap glitch where the sidebar met the header. */
+:root{--ygsp-sbw:0px}
+.st-key-sticky_header{position:fixed !important;top:2.2rem !important;left:var(--ygsp-sbw,0px) !important;right:0 !important;
+  width:calc(100% - var(--ygsp-sbw,0px)) !important;z-index:9000 !important;background:#060B18 !important;
   padding:2px 1rem 2px !important;box-shadow:0 4px 16px rgba(0,0,0,0.5) !important;
-  transition:left .2s ease !important}
-/* When the native sidebar is expanded, the fixed header must start AFTER
-   it — otherwise the sidebar (which sits on top, z-index-wise) covers the
-   left portion of our title. When the sidebar is collapsed, the header
-   goes back to spanning the full width. Sidebar's own z-index must stay
-   above the header so it never renders underneath it either way. */
+  transition:left .15s ease,width .15s ease !important}
+/* Sidebar must stay above the header in stacking order too, as a fallback. */
 section[data-testid="stSidebar"]{z-index:9500 !important}
-[data-testid="stSidebarCollapsedControl"] svg,[data-testid="stSidebarCollapseButton"] svg{
-  color:#FFFFFF !important;filter:drop-shadow(0 0 3px rgba(0,0,0,0.6)) !important}
+/* Collapse/expand arrow — broad selector set + both color AND fill,
+   since different Streamlit versions render this icon slightly differently. */
+[data-testid="stSidebarCollapsedControl"],[data-testid="stSidebarCollapseButton"],
+[data-testid="stSidebarCollapsedControl"] *,[data-testid="stSidebarCollapseButton"] *{
+  color:#FFFFFF !important;fill:#FFFFFF !important;stroke:#FFFFFF !important}
 [data-testid="stSidebarCollapsedControl"],[data-testid="stSidebarCollapseButton"]{
-  background:rgba(212,168,71,0.15) !important;border-radius:6px !important}
-body:has(section[data-testid="stSidebar"][aria-expanded="true"]) .st-key-sticky_header{
-  left:21rem !important;
-}
+  background:rgba(212,168,71,0.25) !important;border-radius:6px !important;
+  border:1px solid rgba(212,168,71,0.4) !important}
+/* Keep the sidebar's own "Menu" title pinned to the top of the sidebar's
+   internal scroll area, so it doesn't scroll away when the nav list is
+   long enough to need scrolling within the sidebar itself. */
+.ygsp-sidebar-title{position:sticky !important;top:0 !important;z-index:10 !important;
+  background:#0D1526 !important;padding:8px 4px 4px !important;margin:0 !important}
 /* Push down ONLY the main content's block-container (NOT the sidebar's —
    scoping to [data-testid="stAppViewContainer"] .main keeps the sidebar's
    own nav list starting at its normal position, unaffected by the header). */
@@ -974,9 +969,15 @@ with sticky_header:
     with h2:
         if not st.session_state.role:
             if st.button("LOGIN",use_container_width=True): st.session_state.show_login=True
-            @st.dialog("Portal Login")
+            @st.dialog("Portal Login", width="large")
             def login():
                 st.markdown("""<style>
+                div[data-testid="stDialog"] div[role="dialog"]{
+                    background:#0D1526 !important;border:1px solid rgba(212,168,71,0.35) !important;
+                    border-radius:16px !important;padding:8px !important}
+                div[data-testid="stDialog"] div[role="dialog"] *:not(input):not(button){color:#E8EEF7}
+                div[data-testid="stDialog"] h2,div[data-testid="stDialogHeader"]{
+                    color:#F0C96B !important;font-family:'Cinzel',serif !important}
                 div[data-testid="stDialog"] input{
                     background:#FFFFFF !important;color:#0D1526 !important;
                     border:1px solid #D4A847 !important;border-radius:8px !important}
@@ -986,7 +987,7 @@ with sticky_header:
                     background:linear-gradient(135deg,#1A6B3C,#22C55E) !important;
                     color:#FFFFFF !important;border:none !important}
                 </style>""",unsafe_allow_html=True)
-                st.markdown('<div class="gt" style="color:#10B981 !important">Yetebaberut Login</div>',unsafe_allow_html=True)
+                st.markdown('<div class="gt" style="color:#10B981 !important;margin-bottom:14px">Yetebaberut Login</div>',unsafe_allow_html=True)
                 with st.form("lf"):
                     st.markdown('<div class="gl" style="color:#10B981 !important">User ID</div>',unsafe_allow_html=True)
                     u=st.text_input("u",label_visibility="collapsed")
@@ -1028,6 +1029,38 @@ with sticky_header:
       <div class="ci"> +251 91 055 6909 / 018-68-87-70</div>
     </div>""",unsafe_allow_html=True)
     st.markdown("<hr style='margin:6px 0 !important'>",unsafe_allow_html=True)
+
+# Keeps the fixed header correctly aligned to the sidebar's REAL width at
+# all times (expanded, collapsed, or manually resized by dragging) — no
+# hardcoded pixel/rem guess, which is what caused the earlier overlap glitch.
+components.html("""
+<script>
+(function(){
+  function syncSidebarWidth(){
+    try{
+      var doc = window.parent.document;
+      var sidebar = doc.querySelector('section[data-testid="stSidebar"]');
+      var root = doc.documentElement;
+      if(sidebar && sidebar.getBoundingClientRect().width > 20){
+        var w = sidebar.getBoundingClientRect().width;
+        root.style.setProperty('--ygsp-sbw', w + 'px');
+      } else {
+        root.style.setProperty('--ygsp-sbw', '0px');
+      }
+    }catch(e){}
+  }
+  syncSidebarWidth();
+  setInterval(syncSidebarWidth, 200);
+  try{
+    var doc = window.parent.document;
+    var sidebar = doc.querySelector('section[data-testid="stSidebar"]');
+    if(sidebar && window.parent.ResizeObserver){
+      new window.parent.ResizeObserver(syncSidebarWidth).observe(sidebar);
+    }
+  }catch(e){}
+})();
+</script>
+""", height=0)
 
 # ════════════════════════════════════════════════════════
 # NAVIGATION ACCESS DEFINITIONS
@@ -1130,7 +1163,7 @@ section[data-testid="stSidebar"] div.stButton button:hover{
 # built-in Streamlit behavior, not something that can silently break. ──
 if st.session_state.role:
     with st.sidebar:
-        st.markdown(f'<div style="padding:8px 4px 4px;color:#F0C96B;font-family:\'Cinzel\',serif;font-size:13px;font-weight:700">Navigation</div>',unsafe_allow_html=True)
+        st.markdown(f'<div class="ygsp-sidebar-title" style="color:#F0C96B;font-family:\'Cinzel\',serif;font-size:13px;font-weight:700">Main Menu</div>',unsafe_allow_html=True)
         for group_label, group_views in NAV_GROUPS:
             visible_in_group = [v for v in group_views if v in VIEWS]
             if not visible_in_group: continue
