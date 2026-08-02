@@ -1163,7 +1163,7 @@ section[data-testid="stSidebar"] div.stButton button:hover{
 # built-in Streamlit behavior, not something that can silently break. ──
 if st.session_state.role:
     with st.sidebar:
-        st.markdown(f'<div class="ygsp-sidebar-title" style="color:#F0C96B;font-family:\'Cinzel\',serif;font-size:13px;font-weight:700">TEST123 Main Menu</div>',unsafe_allow_html=True)
+        st.markdown(f'<div class="ygsp-sidebar-title" style="color:#F0C96B;font-family:\'Cinzel\',serif;font-size:13px;font-weight:700">Main Menu</div>',unsafe_allow_html=True)
         for group_label, group_views in NAV_GROUPS:
             visible_in_group = [v for v in group_views if v in VIEWS]
             if not visible_in_group: continue
