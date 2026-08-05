@@ -827,21 +827,22 @@ section[data-testid="stSidebar"]{z-index:9500 !important}
 [data-testid="stSidebarCollapsedControl"],[data-testid="stSidebarCollapseButton"]{
   background:rgba(212,168,71,0.25) !important;border-radius:6px !important;
   border:1px solid rgba(212,168,71,0.4) !important}
-/* NOTE: attempted to keep this title pinned to the top of the sidebar
-   using both position:sticky and position:fixed — neither held correctly
-   in this deployment (sticky didn't stick; fixed floated at the wrong
-   reference point and overlapped the button list). Rather than guess a
-   third time, this now just renders as normal in-flow content, same as
-   any other sidebar element — reliable, even though it will scroll along
-   with the rest of the list instead of staying pinned. */
-.ygsp-sidebar-title{background:#0D1526 !important;padding:8px 4px 4px !important;margin:0 !important}
+/* Third attempt at pinning this title, using the SAME technique that
+   actually worked for the header width: a live-measured value from JS
+   (--ygsp-sbtop = the sidebar's real top edge, in real pixels) instead of
+   a guessed rem value — the two previous guesses (sticky, then a guessed
+   fixed offset) are what caused this to fail before. */
+.ygsp-sidebar-title{position:fixed !important;top:var(--ygsp-sbtop,2.2rem) !important;left:0 !important;
+  width:var(--ygsp-sbw,21rem) !important;z-index:9600 !important;
+  background:#0D1526 !important;padding:8px 12px 6px !important;margin:0 !important;
+  border-bottom:1px solid rgba(212,168,71,0.25) !important}
 /* Push down ONLY the main content's block-container (NOT the sidebar's —
    scoping to [data-testid="stAppViewContainer"] .main keeps the sidebar's
    own nav list starting at its normal position, unaffected by the header). */
-[data-testid="stAppViewContainer"] .main .block-container{padding-top:195px !important}
-/* The sidebar's own content still needs a little clearance below the
-   shrunk top toolbar. */
-section[data-testid="stSidebar"] .block-container{padding-top:1rem !important}
+[data-testid="stAppViewContainer"] .main .block-container{padding-top:235px !important}
+/* The sidebar's own button list needs clearance below the now-fixed
+   "Main Menu" title bar so buttons don't render underneath it. */
+section[data-testid="stSidebar"] .block-container{padding-top:3.2rem !important}
 .stApp{background:#060B18 !important;color:#E8EEF7 !important;font-family:'Inter',sans-serif !important}
 .yh{background:linear-gradient(135deg,#0D1526,#0A1020,#0D1830);border-bottom:1px solid rgba(212,168,71,0.25);
   padding:10px 28px 8px;margin:0 -1rem 0;position:relative;border-radius:8px 8px 0 0}
@@ -1040,34 +1041,41 @@ with sticky_header:
 # Keeps the fixed header correctly aligned to the sidebar's REAL width at
 # all times (expanded, collapsed, or manually resized by dragging) — no
 # hardcoded pixel/rem guess, which is what caused the earlier overlap glitch.
+# Also measures the sidebar's real TOP offset (not just width) so the
+# "Main Menu" title bar can be pinned at the exact right vertical position
+# instead of a guessed rem value, which is what caused it to overlap/float
+# in the wrong spot in earlier attempts.
 components.html("""
 <script>
 (function(){
-  function syncSidebarWidth(){
+  function syncSidebar(){
     try{
       var doc = window.parent.document;
       var sidebar = doc.querySelector('section[data-testid="stSidebar"]');
       var root = doc.documentElement;
       if(sidebar && sidebar.getBoundingClientRect().width > 20){
-        var w = sidebar.getBoundingClientRect().width;
-        root.style.setProperty('--ygsp-sbw', w + 'px');
+        var rect = sidebar.getBoundingClientRect();
+        root.style.setProperty('--ygsp-sbw', rect.width + 'px');
+        root.style.setProperty('--ygsp-sbtop', Math.max(rect.top,0) + 'px');
       } else {
         root.style.setProperty('--ygsp-sbw', '0px');
       }
     }catch(e){}
   }
-  syncSidebarWidth();
-  setInterval(syncSidebarWidth, 200);
+  syncSidebar();
+  setInterval(syncSidebar, 200);
   try{
     var doc = window.parent.document;
     var sidebar = doc.querySelector('section[data-testid="stSidebar"]');
     if(sidebar && window.parent.ResizeObserver){
-      new window.parent.ResizeObserver(syncSidebarWidth).observe(sidebar);
+      new window.parent.ResizeObserver(syncSidebar).observe(sidebar);
     }
+    doc.addEventListener('scroll', syncSidebar, true);
   }catch(e){}
 })();
 </script>
 """, height=0)
+
 
 # ════════════════════════════════════════════════════════
 # NAVIGATION ACCESS DEFINITIONS
