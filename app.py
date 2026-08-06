@@ -2412,7 +2412,7 @@ with main_block:
                             (seid,pay_month,base,transport,housing,other_al,tax,pen_emp,pen_er,other_ded,
                              total_fine_amt,total_fine_days,sick_days,annual_days,mat_days,mourning_days,
                              unpaid_days,absent_input,hol_count,dayoff_count,gross,net,notes_pay,datetime.now().strftime("%Y-%m-%d"),
-                             er.iloc[0]['full_name'] if len(er)>0 else None,er.iloc[0]['division'] if len(er)>0 else None,er.iloc[0]['cost_center'] if len(er)>0 else None))
+                             er['full_name'],er['division'],er['cost_center']))
                         if apply_all and len(fines_df)>0:
                             ids=tuple(fines_df["id"].tolist())
                             if len(ids)==1: conn.execute("UPDATE fine_letters SET applied_to_payroll='Yes' WHERE id=?",(ids[0],))
