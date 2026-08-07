@@ -1808,7 +1808,7 @@ with main_block:
             st.markdown(f'<div class="card"><div class="fs">Notes</div><div style="color:#C8D8F0;font-size:12px;line-height:1.7;white-space:pre-wrap">{r.get("notes","No notes.") or "No notes."}</div></div>',unsafe_allow_html=True)
 
             conn=get_conn()
-            lv=pg_read_sql("SELECT id,leave_type,start_date,end_date,days_taken,CASE WHEN is_paid=1 THEN 'Paid' ELSE 'Unpaid' END as paid,deduction_amount,status,doc_name FROM leave_records WHERE emp_id=? ORDER BY start_date DESC",conn,params=(eid2,))
+            lv=pg_read_sql("SELECT id,leave_type,start_date,end_date,days_taken,CASE WHEN is_paid=1 THEN 'Paid' ELSE 'Unpaid' END as paid,deduction_amount,status,COALESCE(approved_by,'—') as approved_by,doc_name FROM leave_records WHERE emp_id=? ORDER BY start_date DESC",conn,params=(eid2,))
             fl=pg_read_sql("SELECT id,COALESCE(month,'—') as month,issue_date,COALESCE(fine_type,'Disciplinary') as fine_type,COALESCE(fine_reason,'') as fine_reason,fine_days,fine_amount,applied_to_payroll,letter_name FROM fine_letters WHERE emp_id=? ORDER BY issue_date DESC",conn,params=(eid2,))
             ab=pg_read_sql("SELECT absent_date,reason,CASE WHEN is_excused=1 THEN 'Excused' ELSE 'Unexcused' END as type FROM absent_records WHERE emp_id=? ORDER BY absent_date DESC",conn,params=(eid2,))
             conn.close()
@@ -1849,7 +1849,7 @@ with main_block:
             # ── Leave / Sick / Vacation History with attachments ──
             st.markdown('<div class="ey" style="margin-top:8px">Leave History</div>',unsafe_allow_html=True)
             if len(lv)>0:
-                st.dataframe(lv.drop(columns=["id","doc_name"]),use_container_width=True,hide_index=True)
+                st.dataframe(lv.drop(columns=["id","doc_name"]).rename(columns={"approved_by":"Approved By (Supervisor/GS/HR)"}),use_container_width=True,hide_index=True)
                 lv_docs=lv[lv['doc_name'].notna()]
                 if len(lv_docs)>0:
                     lvd_opts={f"ID {row['id']} — {row['leave_type']} ({row['start_date']} to {row['end_date']})":row['id'] for _,row in lv_docs.iterrows()}
@@ -2252,17 +2252,22 @@ with main_block:
                                 st.success(f"Submitted {ds_status} for {ds_emp} — sent to General Supervisor for review.")
 
                 st.markdown("<hr>",unsafe_allow_html=True)
-                st.markdown('<div class="ey">Your Recent Submissions</div>',unsafe_allow_html=True)
+                st.markdown('<div class="ey">Your Recent Submissions — Status Tracker</div>',unsafe_allow_html=True)
+                st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Shows exactly where each submission is: pending review, approved, returned, or rejected — and by whom.</div>',unsafe_allow_html=True)
                 conn=get_conn()
                 my_dsr=pg_read_sql("""SELECT dsr.id,e.full_name,dsr.status,dsr.start_date,dsr.end_date,dsr.num_days,
-                    dsr.workflow_stage,dsr.gs_comments,dsr.hr_comments
+                    dsr.workflow_stage,dsr.gs_reviewed_by,dsr.gs_comments,dsr.hr_reviewed_by,dsr.hr_comments
                     FROM daily_status_records dsr JOIN employees e ON dsr.emp_id=e.emp_id
                     WHERE dsr.supervisor_id=? ORDER BY dsr.submitted_at DESC LIMIT 50""",conn,params=(st.session_state.uid,))
                 conn.close()
                 if len(my_dsr)==0:
                     st.info("No submissions yet.")
                 else:
-                    st.dataframe(my_dsr,use_container_width=True,hide_index=True)
+                    st.dataframe(my_dsr.rename(columns={
+                        "full_name":"Employee","status":"Type","start_date":"Start","end_date":"End","num_days":"Days",
+                        "workflow_stage":"Current Status","gs_reviewed_by":"GS Reviewer","gs_comments":"GS Comment",
+                        "hr_reviewed_by":"HR Reviewer","hr_comments":"HR Comment"
+                    }).drop(columns=["id"]),use_container_width=True,hide_index=True)
 
     # ════════════════════════════════════════════════════════
     # PAYROLL — with autonomous day-off date calculation
@@ -2664,24 +2669,63 @@ with main_block:
                         row_d[dt.strftime("%d %a")]=build_attendance_code(emp['emp_id'],dt,emp['weekly_dayoff'] or "Sunday",holidays_dict,leave_lookup,absent_lookup)
                     att_only_rows.append(row_d)
                 att_only_df=pd.DataFrame(att_only_rows)
+
+                # Excel: header rows (company/cost center/period) above the grid,
+                # plus the legend as its own sheet — neither was included before.
                 att_buf=io.BytesIO()
-                with pd.ExcelWriter(att_buf,engine="xlsxwriter") as w: att_only_df.to_excel(w,index=False,sheet_name="Attendance")
+                with pd.ExcelWriter(att_buf,engine="xlsxwriter") as w:
+                    wb=w.book
+                    ws_a=wb.add_worksheet("Attendance")
+                    title_fmt=wb.add_format({"bold":True,"font_size":14,"font_color":"#0D1526"})
+                    sub_fmt=wb.add_format({"font_size":10,"font_color":"#444444"})
+                    hdr_fmt=wb.add_format({"bold":True,"bg_color":"#D4A847","font_color":"#0D1526","border":1,"align":"center"})
+                    cell_fmt=wb.add_format({"align":"center","border":1})
+                    ws_a.write(0,0,"YETEBABERUT GENERAL SERVICE PROVIDER",title_fmt)
+                    ws_a.write(1,0,f"Cost Center: {sheet_cc} — {cc_name}   |   Period: {month_dates[0].strftime('%b %d, %Y')} to {month_dates[-1].strftime('%b %d, %Y')}   |   Exported: {datetime.now().strftime('%Y-%m-%d %H:%M')}",sub_fmt)
+                    header_row=3
+                    for ci,col in enumerate(att_only_df.columns):
+                        ws_a.write(header_row,ci,col,hdr_fmt)
+                    for ri in range(len(att_only_df)):
+                        for ci,col in enumerate(att_only_df.columns):
+                            ws_a.write(header_row+1+ri,ci,str(att_only_df.iloc[ri,ci]),cell_fmt)
+                    ws_a.set_column(0,0,10); ws_a.set_column(1,1,22)
+                    for ci in range(2,len(att_only_df.columns)): ws_a.set_column(ci,ci,5)
+                    # Legend sheet
+                    ws_l=wb.add_worksheet("Legend")
+                    ws_l.write(0,0,"Code",hdr_fmt); ws_l.write(0,1,"Meaning",hdr_fmt)
+                    for li,(code,desc) in enumerate(CODE_LEGEND):
+                        ws_l.write(li+1,0,code,cell_fmt); ws_l.write(li+1,1,desc,cell_fmt)
+                    ws_l.set_column(0,0,10); ws_l.set_column(1,1,40)
                 atc1,atc2=st.columns(2)
                 with atc1:
                     st.download_button("Export Employee Attendance to Excel",att_buf.getvalue(),file_name=f"{sheet_cc}_{month_str}_Attendance.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,key="att_export_only")
                 with atc2:
+                    # Print: build a dedicated light/print-friendly table instead of
+                    # reusing the dark on-screen theme, which prints as mostly blank
+                    # on white paper (gold-on-transparent doesn't show up on paper).
+                    print_header_cells="".join([f'<th>{dt.day}<br>{dt.strftime("%a")[:2].upper()}</th>' for dt in month_dates])
+                    print_rows_html="".join([
+                        "<tr><td class='empcell'>"+str(row["EMP ID"])+"</td><td class='empcell'>"+str(row["NAME"])+"</td>"+
+                        "".join([f"<td>{row[dt.strftime('%d %a')]}</td>" for dt in month_dates])+"</tr>"
+                        for _,row in att_only_df.iterrows()
+                    ])
+                    print_legend_html="".join([f"<span><b>{code}</b> = {desc}</span>" for code,desc in CODE_LEGEND])
                     att_print_html=f'''<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
                     body{{font-family:Arial,sans-serif;margin:0;padding:16px;color:#000}}
                     h2{{text-align:center;margin-bottom:2px}}
-                    .sub{{text-align:center;color:#666;font-size:11px;margin-bottom:12px}}
-                    table{{border-collapse:collapse;width:100%;font-size:9px}}
-                    th,td{{border:1px solid #ccc;padding:3px;text-align:center}}
-                    th{{background:#0D1526;color:#D4A847}}
+                    .sub{{text-align:center;color:#444;font-size:11px;margin-bottom:12px}}
+                    table{{border-collapse:collapse;width:100%;font-size:9px;margin-bottom:14px}}
+                    th,td{{border:1px solid #999;padding:3px;text-align:center}}
+                    th{{background:#EDE0C0}}
+                    .empcell{{text-align:left;font-weight:bold}}
+                    .legend{{font-size:9px;color:#333;display:flex;flex-wrap:wrap;gap:10px;border-top:1px solid #ccc;padding-top:8px}}
                     @media print{{body{{margin:0}}}}
                     </style></head><body>
                     <h2>YETEBABERUT GENERAL SERVICE PROVIDER</h2>
-                    <div class="sub">Employee Attendance — Cost Center: {sheet_cc} — {month_str}</div>
-                    {sheet_html}
+                    <div class="sub">Employee Attendance — Cost Center: {sheet_cc} — {cc_name} — {month_str}</div>
+                    <table><thead><tr><th>EMP ID</th><th>NAME</th>{print_header_cells}</tr></thead>
+                    <tbody>{print_rows_html}</tbody></table>
+                    <div class="legend">{print_legend_html}</div>
                     <script>window.onload=function(){{window.print();}}</script>
                     </body></html>'''
                     st.download_button("🖨 Print Employee Attendance",att_print_html.encode(),file_name=f"{sheet_cc}_{month_str}_Attendance_Print.html",mime="text/html",use_container_width=True,key="att_print_only")
@@ -3650,63 +3694,94 @@ with main_block:
         if st.session_state.role not in ("Department Head","Manager"):
             st.info("Only the General Supervisor / Operations Manager (Department Head) or Manager can review submissions here.")
         else:
-            conn=get_conn()
-            gs_pending=pg_read_sql("""SELECT dsr.id,dsr.supervisor_id,su.full_name as supervisor_name,
-                dsr.emp_id,e.full_name as emp_name,e.division,e.cost_center,dsr.status,dsr.leave_type,
-                dsr.start_date,dsr.end_date,dsr.num_days,dsr.reason,dsr.doc_name,dsr.submitted_at
-                FROM daily_status_records dsr
-                JOIN employees e ON dsr.emp_id=e.emp_id
-                LEFT JOIN system_users su ON dsr.supervisor_id=su.username
-                WHERE dsr.workflow_stage='Pending General Supervisor Review'
-                ORDER BY dsr.submitted_at ASC""",conn)
-            conn.close()
-            st.markdown(f'<div class="mg" style="grid-template-columns:1fr"><div class="mb mg-amber"><div class="ml ml-amber">Pending Review</div><div class="mv">{len(gs_pending)}</div></div></div>',unsafe_allow_html=True)
-            if len(gs_pending)==0:
-                st.info("No submissions waiting for review.")
-            else:
-                for _,rec in gs_pending.iterrows():
-                    with st.expander(f"{rec['emp_id']} — {rec['emp_name']} — {rec['status']} — {rec['start_date']} to {rec['end_date']} ({rec['num_days']} day(s))"):
-                        st.markdown(f"""<div style="font-size:12px;color:#94A8C8;line-height:1.9">
-                          Supervisor: <b style="color:#F0C96B">{rec['supervisor_id']}</b> ({rec['supervisor_name'] or '—'}) &nbsp;|&nbsp;
-                          Division: <b style="color:#F0C96B">{rec['division']}</b> &nbsp;|&nbsp;
-                          Cost Center: <b style="color:#F0C96B">{rec['cost_center'] or '—'}</b><br>
-                          Status: <b style="color:#F0C96B">{rec['status']}</b>{' — '+rec['leave_type'] if rec['leave_type'] else ''} &nbsp;|&nbsp;
-                          Submitted: {rec['submitted_at']}<br>
-                          Reason: {rec['reason'] or '—'}
-                        </div>""",unsafe_allow_html=True)
-                        if rec['doc_name']:
-                            conn=get_conn(); cur=conn.cursor()
-                            cur.execute("SELECT doc_name,doc_data FROM daily_status_records WHERE id=?",(rec['id'],))
-                            drow=cur.fetchone(); conn.close()
-                            if drow and drow[1]:
-                                st.markdown(f'<div class="pb">{preview_html(drow[1],drow[0],"Attachment")}</div>',unsafe_allow_html=True)
+            gs_tab1,gs_tab2=st.tabs(["Pending Review","History (by date)"])
+            with gs_tab1:
+                conn=get_conn()
+                gs_pending=pg_read_sql("""SELECT dsr.id,dsr.supervisor_id,su.full_name as supervisor_name,
+                    dsr.emp_id,e.full_name as emp_name,e.division,e.cost_center,dsr.status,dsr.leave_type,
+                    dsr.start_date,dsr.end_date,dsr.num_days,dsr.reason,dsr.doc_name,dsr.submitted_at
+                    FROM daily_status_records dsr
+                    JOIN employees e ON dsr.emp_id=e.emp_id
+                    LEFT JOIN system_users su ON dsr.supervisor_id=su.username
+                    WHERE dsr.workflow_stage='Pending General Supervisor Review'
+                    ORDER BY dsr.submitted_at ASC""",conn)
+                conn.close()
+                st.markdown(f'<div class="mg" style="grid-template-columns:1fr"><div class="mb mg-amber"><div class="ml ml-amber">Pending Review</div><div class="mv">{len(gs_pending)}</div></div></div>',unsafe_allow_html=True)
+                if len(gs_pending)==0:
+                    st.info("No submissions waiting for review.")
+                else:
+                    for _,rec in gs_pending.iterrows():
+                        with st.expander(f"{rec['emp_id']} — {rec['emp_name']} — {rec['status']} — {rec['start_date']} to {rec['end_date']} ({rec['num_days']} day(s))"):
+                            st.markdown(f"""<div style="font-size:12px;color:#94A8C8;line-height:1.9">
+                              Supervisor: <b style="color:#F0C96B">{rec['supervisor_id']}</b> ({rec['supervisor_name'] or '—'}) &nbsp;|&nbsp;
+                              Division: <b style="color:#F0C96B">{rec['division']}</b> &nbsp;|&nbsp;
+                              Cost Center: <b style="color:#F0C96B">{rec['cost_center'] or '—'}</b><br>
+                              Status: <b style="color:#F0C96B">{rec['status']}</b>{' — '+rec['leave_type'] if rec['leave_type'] else ''} &nbsp;|&nbsp;
+                              Submitted: {rec['submitted_at']}<br>
+                              Reason: {rec['reason'] or '—'}
+                            </div>""",unsafe_allow_html=True)
+                            if rec['doc_name']:
+                                conn=get_conn(); cur=conn.cursor()
+                                cur.execute("SELECT doc_name,doc_data FROM daily_status_records WHERE id=?",(rec['id'],))
+                                drow=cur.fetchone(); conn.close()
+                                if drow and drow[1]:
+                                    st.markdown(f'<div class="pb">{preview_html(drow[1],drow[0],"Attachment")}</div>',unsafe_allow_html=True)
 
-                        gs_comment=st.text_input("Comments",key=f"gs_comment_{rec['id']}")
-                        gsc1,gsc2,gsc3=st.columns(3)
-                        with gsc1:
-                            if st.button("Approve",key=f"gs_appr_{rec['id']}",use_container_width=True):
-                                conn=get_conn()
-                                conn.execute("""UPDATE daily_status_records SET workflow_stage='Pending HR Validation',
-                                    gs_reviewed_by=?,gs_reviewed_at=?,gs_comments=? WHERE id=?""",
-                                    (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),gs_comment,rec['id']))
-                                conn.commit(); conn.close()
-                                st.success("Approved — forwarded to HR for validation."); st.rerun()
-                        with gsc2:
-                            if st.button("Return for Correction",key=f"gs_return_{rec['id']}",use_container_width=True):
-                                conn=get_conn()
-                                conn.execute("""UPDATE daily_status_records SET workflow_stage='Returned for Correction',
-                                    gs_reviewed_by=?,gs_reviewed_at=?,gs_comments=? WHERE id=?""",
-                                    (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),gs_comment or "Please review and resubmit.",rec['id']))
-                                conn.commit(); conn.close()
-                                st.warning("Returned to Supervisor for correction."); st.rerun()
-                        with gsc3:
-                            if st.button("Reject",key=f"gs_reject_{rec['id']}",use_container_width=True):
-                                conn=get_conn()
-                                conn.execute("""UPDATE daily_status_records SET workflow_stage='Rejected by General Supervisor',
-                                    gs_reviewed_by=?,gs_reviewed_at=?,gs_comments=? WHERE id=?""",
-                                    (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),gs_comment,rec['id']))
-                                conn.commit(); conn.close()
-                                st.warning("Rejected."); st.rerun()
+                            gs_comment=st.text_input("Comments",key=f"gs_comment_{rec['id']}")
+                            gsc1,gsc2,gsc3=st.columns(3)
+                            with gsc1:
+                                if st.button("Approve",key=f"gs_appr_{rec['id']}",use_container_width=True):
+                                    conn=get_conn()
+                                    conn.execute("""UPDATE daily_status_records SET workflow_stage='Pending HR Validation',
+                                        gs_reviewed_by=?,gs_reviewed_at=?,gs_comments=? WHERE id=?""",
+                                        (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),gs_comment,rec['id']))
+                                    conn.commit(); conn.close()
+                                    st.success("Approved — forwarded to HR for validation."); st.rerun()
+                            with gsc2:
+                                if st.button("Return for Correction",key=f"gs_return_{rec['id']}",use_container_width=True):
+                                    conn=get_conn()
+                                    conn.execute("""UPDATE daily_status_records SET workflow_stage='Returned for Correction',
+                                        gs_reviewed_by=?,gs_reviewed_at=?,gs_comments=? WHERE id=?""",
+                                        (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),gs_comment or "Please review and resubmit.",rec['id']))
+                                    conn.commit(); conn.close()
+                                    st.warning("Returned to Supervisor for correction."); st.rerun()
+                            with gsc3:
+                                if st.button("Reject",key=f"gs_reject_{rec['id']}",use_container_width=True):
+                                    conn=get_conn()
+                                    conn.execute("""UPDATE daily_status_records SET workflow_stage='Rejected by General Supervisor',
+                                        gs_reviewed_by=?,gs_reviewed_at=?,gs_comments=? WHERE id=?""",
+                                        (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),gs_comment,rec['id']))
+                                    conn.commit(); conn.close()
+                                    st.warning("Rejected."); st.rerun()
+
+            with gs_tab2:
+                st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">Everything you (or another General Supervisor / Manager) have already reviewed, filterable by date.</div>',unsafe_allow_html=True)
+                gh1,gh2,gh3=st.columns(3)
+                with gh1: gs_hist_from=st.date_input("From",value=date.today()-timedelta(days=30),key="gs_hist_from")
+                with gh2: gs_hist_to=st.date_input("To",value=date.today(),key="gs_hist_to")
+                with gh3: gs_hist_stage=st.selectbox("Outcome",["All","Pending HR Validation","Returned for Correction","Rejected by General Supervisor"],key="gs_hist_stage")
+                conn=get_conn()
+                gs_hist_q="""SELECT dsr.emp_id,e.full_name as emp_name,dsr.status,dsr.leave_type,dsr.start_date,dsr.end_date,
+                    dsr.num_days,dsr.supervisor_id,dsr.workflow_stage,dsr.gs_reviewed_by,dsr.gs_reviewed_at,dsr.gs_comments
+                    FROM daily_status_records dsr JOIN employees e ON dsr.emp_id=e.emp_id
+                    WHERE dsr.gs_reviewed_at IS NOT NULL
+                    AND substr(dsr.gs_reviewed_at,1,10)>=? AND substr(dsr.gs_reviewed_at,1,10)<=?"""
+                gs_hist_p=[str(gs_hist_from),str(gs_hist_to)]
+                if gs_hist_stage!="All": gs_hist_q+=" AND dsr.workflow_stage=?"; gs_hist_p.append(gs_hist_stage)
+                gs_hist_q+=" ORDER BY dsr.gs_reviewed_at DESC"
+                gs_hist=pg_read_sql(gs_hist_q,conn,params=gs_hist_p)
+                conn.close()
+                if len(gs_hist)==0:
+                    st.info("No reviewed items in this date range.")
+                else:
+                    st.dataframe(gs_hist.rename(columns={
+                        "emp_id":"Employee ID","emp_name":"Name","status":"Status","leave_type":"Leave Type",
+                        "start_date":"Start","end_date":"End","num_days":"Days","supervisor_id":"Submitted By",
+                        "workflow_stage":"Outcome","gs_reviewed_by":"Reviewed By","gs_reviewed_at":"Reviewed At","gs_comments":"Comments"
+                    }),use_container_width=True,hide_index=True)
+                    gs_hist_buf=io.BytesIO()
+                    with pd.ExcelWriter(gs_hist_buf,engine="xlsxwriter") as w: gs_hist.to_excel(w,index=False,sheet_name="GS_Review_History")
+                    st.download_button("Export History",gs_hist_buf.getvalue(),file_name=f"GS_Review_History_{gs_hist_from}_to_{gs_hist_to}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     # ════════════════════════════════════════════════════════
     # HR VALIDATION — Step 3: Human Resources
@@ -3716,74 +3791,106 @@ with main_block:
         if st.session_state.role not in ("HR Staff","Manager"):
             st.info("Only HR Staff or Manager can validate submissions here.")
         else:
-            conn=get_conn()
-            hr_pending=pg_read_sql("""SELECT dsr.id,dsr.supervisor_id,dsr.gs_reviewed_by,dsr.gs_comments,
-                dsr.emp_id,e.full_name as emp_name,e.division,e.cost_center,e.annual_leave_entitlement,
-                dsr.status,dsr.leave_type,dsr.start_date,dsr.end_date,dsr.num_days,dsr.reason,dsr.doc_name,dsr.doc_data,dsr.submitted_at
-                FROM daily_status_records dsr
-                JOIN employees e ON dsr.emp_id=e.emp_id
-                WHERE dsr.workflow_stage='Pending HR Validation'
-                ORDER BY dsr.submitted_at ASC""",conn)
-            conn.close()
-            st.markdown(f'<div class="mg" style="grid-template-columns:1fr"><div class="mb mg-amber"><div class="ml ml-amber">Pending HR Validation</div><div class="mv">{len(hr_pending)}</div></div></div>',unsafe_allow_html=True)
-            if len(hr_pending)==0:
-                st.info("Nothing waiting for HR validation.")
-            else:
-                for _,rec in hr_pending.iterrows():
-                    with st.expander(f"{rec['emp_id']} — {rec['emp_name']} — {rec['status']} — {rec['start_date']} to {rec['end_date']} ({rec['num_days']} day(s))"):
-                        st.markdown(f"""<div style="font-size:12px;color:#94A8C8;line-height:1.9">
-                          General Supervisor approved by: <b style="color:#F0C96B">{rec['gs_reviewed_by']}</b>
-                          {' — comment: '+rec['gs_comments'] if rec['gs_comments'] else ''}<br>
-                          Division: <b style="color:#F0C96B">{rec['division']}</b> &nbsp;|&nbsp;
-                          Cost Center: <b style="color:#F0C96B">{rec['cost_center'] or '—'}</b><br>
-                          Reason: {rec['reason'] or '—'}
-                        </div>""",unsafe_allow_html=True)
+            hr_tab1,hr_tab2=st.tabs(["Pending Validation","History (by date)"])
+            with hr_tab1:
+                conn=get_conn()
+                hr_pending=pg_read_sql("""SELECT dsr.id,dsr.supervisor_id,dsr.gs_reviewed_by,dsr.gs_comments,
+                    dsr.emp_id,e.full_name as emp_name,e.division,e.cost_center,e.annual_leave_entitlement,
+                    dsr.status,dsr.leave_type,dsr.start_date,dsr.end_date,dsr.num_days,dsr.reason,dsr.doc_name,dsr.doc_data,dsr.submitted_at
+                    FROM daily_status_records dsr
+                    JOIN employees e ON dsr.emp_id=e.emp_id
+                    WHERE dsr.workflow_stage='Pending HR Validation'
+                    ORDER BY dsr.submitted_at ASC""",conn)
+                conn.close()
+                st.markdown(f'<div class="mg" style="grid-template-columns:1fr"><div class="mb mg-amber"><div class="ml ml-amber">Pending HR Validation</div><div class="mv">{len(hr_pending)}</div></div></div>',unsafe_allow_html=True)
+                if len(hr_pending)==0:
+                    st.info("Nothing waiting for HR validation.")
+                else:
+                    for _,rec in hr_pending.iterrows():
+                        with st.expander(f"{rec['emp_id']} — {rec['emp_name']} — {rec['status']} — {rec['start_date']} to {rec['end_date']} ({rec['num_days']} day(s))"):
+                            st.markdown(f"""<div style="font-size:12px;color:#94A8C8;line-height:1.9">
+                              General Supervisor approved by: <b style="color:#F0C96B">{rec['gs_reviewed_by']}</b>
+                              {' — comment: '+rec['gs_comments'] if rec['gs_comments'] else ''}<br>
+                              Division: <b style="color:#F0C96B">{rec['division']}</b> &nbsp;|&nbsp;
+                              Cost Center: <b style="color:#F0C96B">{rec['cost_center'] or '—'}</b><br>
+                              Reason: {rec['reason'] or '—'}
+                            </div>""",unsafe_allow_html=True)
 
-                        leave_balance_note=""
-                        if rec['status']=="Annual Leave" or rec['leave_type']=="Annual Leave":
-                            entitlement=int(rec['annual_leave_entitlement'] or 20)
-                            used,remaining=get_annual_leave_balance(rec['emp_id'],datetime.strptime(rec['start_date'],"%Y-%m-%d").year,entitlement)
-                            over_budget = used+rec['num_days']>entitlement
-                            leave_balance_note=f'<div style="font-size:12px;margin-top:6px;color:{"#EF4444" if over_budget else "#10B981"}">Leave balance check: {used} of {entitlement} used this year — {"⚠ this request would exceed the remaining "+str(remaining)+" day(s)" if over_budget else "within remaining "+str(remaining)+" day(s)"}</div>'
-                            st.markdown(leave_balance_note,unsafe_allow_html=True)
+                            leave_balance_note=""
+                            if rec['status']=="Annual Leave" or rec['leave_type']=="Annual Leave":
+                                entitlement=int(rec['annual_leave_entitlement'] or 20)
+                                used,remaining=get_annual_leave_balance(rec['emp_id'],datetime.strptime(rec['start_date'],"%Y-%m-%d").year,entitlement)
+                                over_budget = used+rec['num_days']>entitlement
+                                leave_balance_note=f'<div style="font-size:12px;margin-top:6px;color:{"#EF4444" if over_budget else "#10B981"}">Leave balance check: {used} of {entitlement} used this year — {"⚠ this request would exceed the remaining "+str(remaining)+" day(s)" if over_budget else "within remaining "+str(remaining)+" day(s)"}</div>'
+                                st.markdown(leave_balance_note,unsafe_allow_html=True)
 
-                        if rec['doc_name']:
-                            st.markdown(f'<div class="pb">{preview_html(rec["doc_data"],rec["doc_name"],"Attachment")}</div>',unsafe_allow_html=True)
+                            if rec['doc_name']:
+                                st.markdown(f'<div class="pb">{preview_html(rec["doc_data"],rec["doc_name"],"Attachment")}</div>',unsafe_allow_html=True)
 
-                        hr_comment=st.text_input("Comments",key=f"hr_comment_{rec['id']}")
-                        hrc1,hrc2=st.columns(2)
-                        with hrc1:
-                            if st.button("Approve & Finalize",key=f"hr_appr_{rec['id']}",use_container_width=True):
-                                conn=get_conn(); cur=conn.cursor()
-                                new_leave_id=None; new_absent_id=None
-                                if rec['status']=="Present":
-                                    pass  # nothing further to record
-                                elif rec['status']=="Absent":
-                                    conn.execute("INSERT INTO absent_records(emp_id,absent_date,reason,is_excused,record_status,created_at)VALUES(?,?,?,?,'Active',?)",
-                                        (rec['emp_id'],rec['start_date'],rec['reason'],1 if rec['leave_type']=="Excused" else 0,datetime.now().strftime("%Y-%m-%d")))
-                                else:
-                                    cur.execute("SELECT basic_salary FROM employees WHERE emp_id=?",(rec['emp_id'],))
-                                    sr=cur.fetchone(); dr=float(sr[0])/26 if sr and sr[0] else 0
-                                    conn.execute("""INSERT INTO leave_records(emp_id,leave_type,start_date,end_date,days_taken,
-                                        is_paid,daily_rate,deduction_amount,approved_by,status,notes,created_at,doc_name,doc_data)
-                                        VALUES(?,?,?,?,?,1,?,0,?,'Approved',?,?,?,?)""",
-                                        (rec['emp_id'],rec['leave_type'] or rec['status'],rec['start_date'],rec['end_date'],rec['num_days'],
-                                         round(dr,2),f"HR: {st.session_state.uid} (GS: {rec['gs_reviewed_by']})",rec['reason'],
-                                         datetime.now().strftime("%Y-%m-%d"),rec['doc_name'],rec['doc_data']))
-                                conn.execute("""UPDATE daily_status_records SET workflow_stage='Approved by HR',
-                                    hr_reviewed_by=?,hr_reviewed_at=?,hr_comments=? WHERE id=?""",
-                                    (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),hr_comment,rec['id']))
-                                conn.commit(); conn.close()
-                                st.cache_data.clear()
-                                st.success("Approved. Employee profile, leave balance, and history updated — ready for Finance/Payroll to pick up automatically."); st.rerun()
-                        with hrc2:
-                            if st.button("Reject",key=f"hr_reject_{rec['id']}",use_container_width=True):
-                                conn=get_conn()
-                                conn.execute("""UPDATE daily_status_records SET workflow_stage='Rejected by HR',
-                                    hr_reviewed_by=?,hr_reviewed_at=?,hr_comments=? WHERE id=?""",
-                                    (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),hr_comment,rec['id']))
-                                conn.commit(); conn.close()
-                                st.warning("Rejected."); st.rerun()
+                            hr_comment=st.text_input("Comments",key=f"hr_comment_{rec['id']}")
+                            hrc1,hrc2=st.columns(2)
+                            with hrc1:
+                                if st.button("Approve & Finalize",key=f"hr_appr_{rec['id']}",use_container_width=True):
+                                    conn=get_conn(); cur=conn.cursor()
+                                    new_leave_id=None; new_absent_id=None
+                                    if rec['status']=="Present":
+                                        pass  # nothing further to record
+                                    elif rec['status']=="Absent":
+                                        conn.execute("INSERT INTO absent_records(emp_id,absent_date,reason,is_excused,record_status,created_at)VALUES(?,?,?,?,'Active',?)",
+                                            (rec['emp_id'],rec['start_date'],rec['reason'],1 if rec['leave_type']=="Excused" else 0,datetime.now().strftime("%Y-%m-%d")))
+                                    else:
+                                        cur.execute("SELECT basic_salary FROM employees WHERE emp_id=?",(rec['emp_id'],))
+                                        sr=cur.fetchone(); dr=float(sr[0])/26 if sr and sr[0] else 0
+                                        conn.execute("""INSERT INTO leave_records(emp_id,leave_type,start_date,end_date,days_taken,
+                                            is_paid,daily_rate,deduction_amount,approved_by,status,notes,created_at,doc_name,doc_data)
+                                            VALUES(?,?,?,?,?,1,?,0,?,'Approved',?,?,?,?)""",
+                                            (rec['emp_id'],rec['leave_type'] or rec['status'],rec['start_date'],rec['end_date'],rec['num_days'],
+                                             round(dr,2),f"Supervisor: {rec['supervisor_id']} → GS: {rec['gs_reviewed_by']} → HR: {st.session_state.uid}",rec['reason'],
+                                             datetime.now().strftime("%Y-%m-%d"),rec['doc_name'],rec['doc_data']))
+                                    conn.execute("""UPDATE daily_status_records SET workflow_stage='Approved by HR',
+                                        hr_reviewed_by=?,hr_reviewed_at=?,hr_comments=? WHERE id=?""",
+                                        (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),hr_comment,rec['id']))
+                                    conn.commit(); conn.close()
+                                    st.cache_data.clear()
+                                    st.success("Approved. Employee profile, leave balance, and history updated — ready for Finance/Payroll to pick up automatically."); st.rerun()
+                            with hrc2:
+                                if st.button("Reject",key=f"hr_reject_{rec['id']}",use_container_width=True):
+                                    conn=get_conn()
+                                    conn.execute("""UPDATE daily_status_records SET workflow_stage='Rejected by HR',
+                                        hr_reviewed_by=?,hr_reviewed_at=?,hr_comments=? WHERE id=?""",
+                                        (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),hr_comment,rec['id']))
+                                    conn.commit(); conn.close()
+                                    st.warning("Rejected."); st.rerun()
+
+            with hr_tab2:
+                st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">Everything already validated (or rejected) by HR, filterable by date.</div>',unsafe_allow_html=True)
+                hh1,hh2,hh3=st.columns(3)
+                with hh1: hr_hist_from=st.date_input("From",value=date.today()-timedelta(days=30),key="hr_hist_from")
+                with hh2: hr_hist_to=st.date_input("To",value=date.today(),key="hr_hist_to")
+                with hh3: hr_hist_stage=st.selectbox("Outcome",["All","Approved by HR","Rejected by HR"],key="hr_hist_stage")
+                conn=get_conn()
+                hr_hist_q="""SELECT dsr.emp_id,e.full_name as emp_name,dsr.status,dsr.leave_type,dsr.start_date,dsr.end_date,
+                    dsr.num_days,dsr.supervisor_id,dsr.gs_reviewed_by,dsr.workflow_stage,dsr.hr_reviewed_by,dsr.hr_reviewed_at,dsr.hr_comments
+                    FROM daily_status_records dsr JOIN employees e ON dsr.emp_id=e.emp_id
+                    WHERE dsr.hr_reviewed_at IS NOT NULL
+                    AND substr(dsr.hr_reviewed_at,1,10)>=? AND substr(dsr.hr_reviewed_at,1,10)<=?"""
+                hr_hist_p=[str(hr_hist_from),str(hr_hist_to)]
+                if hr_hist_stage!="All": hr_hist_q+=" AND dsr.workflow_stage=?"; hr_hist_p.append(hr_hist_stage)
+                hr_hist_q+=" ORDER BY dsr.hr_reviewed_at DESC"
+                hr_hist=pg_read_sql(hr_hist_q,conn,params=hr_hist_p)
+                conn.close()
+                if len(hr_hist)==0:
+                    st.info("No validated items in this date range.")
+                else:
+                    st.dataframe(hr_hist.rename(columns={
+                        "emp_id":"Employee ID","emp_name":"Name","status":"Status","leave_type":"Leave Type",
+                        "start_date":"Start","end_date":"End","num_days":"Days","supervisor_id":"Submitted By",
+                        "gs_reviewed_by":"GS Reviewer","workflow_stage":"Outcome","hr_reviewed_by":"HR Reviewer",
+                        "hr_reviewed_at":"Reviewed At","hr_comments":"Comments"
+                    }),use_container_width=True,hide_index=True)
+                    hr_hist_buf=io.BytesIO()
+                    with pd.ExcelWriter(hr_hist_buf,engine="xlsxwriter") as w: hr_hist.to_excel(w,index=False,sheet_name="HR_Validation_History")
+                    st.download_button("Export History",hr_hist_buf.getvalue(),file_name=f"HR_Validation_History_{hr_hist_from}_to_{hr_hist_to}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     # ════════════════════════════════════════════════════════
     # DEMOTION & STATUS MANAGEMENT
