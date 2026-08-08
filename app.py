@@ -1192,7 +1192,7 @@ if st.session_state.role:
                 if st.button(v, use_container_width=True, key=f"nav_{v}"):
                     st.session_state.view=v; st.rerun()
                 if is_active: st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="nav-footer">Yetebaberut HRMS<br>v2.5 (build check)</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="nav-footer">Yetebaberut HRMS<br>v2.6 (build check)</div>', unsafe_allow_html=True)
 
 main_block = st.container() if st.session_state.role else st.container()
 
@@ -1984,7 +1984,7 @@ with main_block:
           <div class="mb mg-purple"><div class="ml ml-purple">On Leave</div><div class="mv">{leave_div}</div></div>
         </div>""",unsafe_allow_html=True)
 
-        sup1,sup2,sup3,sup4,sup5,sup6=st.tabs(["Record Absence","Record Leave","Issue Fine","Movement Log","Submit Monthly Sheet","Daily Status (New Workflow)"])
+        sup1,sup2,sup3,sup4,sup5,sup6,sup7=st.tabs(["Record Absence","Record Leave","Issue Fine","Vacation","Movement Log","Submit Monthly Sheet","Daily Status (New Workflow)"])
 
         elo_sup={f"{r['emp_id']} — {r['full_name']}":r['emp_id'] for _,r in my_emps.iterrows()}
 
@@ -2126,8 +2126,61 @@ with main_block:
                     st.dataframe(div_fines,use_container_width=True,hide_index=True)
 
         with sup4:
+            st.markdown('<div style="color:#6B7FA3;font-size:12px;margin-bottom:10px">Request vacation for an employee in your division. This routes through General Supervisor review, then HR validation, then is available to Finance for payroll — same pipeline as every other leave type here.</div>',unsafe_allow_html=True)
+            if len(elo_sup)==0:
+                st.info("No employees currently assigned to your division.")
+            else:
+                conn=get_conn()
+                vac_emps_sup=pg_read_sql("SELECT emp_id,full_name,annual_leave_entitlement FROM employees WHERE division=? AND current_status != 'Terminated'",conn,params=(my_division,))
+                conn.close()
+                vac_lo_sup={f"{r['emp_id']} — {r['full_name']}":r for _,r in vac_emps_sup.iterrows()}
+                v_emp_lbl_sup=st.selectbox("Employee",list(vac_lo_sup.keys()),key="sup_vac_emp")
+                v_row_sup=vac_lo_sup[v_emp_lbl_sup]
+                v_entitlement_sup=int(v_row_sup['annual_leave_entitlement'] or 20)
+
+                vsc1,vsc2=st.columns(2)
+                with vsc1: v_start_sup=st.date_input("Vacation Start Date",value=date.today(),key="sup_vac_start")
+                with vsc2: v_return_sup=st.date_input("Return-to-Work Date",value=date.today()+timedelta(days=1),key="sup_vac_return")
+
+                v_days_sup=max((v_return_sup-v_start_sup).days,0)
+                used_now_sup,remaining_now_sup=get_annual_leave_balance(v_row_sup['emp_id'],v_start_sup.year,v_entitlement_sup)
+
+                st.markdown(f"""<div class="mg" style="grid-template-columns:repeat(3,1fr);margin-top:10px">
+                  <div class="mb mg-teal"><div class="ml ml-teal">Total Vacation Days</div><div class="mv">{v_days_sup}</div></div>
+                  <div class="mb mg-amber"><div class="ml ml-amber">Already Used ({v_start_sup.year})</div><div class="mv">{used_now_sup}</div></div>
+                  <div class="mb mg-green"><div class="ml ml-green">Remaining Before This Request</div><div class="mv">{remaining_now_sup}</div></div>
+                </div>""",unsafe_allow_html=True)
+
+                v_notes_sup=st.text_area("Notes (optional)",key="sup_vac_notes")
+
+                if v_return_sup<=v_start_sup:
+                    st.warning("Return-to-Work Date must be after the Vacation Start Date.")
+                elif st.button("Submit for General Supervisor Review",use_container_width=True,key="sup_vac_save_btn"):
+                    if used_now_sup+v_days_sup>v_entitlement_sup:
+                        st.error(f"{v_row_sup['full_name']} has already used {used_now_sup} of {v_entitlement_sup} annual leave days for {v_start_sup.year}. This request of {v_days_sup} day(s) would exceed the remaining {remaining_now_sup} day(s).")
+                    else:
+                        conn=get_conn(); cur=conn.cursor()
+                        v_end_sup=v_return_sup-timedelta(days=1)
+                        cur.execute("""SELECT COUNT(*) FROM leave_records WHERE emp_id=? AND status != 'Cancelled'
+                            AND start_date<=? AND end_date>=?""",(v_row_sup['emp_id'],str(v_end_sup),str(v_start_sup)))
+                        overlap_v_sup=cur.fetchone()[0]
+                        cur.execute("""SELECT COUNT(*) FROM daily_status_records WHERE emp_id=? AND start_date<=? AND end_date>=?
+                            AND workflow_stage NOT IN ('Rejected by General Supervisor','Rejected by HR','Returned for Correction')""",(v_row_sup['emp_id'],str(v_end_sup),str(v_start_sup)))
+                        overlap_v_sup+=cur.fetchone()[0]
+                        if overlap_v_sup>0:
+                            conn.close()
+                            st.error(f"{v_row_sup['full_name']} already has a leave/status record overlapping this period.")
+                        else:
+                            conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
+                                reason,supervisor_id,submitted_at,workflow_stage)
+                                VALUES(?,'Vacation','Annual Leave',?,?,?,?,?,?,'Pending General Supervisor Review')""",
+                                (v_row_sup['emp_id'],str(v_start_sup),str(v_end_sup),v_days_sup,v_notes_sup,
+                                 st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                            conn.commit(); conn.close()
+                            st.success(f"Vacation request submitted: {v_days_sup} day(s) for {v_row_sup['full_name']}. Sent to General Supervisor for review, then HR, then Finance."); st.rerun()
+
+        with sup5:
             st.markdown('<div style="color:#6B7FA3;font-size:12px;margin-bottom:10px">Work movement log — transfers, status changes and notes for employees in your division.</div>',unsafe_allow_html=True)
-            st.dataframe(my_emps[['emp_id','full_name','job_title','cost_center','current_status']],use_container_width=True,hide_index=True)
             if len(elo_sup)>0:
                 with st.form("sup_status_form"):
                     ms1,ms2=st.columns(2)
@@ -2143,8 +2196,11 @@ with main_block:
                         conn.commit(); conn.close()
                         st.cache_data.clear()
                         st.success(f"{mv_eid} status updated to {mv_status}"); st.rerun()
+            st.markdown("<hr>",unsafe_allow_html=True)
+            st.markdown('<div class="ey">Division Employees</div>',unsafe_allow_html=True)
+            st.dataframe(my_emps[['emp_id','full_name','job_title','cost_center','current_status']],use_container_width=True,hide_index=True)
 
-        with sup5:
+        with sup6:
             st.markdown('<div style="color:#6B7FA3;font-size:13px;margin-bottom:14px">Compile the full month attendance for one of your cost centers and submit it to the Payroll Section for review and approval. Salaries are only released after Payroll Section approves.</div>',unsafe_allow_html=True)
             my_ccs=get_cost_centers(my_division)
             if len(my_ccs)==0:
@@ -2203,7 +2259,7 @@ with main_block:
                 else:
                     st.info("No employees currently in this cost center.")
 
-        with sup6:
+        with sup7:
             st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">Record an employee\'s daily attendance/leave status. Submissions route automatically to the General Supervisor / Operations Manager for review.</div>',unsafe_allow_html=True)
             if len(elo_sup)==0:
                 st.info("No employees assigned to your division/cost center yet.")
