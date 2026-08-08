@@ -813,6 +813,9 @@ header[data-testid="stHeader"]{height:2.2rem !important;min-height:2.2rem !impor
    small JS snippet below — no more guessing a fixed rem value, which is
    what caused the overlap glitch where the sidebar met the header. */
 :root{--ygsp-sbw:0px}
+div[data-testid="stIFrame"]{height:0px !important;min-height:0px !important;
+  max-height:0px !important;border:none !important;overflow:hidden !important;
+  visibility:hidden !important;position:absolute !important}
 .st-key-sticky_header{position:fixed !important;top:2.2rem !important;left:var(--ygsp-sbw,0px) !important;right:0 !important;
   width:calc(100% - var(--ygsp-sbw,0px)) !important;z-index:9000 !important;background:#060B18 !important;
   padding:2px 1rem 2px !important;box-shadow:0 4px 16px rgba(0,0,0,0.5) !important;
@@ -839,7 +842,7 @@ section[data-testid="stSidebar"]{z-index:9500 !important}
 /* Push down ONLY the main content's block-container (NOT the sidebar's —
    scoping to [data-testid="stAppViewContainer"] .main keeps the sidebar's
    own nav list starting at its normal position, unaffected by the header). */
-[data-testid="stAppViewContainer"] .main .block-container{padding-top:235px !important}
+[data-testid="stAppViewContainer"] .main .block-container{padding-top:275px !important}
 /* The sidebar's own button list needs clearance below the now-fixed
    "Main Menu" title bar so buttons don't render underneath it. */
 section[data-testid="stSidebar"] .block-container{padding-top:3.2rem !important}
