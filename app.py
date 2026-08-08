@@ -842,7 +842,7 @@ section[data-testid="stSidebar"]{z-index:9500 !important}
 /* Push down ONLY the main content's block-container (NOT the sidebar's —
    scoping to [data-testid="stAppViewContainer"] .main keeps the sidebar's
    own nav list starting at its normal position, unaffected by the header). */
-[data-testid="stAppViewContainer"] .main .block-container{padding-top:340px !important}
+[data-testid="stAppViewContainer"] .main .block-container{padding-top:400px !important}
 /* The sidebar's own button list needs clearance below the now-fixed
    "Main Menu" title bar so buttons don't render underneath it. */
 section[data-testid="stSidebar"] .block-container{padding-top:3.2rem !important}
@@ -1192,7 +1192,7 @@ if st.session_state.role:
                 if st.button(v, use_container_width=True, key=f"nav_{v}"):
                     st.session_state.view=v; st.rerun()
                 if is_active: st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="nav-footer">Yetebaberut HRMS<br>v2.3 (build check)</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="nav-footer">Yetebaberut HRMS<br>v2.4 (build check)</div>', unsafe_allow_html=True)
 
 main_block = st.container() if st.session_state.role else st.container()
 
