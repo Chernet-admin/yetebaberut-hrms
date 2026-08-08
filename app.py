@@ -868,7 +868,7 @@ section[data-testid="stSidebar"] .block-container{padding-top:3.2rem !important}
 .ey{font-size:9px;font-weight:600;letter-spacing:.16em;text-transform:uppercase;color:#D4A847;
   margin-bottom:4px;display:flex;align-items:center;gap:6px}
 .ey::before{content:'';display:inline-block;width:14px;height:1px;background:#D4A847}
-.tl{font-family:'Cinzel',serif;font-size:clamp(15px,2vw,24px);font-weight:700;color:#F0C96B;margin-bottom:5px}
+.tl{font-family:'Cinzel',serif;font-size:clamp(15px,2vw,24px);font-weight:700;color:#F0C96B;margin-bottom:5px;margin-top:70px !important;padding-top:6px !important}
 .mg{display:grid;grid-template-columns:repeat(7,1fr);gap:7px;margin-bottom:16px}
 .mb{background:#0D1526;border:1px solid rgba(255,255,255,0.07);border-radius:10px;
   padding:11px 8px;text-align:center;position:relative;overflow:hidden}
@@ -1192,7 +1192,7 @@ if st.session_state.role:
                 if st.button(v, use_container_width=True, key=f"nav_{v}"):
                     st.session_state.view=v; st.rerun()
                 if is_active: st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="nav-footer">Yetebaberut HRMS<br>v2.4 (build check)</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="nav-footer">Yetebaberut HRMS<br>v2.5 (build check)</div>', unsafe_allow_html=True)
 
 main_block = st.container() if st.session_state.role else st.container()
 
