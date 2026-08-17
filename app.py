@@ -415,7 +415,7 @@ def init_db():
         doc_data BLOB,
         supervisor_id TEXT,
         submitted_at TEXT,
-        workflow_stage TEXT DEFAULT 'Pending General Supervisor Review',
+        workflow_stage TEXT DEFAULT 'Pending HR Review',
         gs_reviewed_by TEXT, gs_reviewed_at TEXT, gs_comments TEXT,
         hr_reviewed_by TEXT, hr_reviewed_at TEXT, hr_comments TEXT,
         linked_leave_id INTEGER, linked_absent_id INTEGER)""")
@@ -1089,18 +1089,18 @@ components.html("""
 # ════════════════════════════════════════════════════════
 ALL_NAV_VIEWS = ["Home","Applicant Intake","Employee Directory","Employee Profile",
     "Supervisor Console","Payroll","Payroll Approvals","Leave & Discipline","Leave Records","Vacation",
-    "GS Review","HR Validation","Demotion","Public Holidays","Cost Centers","Recycle Bin","Administration"]
+    "HR Review","HR Manager Approval","Demotion","Public Holidays","Cost Centers","Recycle Bin","Administration"]
 
 ROLE_DEFAULT_VIEWS = {
     "Supervisor": ["Home","Supervisor Console","Public Holidays"],
     "Payroll Section": ["Home","Payroll Approvals","Payroll","Employee Directory","Employee Profile","Public Holidays","Cost Centers"],
-    "Department Head": ["Home","GS Review","Vacation","Employee Directory","Employee Profile","Public Holidays"],
-    "HR Staff": ["Home","HR Validation","Applicant Intake","Employee Directory","Employee Profile","Leave & Discipline","Leave Records","Vacation","Demotion","Public Holidays"],
+    "Department Head": ["Home","Vacation","Employee Directory","Employee Profile","Public Holidays"],
+    "HR Staff": ["Home","HR Review","Applicant Intake","Employee Directory","Employee Profile","Leave & Discipline","Leave Records","Vacation","Demotion","Public Holidays"],
     "Manager": ["Home","Applicant Intake","Employee Directory","Employee Profile","Payroll",
-        "Payroll Approvals","Leave & Discipline","Leave Records","Vacation","GS Review","HR Validation","Demotion","Public Holidays","Cost Centers","Recycle Bin","Administration"],
+        "Payroll Approvals","Leave & Discipline","Leave Records","Vacation","HR Manager Approval","Demotion","Public Holidays","Cost Centers","Recycle Bin","Administration"],
 }
 ROLE_DEFAULT_FALLBACK = ["Home","Applicant Intake","Employee Directory","Employee Profile",
-    "Payroll","Payroll Approvals","Leave & Discipline","Leave Records","Vacation","GS Review","HR Validation","Demotion","Public Holidays","Cost Centers"]
+    "Payroll","Payroll Approvals","Leave & Discipline","Leave Records","Vacation","HR Review","HR Manager Approval","Demotion","Public Holidays","Cost Centers"]
 
 def get_user_nav_views(role, nav_access_json):
     """Returns the ordered list of views this user can see."""
@@ -1148,7 +1148,7 @@ NAV_GROUPS = [
     ("RECRUITMENT", ["Applicant Intake"]),
     ("WORKFORCE", ["Employee Directory","Employee Profile","Supervisor Console"]),
     ("FINANCE", ["Payroll","Payroll Approvals","Cost Centers"]),
-    ("HR OPERATIONS", ["Leave & Discipline","Leave Records","Vacation","GS Review","HR Validation","Demotion"]),
+    ("HR OPERATIONS", ["Leave & Discipline","Leave Records","Vacation","HR Review","HR Manager Approval","Demotion"]),
     ("REFERENCE", ["Public Holidays"]),
     ("SYSTEM", ["Recycle Bin","Administration"]),
 ]
@@ -2003,7 +2003,7 @@ with main_block:
                         ab_eid_sup=elo_sup[ab_emp]
                         conn=get_conn(); cur=conn.cursor()
                         cur.execute("""SELECT COUNT(*) FROM daily_status_records WHERE emp_id=? AND start_date<=? AND end_date>=?
-                            AND workflow_stage NOT IN ('Rejected by General Supervisor','Rejected by HR','Returned for Correction')""",(ab_eid_sup,str(ab_date),str(ab_date)))
+                            AND workflow_stage NOT IN ('Rejected by HR','Rejected by HR Manager','Returned for Correction')""",(ab_eid_sup,str(ab_date),str(ab_date)))
                         dup_count_sup=cur.fetchone()[0]
                         cur.execute("""SELECT leave_type FROM leave_records WHERE emp_id=? AND status='Approved'
                             AND start_date<=? AND end_date>=?""",(ab_eid_sup,str(ab_date),str(ab_date)))
@@ -2017,7 +2017,7 @@ with main_block:
                         else:
                             conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
                                 reason,supervisor_id,submitted_at,workflow_stage)
-                                VALUES(?,'Absent',?,?,?,1,?,?,?,'Pending General Supervisor Review')""",
+                                VALUES(?,'Absent',?,?,?,1,?,?,?,'Pending HR Review')""",
                                 (ab_eid_sup,"Excused" if "Excused" in ab_type else "Unexcused",str(ab_date),str(ab_date),ab_reason,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                             conn.commit(); conn.close()
                             st.success(f"Absence for {ab_date} submitted for General Supervisor review."); st.rerun()
@@ -2054,7 +2054,7 @@ with main_block:
                             AND start_date<=? AND end_date>=?""",(l_eid,str(l_end),str(l_start)))
                         overlap_count_sup=cur.fetchone()[0]
                         cur.execute("""SELECT COUNT(*) FROM daily_status_records WHERE emp_id=? AND start_date<=? AND end_date>=?
-                            AND workflow_stage NOT IN ('Rejected by General Supervisor','Rejected by HR','Returned for Correction')""",(l_eid,str(l_end),str(l_start)))
+                            AND workflow_stage NOT IN ('Rejected by HR','Rejected by HR Manager','Returned for Correction')""",(l_eid,str(l_end),str(l_start)))
                         overlap_count_sup+=cur.fetchone()[0]
                         if overlap_count_sup>0:
                             conn.close()
@@ -2072,7 +2072,7 @@ with main_block:
                                 st.stop()
                         conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
                             reason,supervisor_id,submitted_at,workflow_stage)
-                            VALUES(?,?,?,?,?,?,?,?,?,'Pending General Supervisor Review')""",
+                            VALUES(?,?,?,?,?,?,?,?,?,'Pending HR Review')""",
                             (l_eid,l_type,l_type,str(l_start),str(l_end),days,l_notes,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                         conn.commit(); conn.close()
                         st.success(f"{l_type} submitted for General Supervisor review: {days} days"); st.rerun()
@@ -2165,7 +2165,7 @@ with main_block:
                             AND start_date<=? AND end_date>=?""",(v_row_sup['emp_id'],str(v_end_sup),str(v_start_sup)))
                         overlap_v_sup=cur.fetchone()[0]
                         cur.execute("""SELECT COUNT(*) FROM daily_status_records WHERE emp_id=? AND start_date<=? AND end_date>=?
-                            AND workflow_stage NOT IN ('Rejected by General Supervisor','Rejected by HR','Returned for Correction')""",(v_row_sup['emp_id'],str(v_end_sup),str(v_start_sup)))
+                            AND workflow_stage NOT IN ('Rejected by HR','Rejected by HR Manager','Returned for Correction')""",(v_row_sup['emp_id'],str(v_end_sup),str(v_start_sup)))
                         overlap_v_sup+=cur.fetchone()[0]
                         if overlap_v_sup>0:
                             conn.close()
@@ -2173,7 +2173,7 @@ with main_block:
                         else:
                             conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
                                 reason,supervisor_id,submitted_at,workflow_stage)
-                                VALUES(?,'Vacation','Annual Leave',?,?,?,?,?,?,'Pending General Supervisor Review')""",
+                                VALUES(?,'Vacation','Annual Leave',?,?,?,?,?,?,'Pending HR Review')""",
                                 (v_row_sup['emp_id'],str(v_start_sup),str(v_end_sup),v_days_sup,v_notes_sup,
                                  st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                             conn.commit(); conn.close()
@@ -2284,7 +2284,7 @@ with main_block:
                             conn=get_conn(); cur=conn.cursor()
                             # Prevent duplicate / overlapping daily status submissions for the same employee & dates
                             cur.execute("""SELECT COUNT(*) FROM daily_status_records WHERE emp_id=? AND start_date<=? AND end_date>=?
-                                AND workflow_stage NOT IN ('Rejected by General Supervisor','Rejected by HR','Returned for Correction')""",(ds_eid,str(ds_end),str(ds_start)))
+                                AND workflow_stage NOT IN ('Rejected by HR','Rejected by HR Manager','Returned for Correction')""",(ds_eid,str(ds_end),str(ds_start)))
                             if cur.fetchone()[0]>0:
                                 conn.close()
                                 st.error(f"{ds_emp} already has a submitted status record overlapping these dates.")
@@ -2303,7 +2303,7 @@ with main_block:
                                 ds_days=max((ds_end-ds_start).days+1,0) if ds_status!="Present" else 0
                                 conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
                                     reason,doc_name,doc_data,supervisor_id,submitted_at,workflow_stage)
-                                    VALUES(?,?,?,?,?,?,?,?,?,?,?,'Pending General Supervisor Review')""",
+                                    VALUES(?,?,?,?,?,?,?,?,?,?,?,'Pending HR Review')""",
                                     (ds_eid,ds_status,ds_status if ds_status not in ("Present","Absent") else None,
                                      str(ds_start),str(ds_end),ds_days,ds_reason,ds_doc_name,ds_doc_data,
                                      st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
@@ -3181,7 +3181,7 @@ with main_block:
                         AND start_date<=? AND end_date>=?""",(l_eid,str(l_end),str(l_start)))
                     overlap_count=cur.fetchone()[0]
                     cur.execute("""SELECT COUNT(*) FROM daily_status_records WHERE emp_id=? AND start_date<=? AND end_date>=?
-                        AND workflow_stage NOT IN ('Rejected by General Supervisor','Rejected by HR','Returned for Correction')""",(l_eid,str(l_end),str(l_start)))
+                        AND workflow_stage NOT IN ('Rejected by HR','Rejected by HR Manager','Returned for Correction')""",(l_eid,str(l_end),str(l_start)))
                     overlap_count+=cur.fetchone()[0]
                     if overlap_count>0:
                         conn.close()
@@ -3201,7 +3201,7 @@ with main_block:
                     ldoc_data=l_doc.getvalue() if l_doc else None
                     conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
                         reason,doc_name,doc_data,supervisor_id,submitted_at,workflow_stage)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,'Pending General Supervisor Review')""",
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,'Pending HR Review')""",
                         (l_eid,l_type,l_type,str(l_start),str(l_end),days,l_notes,ldoc_name,ldoc_data,l_by,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                     conn.commit(); conn.close()
                     st.success(f"{l_type}: {days} days submitted for General Supervisor review."); st.rerun()
@@ -3405,7 +3405,7 @@ with main_block:
                     ab_eid_chosen=elo[ab_emp]
                     conn=get_conn(); cur=conn.cursor()
                     cur.execute("""SELECT COUNT(*) FROM daily_status_records WHERE emp_id=? AND start_date<=? AND end_date>=?
-                        AND workflow_stage NOT IN ('Rejected by General Supervisor','Rejected by HR','Returned for Correction')""",(ab_eid_chosen,str(ab_date),str(ab_date)))
+                        AND workflow_stage NOT IN ('Rejected by HR','Rejected by HR Manager','Returned for Correction')""",(ab_eid_chosen,str(ab_date),str(ab_date)))
                     dup_count=cur.fetchone()[0]
                     cur.execute("""SELECT leave_type FROM leave_records WHERE emp_id=? AND status='Approved'
                         AND start_date<=? AND end_date>=?""",(ab_eid_chosen,str(ab_date),str(ab_date)))
@@ -3419,7 +3419,7 @@ with main_block:
                     else:
                         conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
                             reason,supervisor_id,submitted_at,workflow_stage)
-                            VALUES(?,'Absent',?,?,?,1,?,?,?,'Pending General Supervisor Review')""",
+                            VALUES(?,'Absent',?,?,?,1,?,?,?,'Pending HR Review')""",
                             (ab_eid_chosen,"Excused" if "Excused" in ab_ex else "Unexcused",str(ab_date),str(ab_date),
                              ab_reason,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                         conn.commit(); conn.close(); st.success(f"Absence for {ab_date} submitted for General Supervisor review."); st.rerun()
@@ -3688,7 +3688,7 @@ with main_block:
                             AND start_date<=? AND end_date>=?""",(v_eid,str(v_end),str(v_start)))
                         overlap_v=cur.fetchone()[0]
                         cur.execute("""SELECT COUNT(*) FROM daily_status_records WHERE emp_id=? AND start_date<=? AND end_date>=?
-                            AND workflow_stage NOT IN ('Rejected by General Supervisor','Rejected by HR','Returned for Correction')""",(v_eid,str(v_end),str(v_start)))
+                            AND workflow_stage NOT IN ('Rejected by HR','Rejected by HR Manager','Returned for Correction')""",(v_eid,str(v_end),str(v_start)))
                         overlap_v+=cur.fetchone()[0]
                         if overlap_v>0:
                             conn.close()
@@ -3696,7 +3696,7 @@ with main_block:
                         else:
                             conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
                                 reason,supervisor_id,submitted_at,workflow_stage)
-                                VALUES(?,'Vacation','Annual Leave',?,?,?,?,?,?,'Pending General Supervisor Review')""",
+                                VALUES(?,'Vacation','Annual Leave',?,?,?,?,?,?,'Pending HR Review')""",
                                 (v_eid,str(v_start),str(v_end),v_days,v_notes,
                                  st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                             conn.commit(); conn.close()
@@ -3746,12 +3746,12 @@ with main_block:
                                     st.warning("Vacation request rejected."); st.rerun()
 
     # ════════════════════════════════════════════════════════
-    # GS REVIEW — Step 2: General Supervisor / Operations Manager
+    # HR REVIEW — Step 1: HR Staff reviews Supervisor submissions
     # ════════════════════════════════════════════════════════
-    elif V=="GS Review":
-        st.markdown('<div class="tl">General Supervisor Review</div>',unsafe_allow_html=True)
-        if st.session_state.role not in ("Department Head","Manager"):
-            st.info("Only the General Supervisor / Operations Manager (Department Head) or Manager can review submissions here.")
+    elif V=="HR Review":
+        st.markdown('<div class="tl">HR Review</div>',unsafe_allow_html=True)
+        if st.session_state.role not in ("HR Staff","Manager"):
+            st.info("Only HR Staff or Manager can review submissions here.")
         else:
             gs_tab1,gs_tab2=st.tabs(["Pending Review","History (by date)"])
             with gs_tab1:
@@ -3762,7 +3762,7 @@ with main_block:
                     FROM daily_status_records dsr
                     JOIN employees e ON dsr.emp_id=e.emp_id
                     LEFT JOIN system_users su ON dsr.supervisor_id=su.username
-                    WHERE dsr.workflow_stage='Pending General Supervisor Review'
+                    WHERE dsr.workflow_stage='Pending HR Review'
                     ORDER BY dsr.submitted_at ASC""",conn)
                 conn.close()
                 st.markdown(f'<div class="mg" style="grid-template-columns:1fr"><div class="mb mg-amber"><div class="ml ml-amber">Pending Review</div><div class="mv">{len(gs_pending)}</div></div></div>',unsafe_allow_html=True)
@@ -3791,11 +3791,11 @@ with main_block:
                             with gsc1:
                                 if st.button("Approve",key=f"gs_appr_{rec['id']}",use_container_width=True):
                                     conn=get_conn()
-                                    conn.execute("""UPDATE daily_status_records SET workflow_stage='Pending HR Validation',
+                                    conn.execute("""UPDATE daily_status_records SET workflow_stage='Pending HR Manager Approval',
                                         gs_reviewed_by=?,gs_reviewed_at=?,gs_comments=? WHERE id=?""",
                                         (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),gs_comment,rec['id']))
                                     conn.commit(); conn.close()
-                                    st.success("Approved — forwarded to HR for validation."); st.rerun()
+                                    st.success("Approved — forwarded to the HR Manager for final approval."); st.rerun()
                             with gsc2:
                                 if st.button("Return for Correction",key=f"gs_return_{rec['id']}",use_container_width=True):
                                     conn=get_conn()
@@ -3807,18 +3807,18 @@ with main_block:
                             with gsc3:
                                 if st.button("Reject",key=f"gs_reject_{rec['id']}",use_container_width=True):
                                     conn=get_conn()
-                                    conn.execute("""UPDATE daily_status_records SET workflow_stage='Rejected by General Supervisor',
+                                    conn.execute("""UPDATE daily_status_records SET workflow_stage='Rejected by HR',
                                         gs_reviewed_by=?,gs_reviewed_at=?,gs_comments=? WHERE id=?""",
                                         (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),gs_comment,rec['id']))
                                     conn.commit(); conn.close()
                                     st.warning("Rejected."); st.rerun()
 
             with gs_tab2:
-                st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">Everything you (or another General Supervisor / Manager) have already reviewed, filterable by date.</div>',unsafe_allow_html=True)
+                st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">Everything you (or another HR Staff / Manager) have already reviewed, filterable by date.</div>',unsafe_allow_html=True)
                 gh1,gh2,gh3=st.columns(3)
                 with gh1: gs_hist_from=st.date_input("From",value=date.today()-timedelta(days=30),key="gs_hist_from")
                 with gh2: gs_hist_to=st.date_input("To",value=date.today(),key="gs_hist_to")
-                with gh3: gs_hist_stage=st.selectbox("Outcome",["All","Pending HR Validation","Returned for Correction","Rejected by General Supervisor"],key="gs_hist_stage")
+                with gh3: gs_hist_stage=st.selectbox("Outcome",["All","Pending HR Manager Approval","Returned for Correction","Rejected by HR"],key="gs_hist_stage")
                 conn=get_conn()
                 gs_hist_q="""SELECT dsr.emp_id,e.full_name as emp_name,dsr.status,dsr.leave_type,dsr.start_date,dsr.end_date,
                     dsr.num_days,dsr.supervisor_id,dsr.workflow_stage,dsr.gs_reviewed_by,dsr.gs_reviewed_at,dsr.gs_comments
@@ -3839,8 +3839,8 @@ with main_block:
                         "workflow_stage":"Outcome","gs_reviewed_by":"Reviewed By","gs_reviewed_at":"Reviewed At","gs_comments":"Comments"
                     }),use_container_width=True,hide_index=True)
                     gs_hist_buf=io.BytesIO()
-                    with pd.ExcelWriter(gs_hist_buf,engine="xlsxwriter") as w: gs_hist.to_excel(w,index=False,sheet_name="GS_Review_History")
-                    st.download_button("Export History",gs_hist_buf.getvalue(),file_name=f"GS_Review_History_{gs_hist_from}_to_{gs_hist_to}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    with pd.ExcelWriter(gs_hist_buf,engine="xlsxwriter") as w: gs_hist.to_excel(w,index=False,sheet_name="HR_Review_History")
+                    st.download_button("Export History",gs_hist_buf.getvalue(),file_name=f"HR_Review_History_{gs_hist_from}_to_{gs_hist_to}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     # ════════════════════════════════════════════════════════
     # HR VALIDATION — Step 3: Human Resources
@@ -3858,10 +3858,10 @@ with main_block:
                     dsr.status,dsr.leave_type,dsr.start_date,dsr.end_date,dsr.num_days,dsr.reason,dsr.doc_name,dsr.doc_data,dsr.submitted_at
                     FROM daily_status_records dsr
                     JOIN employees e ON dsr.emp_id=e.emp_id
-                    WHERE dsr.workflow_stage='Pending HR Validation'
+                    WHERE dsr.workflow_stage='Pending HR Manager Approval'
                     ORDER BY dsr.submitted_at ASC""",conn)
                 conn.close()
-                st.markdown(f'<div class="mg" style="grid-template-columns:1fr"><div class="mb mg-amber"><div class="ml ml-amber">Pending HR Validation</div><div class="mv">{len(hr_pending)}</div></div></div>',unsafe_allow_html=True)
+                st.markdown(f'<div class="mg" style="grid-template-columns:1fr"><div class="mb mg-amber"><div class="ml ml-amber">Pending HR Manager Approval</div><div class="mv">{len(hr_pending)}</div></div></div>',unsafe_allow_html=True)
                 if len(hr_pending)==0:
                     st.info("Nothing waiting for HR validation.")
                 else:
@@ -3906,7 +3906,7 @@ with main_block:
                                             (rec['emp_id'],rec['leave_type'] or rec['status'],rec['start_date'],rec['end_date'],rec['num_days'],
                                              round(dr,2),f"Supervisor: {rec['supervisor_id']} → GS: {rec['gs_reviewed_by']} → HR: {st.session_state.uid}",rec['reason'],
                                              datetime.now().strftime("%Y-%m-%d"),rec['doc_name'],rec['doc_data']))
-                                    conn.execute("""UPDATE daily_status_records SET workflow_stage='Approved by HR',
+                                    conn.execute("""UPDATE daily_status_records SET workflow_stage='Approved by HR Manager',
                                         hr_reviewed_by=?,hr_reviewed_at=?,hr_comments=? WHERE id=?""",
                                         (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),hr_comment,rec['id']))
                                     conn.commit(); conn.close()
@@ -3915,18 +3915,14 @@ with main_block:
                             with hrc2:
                                 if st.button("Reject",key=f"hr_reject_{rec['id']}",use_container_width=True):
                                     conn=get_conn()
-                                    conn.execute("""UPDATE daily_status_records SET workflow_stage='Rejected by HR',
-                                        hr_reviewed_by=?,hr_reviewed_at=?,hr_comments=? WHERE id=?""",
-                                        (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),hr_comment,rec['id']))
-                                    conn.commit(); conn.close()
-                                    st.warning("Rejected."); st.rerun()
+                                    conn.execute("""UPDATE daily_status_records SET workflow_stage='Rejected by HR Manager',
 
             with hr_tab2:
                 st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">Everything already validated (or rejected) by HR, filterable by date.</div>',unsafe_allow_html=True)
                 hh1,hh2,hh3=st.columns(3)
                 with hh1: hr_hist_from=st.date_input("From",value=date.today()-timedelta(days=30),key="hr_hist_from")
                 with hh2: hr_hist_to=st.date_input("To",value=date.today(),key="hr_hist_to")
-                with hh3: hr_hist_stage=st.selectbox("Outcome",["All","Approved by HR","Rejected by HR"],key="hr_hist_stage")
+                with hh3: hr_hist_stage=st.selectbox("Outcome",["All","Approved by HR Manager","Rejected by HR Manager"],key="hr_hist_stage")
                 conn=get_conn()
                 hr_hist_q="""SELECT dsr.emp_id,e.full_name as emp_name,dsr.status,dsr.leave_type,dsr.start_date,dsr.end_date,
                     dsr.num_days,dsr.supervisor_id,dsr.gs_reviewed_by,dsr.workflow_stage,dsr.hr_reviewed_by,dsr.hr_reviewed_at,dsr.hr_comments
