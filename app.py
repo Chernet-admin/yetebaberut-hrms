@@ -1197,7 +1197,7 @@ if st.session_state.role:
                 if st.button(v, use_container_width=True, key=f"nav_{v}"):
                     st.session_state.view=v; st.rerun()
                 if is_active: st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="nav-footer">Yetebaberut HRMS<br>v2.6 (build check)</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="nav-footer">Yetebaberut HRMS<br>v2.7 (build check)</div>', unsafe_allow_html=True)
 
 main_block = st.container() if st.session_state.role else st.container()
 
