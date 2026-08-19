@@ -2330,7 +2330,7 @@ with main_block:
                     st.dataframe(my_dsr.rename(columns={
                         "full_name":"Employee","status":"Type","start_date":"Start","end_date":"End","num_days":"Days",
                         "workflow_stage":"Current Status","gs_reviewed_by":"HR Reviewer","gs_comments":"HR Comment",
-                        "hr_reviewed_by":"HR Reviewer","hr_comments":"HR Comment"
+                        "hr_reviewed_by":"HR Manager","hr_comments":"HR Manager Comment"
                     }).drop(columns=["id"]),use_container_width=True,hide_index=True)
 
     # ════════════════════════════════════════════════════════
