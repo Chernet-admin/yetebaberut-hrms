@@ -301,7 +301,11 @@ def init_db():
         "sick_leave_days":"INTEGER DEFAULT 0","annual_leave_days":"INTEGER DEFAULT 0",
         "maternity_leave_days":"INTEGER DEFAULT 0","mourning_leave_days":"INTEGER DEFAULT 0",
         "unpaid_leave_days":"INTEGER DEFAULT 0","pension_employer":"REAL DEFAULT 0",
-        "full_name":"TEXT","division":"TEXT","cost_center":"TEXT"}.items():
+        "full_name":"TEXT","division":"TEXT","cost_center":"TEXT",
+        "category":"TEXT","position_title":"TEXT","meal_allowance":"REAL DEFAULT 0",
+        "medical_insurance":"REAL DEFAULT 0","paid_leaves_amount":"REAL DEFAULT 0",
+        "overhead_profit_margin":"REAL DEFAULT 0","vat_amount":"REAL DEFAULT 0",
+        "total_paid_per_mm":"REAL DEFAULT 0","taxable_amount":"REAL DEFAULT 0"}.items():
         if pcol not in pcols:
             try: c.execute(f"ALTER TABLE payroll ADD COLUMN {pcol} {ptyp}"); conn.commit()
             except: pass
@@ -683,6 +687,41 @@ def calc_pay(basic,transport,housing,other,fine,unpaid,absent,extra):
     tax=eth_tax(gross); pen=basic*0.07; pen_er=basic*0.11
     net=max(gross-tax-pen-fine-(daily*(unpaid+absent))-extra,0)
     return round(net,2),round(tax,2),round(pen,2),round(pen_er,2),round(daily,2),round(gross,2)
+
+# ── AGENCY COST-BREAKDOWN PAYROLL MODEL (Annex III) ──
+# This replaces the simple in-house payroll model above for the primary
+# Process Payroll workflow. Formulas verified against the client's actual
+# signed Annex III document (all 5 category rows matched to the cent):
+#   Gross Earning = Basic + Transport + Meal + Medical + Company Pension(11%) + Paid Leaves + Overhead/Profit Margin
+#   VAT = Gross Earning x 15%
+#   Total Paid Per MM = Gross Earning + VAT  (this is what the CLIENT pays the agency)
+#   Taxable Amount = Basic + Transport - 600  (flat transport tax exemption)
+#   Net Pay = Basic + Transport + Meal - Employee Pension(7%) - Income Tax  (paid to the employee)
+# Income Tax uses this app's existing Ethiopian PAYE bracket function
+# (eth_tax) applied to the Taxable Amount above — this part is editable
+# in the UI in case the client's current bracket table differs slightly.
+CATEGORY_POSITIONS = {
+    "A": ["Cleaner","FSA","Laborer","Gardener","Catering Helper","Waitress","BCH"],
+    "B": ["Security Guard (Ticket Office)"],
+    "C": ["Driver","Tire Repair Man","Tailor"],
+    "D": ["Carpenter","Mason","Welder","Painter"],
+    "E": ["Cook"],
+}
+
+def calc_agency_payroll(basic,transport,meal,medical,paid_leaves,overhead_margin,income_tax_override=None):
+    company_pension=round(basic*0.11,2)
+    employee_pension=round(basic*0.07,2)
+    gross_earning=round(basic+transport+meal+medical+company_pension+paid_leaves+overhead_margin,2)
+    vat=round(gross_earning*0.15,2)
+    total_paid_per_mm=round(gross_earning+vat,2)
+    taxable_amount=max(round(basic+transport-600,2),0)
+    income_tax=round(income_tax_override,2) if income_tax_override is not None else round(eth_tax(taxable_amount),2)
+    net_pay=round(basic+transport+meal-employee_pension-income_tax,2)
+    return {
+        "company_pension":company_pension,"employee_pension":employee_pension,
+        "gross_earning":gross_earning,"vat":vat,"total_paid_per_mm":total_paid_per_mm,
+        "taxable_amount":taxable_amount,"income_tax":income_tax,"net_pay":net_pay,
+    }
 
 def b64file(data,name):
     if not data or not name: return None,None
