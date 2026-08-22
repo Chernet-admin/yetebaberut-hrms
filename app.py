@@ -773,28 +773,30 @@ td{{padding:6px 10px;font-size:12px;border-bottom:1px solid #eee}}
 <div><div class="lbl">Full Name</div><div class="val">{emp.get("full_name","")}</div></div>
 <div><div class="lbl">Division</div><div class="val">{emp.get("division","")}</div></div>
 <div><div class="lbl">Cost Center</div><div class="val">{emp.get("cost_center","—")}</div></div>
-<div><div class="lbl">Job Title</div><div class="val">{emp.get("job_title","—")}</div></div>
+<div><div class="lbl">Job Title / Category</div><div class="val">{emp.get("job_title","—")} {f"(Cat. {pay.get('category')})" if pay.get('category') else ""}</div></div>
 <div><div class="lbl">Bank / Account</div><div class="val">{emp.get("bank_name","—")} / {emp.get("bank_account","—")}</div></div>
 </div>
-<table><tr><th>EARNINGS</th><th style="text-align:right">ETB</th></tr>
+<table><tr><th>COST BREAKDOWN (AGENCY BILLING)</th><th style="text-align:right">ETB</th></tr>
 <tr><td>Basic Salary</td><td style="text-align:right">{float(pay.get("basic_salary",0)):,.2f}</td></tr>
 <tr><td>Transport Allowance</td><td style="text-align:right">{float(pay.get("transport_allowance",0)):,.2f}</td></tr>
-<tr><td>Housing Allowance</td><td style="text-align:right">{float(pay.get("housing_allowance",0)):,.2f}</td></tr>
-<tr><td>Other Allowance</td><td style="text-align:right">{float(pay.get("other_allowance",0)):,.2f}</td></tr>
-<tr style="font-weight:bold;background:#f5f5f5"><td>GROSS</td><td style="text-align:right">{float(pay.get("gross_salary",0)):,.2f}</td></tr></table>
-<table><tr><th>DEDUCTIONS</th><th style="text-align:right">ETB</th></tr>
+<tr><td>Meal Allowance</td><td style="text-align:right">{float(pay.get("meal_allowance",0)):,.2f}</td></tr>
+<tr><td>Medical Insurance</td><td style="text-align:right">{float(pay.get("medical_insurance",0)):,.2f}</td></tr>
+<tr><td>Pension Contribution by Company (11%)</td><td style="text-align:right">{float(pay.get("pension_employer",0)):,.2f}</td></tr>
+<tr><td>Paid Leaves</td><td style="text-align:right">{float(pay.get("paid_leaves_amount",0)):,.2f}</td></tr>
+<tr><td>Overhead & Profit Margin</td><td style="text-align:right">{float(pay.get("overhead_profit_margin",0)):,.2f}</td></tr>
+<tr style="font-weight:bold;background:#f5f5f5"><td>GROSS EARNING</td><td style="text-align:right">{float(pay.get("gross_salary",0)):,.2f}</td></tr>
+<tr><td>VAT (15%)</td><td style="text-align:right">{float(pay.get("vat_amount",0)):,.2f}</td></tr>
+<tr style="font-weight:bold;background:#f5f5f5"><td>TOTAL PAID PER MM (billed to client)</td><td style="text-align:right">{float(pay.get("total_paid_per_mm",0)):,.2f}</td></tr></table>
+<table><tr><th>EMPLOYEE PAY</th><th style="text-align:right">ETB</th></tr>
+<tr><td>Taxable Amount</td><td style="text-align:right">{float(pay.get("taxable_amount",0)):,.2f}</td></tr>
 <tr><td class="ded">Income Tax</td><td class="ded" style="text-align:right">-{float(pay.get("income_tax",0)):,.2f}</td></tr>
-<tr><td class="ded">Employee Pension 7%</td><td class="ded" style="text-align:right">-{float(pay.get("pension_employee",0)):,.2f}</td></tr>
+<tr><td class="ded">Employee Pension (7%)</td><td class="ded" style="text-align:right">-{float(pay.get("pension_employee",0)):,.2f}</td></tr>
 <tr><td class="ded">Fines ({pay.get("fine_days",0)} days)</td><td class="ded" style="text-align:right">-{float(pay.get("fine_amount",0)):,.2f}</td></tr>
-<tr><td class="ded">Unpaid Leave ({pay.get("unpaid_leave_days",0)} days)</td><td class="ded" style="text-align:right">-{float(pay.get("unpaid_leave_days",0))*daily:,.2f}</td></tr>
 <tr><td class="ded">Absent ({pay.get("absent_days",0)} days)</td><td class="ded" style="text-align:right">-{float(pay.get("absent_days",0))*daily:,.2f}</td></tr>
 <tr><td class="ded">Other Deductions</td><td class="ded" style="text-align:right">-{float(pay.get("other_deductions",0)):,.2f}</td></tr>
-<tr><td class="add">Paid Leave (Sick/Annual/Mat/Mourning)</td><td class="add" style="text-align:right"> Paid</td></tr>
 <tr><td class="add">Day-Off ({pay.get("dayoff_days",4)} days — {pay.get("dayoff_weekday","Sunday")}s)</td><td class="add" style="text-align:right"> Paid</td></tr>
 <tr><td class="add">Public Holidays ({pay.get("holiday_days",0)} days)</td><td class="add" style="text-align:right"> Paid</td></tr></table>
-<table><tr class="nr"><td>NET SALARY</td><td style="text-align:right;font-size:16px">ETB {float(pay.get("net_salary",0)):,.2f}</td></tr></table>
-<table><tr><th>EMPLOYER</th><th style="text-align:right">ETB</th></tr>
-<tr><td class="add">Employer Pension 11%</td><td class="add" style="text-align:right">{float(pay.get("pension_employer",0)):,.2f}</td></tr></table>
+<table><tr class="nr"><td>FINAL NET PAY</td><td style="text-align:right;font-size:16px">ETB {float(pay.get("net_salary",0)):,.2f}</td></tr></table>
 <div class="footer">
 <div><div class="sig">Employee Signature</div></div>
 <div><div class="sig">HR Officer</div></div>
@@ -2398,22 +2400,10 @@ with main_block:
                 fine_days,fine_amount,letter_name,applied_to_payroll
                 FROM fine_letters WHERE emp_id=? AND applied_to_payroll='No'
                 AND COALESCE(record_status,'Active')='Active'""",conn,params=(seid,))
-            # Absences for this month — excluding Cancelled and Compensated records automatically
             ab_count=pg_read_sql("""SELECT COUNT(*) as c FROM absent_records
                 WHERE emp_id=? AND is_excused=0 AND substr(absent_date,1,7)=?
                 AND COALESCE(record_status,'Active')='Active'""",conn,params=(seid,pay_month)).iloc[0]['c']
-            # Leave days for this month — auto-collected from approved leave records, excluding Cancelled
-            leave_this_month=pg_read_sql("""SELECT leave_type, SUM(days_taken) as total_days FROM leave_records
-                WHERE emp_id=? AND status IN ('Approved') AND
-                ((substr(start_date,1,7)=?) OR (substr(end_date,1,7)=?))
-                GROUP BY leave_type""",conn,params=(seid,pay_month,pay_month))
             conn.close()
-            leave_lookup_auto = dict(zip(leave_this_month['leave_type'], leave_this_month['total_days'])) if len(leave_this_month)>0 else {}
-            auto_sick = int(leave_lookup_auto.get("Sick Leave",0))
-            auto_annual = int(leave_lookup_auto.get("Annual Leave",0))
-            auto_maternity = int(leave_lookup_auto.get("Maternity Leave",0))
-            auto_mourning = int(leave_lookup_auto.get("Mourning Leave",0))
-            auto_unpaid = int(leave_lookup_auto.get("Unpaid Leave",0))
             if len(er)==0: st.warning("Not found."); st.stop()
             er=er.iloc[0]; base=float(er.get("basic_salary",0) or 0)
             weekly_dayoff = er.get("weekly_dayoff") or "Sunday"
@@ -2421,15 +2411,23 @@ with main_block:
             holidays=get_holidays(pay_yr)
             month_hols=[d for d in holidays if d.month==pay_mo]
             hol_count=len(month_hols)
-
-            # ── AUTONOMOUS DAY-OFF CALCULATION ──
-            # System knows the employee's chosen weekday and automatically finds
-            # every matching calendar date in the selected month — no manual entry needed.
             dayoff_dates = get_dayoff_dates(weekly_dayoff, pay_yr, pay_mo)
             dayoff_count = len(dayoff_dates)
             absent_count=int(ab_count)
 
             st.markdown("<hr>",unsafe_allow_html=True)
+            st.markdown('<div class="fs">Category & Position (Annex III Cost Breakdown)</div>',unsafe_allow_html=True)
+            cat1,cat2=st.columns(2)
+            emp_job_title = er.get("job_title") or ""
+            suggested_cat = next((c for c,positions in CATEGORY_POSITIONS.items()
+                if any(p.lower() in emp_job_title.lower() or emp_job_title.lower() in p.lower() for p in positions)), "A")
+            with cat1:
+                cat_opts=list(CATEGORY_POSITIONS.keys())
+                sel_category=st.selectbox("Category",cat_opts,index=cat_opts.index(suggested_cat),
+                    format_func=lambda c: f"{c} — {', '.join(CATEGORY_POSITIONS[c])}")
+            with cat2:
+                position_title=st.text_input("Position Title",value=emp_job_title or CATEGORY_POSITIONS[sel_category][0])
+
             st.markdown('<div class="fs">Employee Weekly Day-Off Setting</div>',unsafe_allow_html=True)
             wd_disp_col,wd_edit_col=st.columns([2,1])
             with wd_disp_col:
@@ -2451,54 +2449,63 @@ with main_block:
                         st.success(f"Day-off changed to {new_wd}. System will recalculate dates automatically.")
                         st.rerun()
 
-            st.markdown('<div class="fs">Allowances</div>',unsafe_allow_html=True)
-            al1,al2,al3,al4=st.columns(4)
-            with al1: transport=st.number_input("Transport Allowance",min_value=0.0,value=500.0,step=50.0)
-            with al2: housing=st.number_input("Housing Allowance",min_value=0.0,value=300.0,step=50.0)
-            with al3: other_al=st.number_input("Other Allowance",min_value=0.0,value=0.0,step=50.0)
-            with al4: st.markdown(f'<div style="background:#0D1526;border:1px solid rgba(212,168,71,0.2);border-radius:8px;padding:10px;margin-top:20px"><div style="color:#6B7FA3;font-size:9px">BASIC SALARY</div><div style="color:#F0C96B;font-size:17px;font-family:Cinzel,serif;font-weight:700">ETB {base:,.2f}</div></div>',unsafe_allow_html=True)
-            st.markdown('<div class="fs">Leave This Month — Auto-Collected from Leave Records (editable)</div>',unsafe_allow_html=True)
-            lv1,lv2,lv3,lv4,lv5=st.columns(5)
-            with lv1: sick_days=st.number_input("Sick Leave",min_value=0,max_value=30,value=auto_sick,step=1)
-            with lv2: annual_days=st.number_input("Annual Leave",min_value=0,max_value=30,value=auto_annual,step=1)
-            with lv3: mat_days=st.number_input("Maternity",min_value=0,max_value=90,value=auto_maternity,step=1)
-            with lv4: mourning_days=st.number_input("Mourning",min_value=0,max_value=5,value=auto_mourning,step=1)
-            with lv5: unpaid_days=st.number_input("Unpaid Leave",min_value=0,max_value=30,value=auto_unpaid,step=1)
-            st.markdown('<div class="fs">Absence & Public Holidays (Auto-Detected — Cancelled and Compensated days excluded)</div>',unsafe_allow_html=True)
+            st.markdown('<div class="fs">Agency Cost Breakdown — Annex III</div>',unsafe_allow_html=True)
+            st.caption("Formulas verified against the signed Annex III document. Paid Leaves and Overhead/Profit Margin are business-set values you enter per employee — adjust anytime.")
+            ac1,ac2,ac3=st.columns(3)
+            with ac1: transport=st.number_input("Transport Allowance",min_value=0.0,value=500.0,step=50.0)
+            with ac2: meal_allow=st.number_input("Meal Allowance (30 birr × 26 days default)",min_value=0.0,value=780.0,step=10.0)
+            with ac3: medical_ins=st.number_input("Medical Insurance",min_value=0.0,value=150.0,step=10.0)
+            ac4,ac5,ac6=st.columns(3)
+            with ac4: paid_leaves_amt=st.number_input("Paid Leaves (ETB)",min_value=0.0,value=0.0,step=10.0)
+            with ac5: overhead_margin=st.number_input("Overhead & Profit Margin per person",min_value=0.0,value=0.0,step=10.0)
+            with ac6: st.markdown(f'<div style="background:#0D1526;border:1px solid rgba(212,168,71,0.2);border-radius:8px;padding:10px;margin-top:20px"><div style="color:#6B7FA3;font-size:9px">BASIC SALARY</div><div style="color:#F0C96B;font-size:17px;font-family:Cinzel,serif;font-weight:700">ETB {base:,.2f}</div></div>',unsafe_allow_html=True)
+
+            calc=calc_agency_payroll(base,transport,meal_allow,medical_ins,paid_leaves_amt,overhead_margin)
+            tax_override=st.number_input("Income Tax (auto-calculated — override here if your current PAYE bracket table differs)",
+                min_value=0.0,value=float(calc["income_tax"]),step=1.0,
+                help="Auto value uses this app's built-in Ethiopian PAYE brackets applied to the Taxable Amount below. Edit if your accountant's current table gives a different figure.")
+            if tax_override != calc["income_tax"]:
+                calc=calc_agency_payroll(base,transport,meal_allow,medical_ins,paid_leaves_amt,overhead_margin,income_tax_override=tax_override)
+
+            st.markdown('<div class="fs">Absence & Public Holidays (Auto-Detected, applied as extra deduction below)</div>',unsafe_allow_html=True)
             ab1,ab2,ab3=st.columns(3)
             with ab1: absent_input=st.number_input("Absent Days (unexcused, deducted)",min_value=0,max_value=30,value=absent_count,step=1)
             with ab2: st.markdown(f'<div style="background:#0D1526;border:1px solid rgba(56,189,248,0.2);border-radius:8px;padding:10px;margin-top:20px"><div style="color:#6B7FA3;font-size:9px">DAY-OFF ({weekly_dayoff}s) — AUTO</div><div style="color:#38BDF8;font-size:17px;font-family:Cinzel,serif;font-weight:700">{dayoff_count} days  Paid</div></div>',unsafe_allow_html=True)
-            with ab3: st.markdown(f'<div style="background:#0D1526;border:1px solid rgba(212,168,71,0.2);border-radius:8px;padding:10px;margin-top:20px"><div style="color:#6B7FA3;font-size:9px">PAID HOLIDAYS — AUTO</div><div style="color:#F0C96B;font-size:17px;font-family:Cinzel,serif;font-weight:700">{hol_count} days  Paid</div><div style="font-size:9px;color:#6B7FA3">{"  ".join([d.strftime("%b %d") for d in month_hols]) or "None this month"}</div></div>',unsafe_allow_html=True)
+            with ab3: st.markdown(f'<div style="background:#0D1526;border:1px solid rgba(212,168,71,0.2);border-radius:8px;padding:10px;margin-top:20px"><div style="color:#6B7FA3;font-size:9px">PAID HOLIDAYS — AUTO</div><div style="color:#F0C96B;font-size:17px;font-family:Cinzel,serif;font-weight:700">{hol_count} days  Paid</div></div>',unsafe_allow_html=True)
             total_fine_days=0; total_fine_amt=0.0; apply_all=False
             if len(fines_df)>0:
                 st.markdown('<div class="fs">Pending Fine Letters (Auto-Collected)</div>',unsafe_allow_html=True)
                 st.dataframe(fines_df[["id","month","issue_date","fine_reason","fine_type","fine_days","fine_amount","letter_name"]],use_container_width=True,hide_index=True)
-                apply_all=st.checkbox("Apply all pending fines to this payroll (Cancelled and Compensated fines are excluded automatically)",value=True)
+                apply_all=st.checkbox("Apply all pending fines to this payroll",value=True)
                 if apply_all:
                     total_fine_days=int(fines_df["fine_days"].sum()); total_fine_amt=float(fines_df["fine_amount"].sum())
-                    st.markdown(f'<div style="color:#FCA5A5;font-size:12px">Fine: <b>ETB {total_fine_amt:,.2f}</b> ({total_fine_days} days)</div>',unsafe_allow_html=True)
             else:
                 st.success("No pending fines.")
             other_ded=st.number_input("Other Deductions (ETB)",min_value=0.0,value=0.0,step=50.0)
             notes_pay=st.text_area("Payroll Notes",placeholder="Optional...")
-            net,tax,pen_emp,pen_er,daily_rate,gross=calc_pay(base,transport,housing,other_al,total_fine_amt,unpaid_days,absent_input,other_ded)
+
+            daily_rate=round(base/26,2) if base else 0
+            extra_deductions=round(total_fine_amt+other_ded+(daily_rate*absent_input),2)
+            final_net=round(max(calc["net_pay"]-extra_deductions,0),2)
+
             st.markdown(f"""<div class="ps">
-              <div style="font-family:'Cinzel',serif;font-size:12px;color:#D4A847;margin-bottom:10px;letter-spacing:.05em">AUTO PAYROLL — {pay_month}</div>
+              <div style="font-family:'Cinzel',serif;font-size:12px;color:#D4A847;margin-bottom:10px;letter-spacing:.05em">AGENCY COST BREAKDOWN — {pay_month} — Category {sel_category}</div>
               <div class="pr"><span class="pl">Basic Salary</span><span class="pv">ETB {base:,.2f}</span></div>
-              <div class="pr"><span class="pl">Transport</span><span class="pv">ETB {transport:,.2f}</span></div>
-              <div class="pr"><span class="pl">Housing</span><span class="pv">ETB {housing:,.2f}</span></div>
-              <div class="pr"><span class="pl">Other Allow.</span><span class="pv">ETB {other_al:,.2f}</span></div>
-              <div class="pr"><span class="pl" style="font-weight:600">GROSS</span><span class="pv" style="color:#F0C96B;font-weight:600">ETB {gross:,.2f}</span></div>
-              <div class="pr"><span class="pl">Income Tax</span><span class="pd">- ETB {tax:,.2f}</span></div>
-              <div class="pr"><span class="pl">Pension Emp 7%</span><span class="pd">- ETB {pen_emp:,.2f}</span></div>
-              <div class="pr"><span class="pl">Pension Er 11%</span><span class="pv" style="color:#38BDF8">ETB {pen_er:,.2f} (company)</span></div>
-              <div class="pr"><span class="pl">Fines ({total_fine_days} days)</span><span class="pd">- ETB {total_fine_amt:,.2f}</span></div>
-              <div class="pr"><span class="pl">Unpaid Leave ({unpaid_days} × ETB {daily_rate:.2f})</span><span class="pd">- ETB {daily_rate*unpaid_days:,.2f}</span></div>
-              <div class="pr"><span class="pl">Absent ({absent_input} × ETB {daily_rate:.2f})</span><span class="pd">- ETB {daily_rate*absent_input:,.2f}</span></div>
-              <div class="pr"><span class="pl">Other Deductions</span><span class="pd">- ETB {other_ded:,.2f}</span></div>
-              <div class="pr"><span class="pl" style="color:#10B981">Paid Leave (Sick {sick_days}+Annual {annual_days}+Mat {mat_days}+Mourning {mourning_days})</span><span class="pv" style="color:#10B981"> Paid</span></div>
-              <div class="pr"><span class="pl" style="color:#10B981">Day-Off {dayoff_count} days ({weekly_dayoff}) + Holidays {hol_count}</span><span class="pv" style="color:#10B981"> Paid</span></div>
-              <div class="pr" style="border-top:1px solid rgba(16,185,129,0.3);margin-top:6px;padding-top:10px"><span class="pl" style="font-size:14px;font-weight:600;color:#E8EEF7">NET SALARY</span><span class="pn">ETB {net:,.2f}</span></div>
+              <div class="pr"><span class="pl">Transport Allowance</span><span class="pv">ETB {transport:,.2f}</span></div>
+              <div class="pr"><span class="pl">Meal Allowance</span><span class="pv">ETB {meal_allow:,.2f}</span></div>
+              <div class="pr"><span class="pl">Medical Insurance</span><span class="pv">ETB {medical_ins:,.2f}</span></div>
+              <div class="pr"><span class="pl">Pension Contribution by Company (11%)</span><span class="pv" style="color:#38BDF8">ETB {calc['company_pension']:,.2f}</span></div>
+              <div class="pr"><span class="pl">Paid Leaves</span><span class="pv">ETB {paid_leaves_amt:,.2f}</span></div>
+              <div class="pr"><span class="pl">Overhead & Profit Margin</span><span class="pv">ETB {overhead_margin:,.2f}</span></div>
+              <div class="pr" style="border-top:1px solid rgba(212,168,71,0.2);margin-top:4px;padding-top:8px"><span class="pl" style="font-weight:600">GROSS EARNING</span><span class="pv" style="color:#F0C96B;font-weight:600">ETB {calc['gross_earning']:,.2f}</span></div>
+              <div class="pr"><span class="pl">VAT (15%)</span><span class="pv">ETB {calc['vat']:,.2f}</span></div>
+              <div class="pr" style="border-top:1px solid rgba(212,168,71,0.2);margin-top:4px;padding-top:8px"><span class="pl" style="font-weight:600">TOTAL PAID PER MM (billed to client)</span><span class="pv" style="color:#F0C96B;font-weight:600">ETB {calc['total_paid_per_mm']:,.2f}</span></div>
+              <div class="pr" style="margin-top:10px"><span class="pl">Taxable Amount</span><span class="pv">ETB {calc['taxable_amount']:,.2f}</span></div>
+              <div class="pr"><span class="pl">Income Tax</span><span class="pd">- ETB {calc['income_tax']:,.2f}</span></div>
+              <div class="pr"><span class="pl">Pension by the Employee (7%)</span><span class="pd">- ETB {calc['employee_pension']:,.2f}</span></div>
+              <div class="pr" style="border-top:1px solid rgba(16,185,129,0.3);margin-top:6px;padding-top:10px"><span class="pl" style="font-size:13px;font-weight:600;color:#E8EEF7">NET PAY (per Annex III)</span><span class="pn">ETB {calc['net_pay']:,.2f}</span></div>
+              <div class="pr" style="margin-top:8px"><span class="pl">Fines / Absences / Other Deductions</span><span class="pd">- ETB {extra_deductions:,.2f}</span></div>
+              <div class="pr" style="border-top:1px solid rgba(16,185,129,0.3);margin-top:6px;padding-top:10px"><span class="pl" style="font-size:14px;font-weight:600;color:#E8EEF7">FINAL NET PAY</span><span class="pn">ETB {final_net:,.2f}</span></div>
             </div>""",unsafe_allow_html=True)
             st.write("")
             sc1,sc2=st.columns(2)
@@ -2511,31 +2518,32 @@ with main_block:
                         conn.close()
                         st.error(f"Payroll for {seid} — {pay_month} has already been processed. The system blocks duplicate payroll entries automatically. Check Payroll History to review or correct the existing record.")
                     else:
-                        conn.execute("""INSERT INTO payroll(emp_id,month,basic_salary,transport_allowance,housing_allowance,
-                            other_allowance,income_tax,pension_employee,pension_employer,other_deductions,fine_amount,fine_days,
-                            sick_leave_days,annual_leave_days,maternity_leave_days,mourning_leave_days,unpaid_leave_days,
+                        conn.execute("""INSERT INTO payroll(emp_id,month,basic_salary,transport_allowance,
+                            income_tax,pension_employee,pension_employer,other_deductions,fine_amount,fine_days,
                             absent_days,holiday_days,dayoff_days,gross_salary,net_salary,payment_status,notes,created_at,
-                            full_name,division,cost_center)
-                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Processed',?,?,?,?,?)""",
-                            (seid,pay_month,base,transport,housing,other_al,tax,pen_emp,pen_er,other_ded,
-                             total_fine_amt,total_fine_days,sick_days,annual_days,mat_days,mourning_days,
-                             unpaid_days,absent_input,hol_count,dayoff_count,gross,net,notes_pay,datetime.now().strftime("%Y-%m-%d"),
-                             er['full_name'],er['division'],er['cost_center']))
+                            full_name,division,cost_center,category,position_title,meal_allowance,medical_insurance,
+                            paid_leaves_amount,overhead_profit_margin,vat_amount,total_paid_per_mm,taxable_amount)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Processed',?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (seid,pay_month,base,transport,calc['income_tax'],calc['employee_pension'],calc['company_pension'],
+                             extra_deductions,total_fine_amt,total_fine_days,absent_input,hol_count,dayoff_count,
+                             calc['gross_earning'],final_net,notes_pay,datetime.now().strftime("%Y-%m-%d"),
+                             er['full_name'],er['division'],er['cost_center'],sel_category,position_title,meal_allow,
+                             medical_ins,paid_leaves_amt,overhead_margin,calc['vat'],calc['total_paid_per_mm'],calc['taxable_amount']))
                         if apply_all and len(fines_df)>0:
                             ids=tuple(fines_df["id"].tolist())
                             if len(ids)==1: conn.execute("UPDATE fine_letters SET applied_to_payroll='Yes' WHERE id=?",(ids[0],))
                             else: conn.execute(f"UPDATE fine_letters SET applied_to_payroll='Yes' WHERE id IN {ids}")
                         conn.commit(); conn.close()
-                        st.success(f"Payroll saved — Net: ETB {net:,.2f}"); st.balloons()
+                        st.success(f"Payroll saved — Final Net Pay: ETB {final_net:,.2f}"); st.balloons()
             with sc2:
                 er_dict=er.to_dict()
-                pay_row={"month":pay_month,"basic_salary":base,"transport_allowance":transport,"housing_allowance":housing,
-                    "other_allowance":other_al,"gross_salary":gross,"income_tax":tax,"pension_employee":pen_emp,
-                    "pension_employer":pen_er,"fine_days":total_fine_days,"fine_amount":total_fine_amt,
-                    "unpaid_leave_days":unpaid_days,"absent_days":absent_input,"sick_leave_days":sick_days,
-                    "annual_leave_days":annual_days,"maternity_leave_days":mat_days,"mourning_leave_days":mourning_days,
+                pay_row={"month":pay_month,"basic_salary":base,"transport_allowance":transport,"meal_allowance":meal_allow,
+                    "medical_insurance":medical_ins,"gross_salary":calc['gross_earning'],"income_tax":calc['income_tax'],
+                    "pension_employee":calc['employee_pension'],"pension_employer":calc['company_pension'],
+                    "vat_amount":calc['vat'],"total_paid_per_mm":calc['total_paid_per_mm'],"taxable_amount":calc['taxable_amount'],
+                    "fine_days":total_fine_days,"fine_amount":total_fine_amt,"absent_days":absent_input,
                     "holiday_days":hol_count,"dayoff_days":dayoff_count,"dayoff_weekday":weekly_dayoff,
-                    "other_deductions":other_ded,"net_salary":net}
+                    "other_deductions":other_ded,"net_salary":final_net,"category":sel_category,"position_title":position_title}
                 html_slip=print_slip(er_dict,pay_row)
                 b64_slip=base64.b64encode(html_slip.encode()).decode()
                 st.markdown(f'<a href="data:text/html;base64,{b64_slip}" download="Payroll_{seid}_{pay_month}.html" target="_blank"><button style="width:100%;background:linear-gradient(135deg,#7B2FBE,#9333EA);color:#fff;border:none;border-radius:8px;padding:10px;font-weight:600;font-size:12px;cursor:pointer"> Print / Download Payroll Statement</button></a>',unsafe_allow_html=True)
