@@ -543,9 +543,32 @@ def init_db():
         transport_allowance REAL DEFAULT 0,
         meal_allowance REAL DEFAULT 0,
         medical_insurance REAL DEFAULT 0,
+        paid_leave REAL DEFAULT 0,
         overhead_profit REAL DEFAULT 0,
         updated_by TEXT,
         updated_at TEXT)""")
+    c.execute("PRAGMA table_info(salary_categories)")
+    sccols=[col[1] for col in c.fetchall()]
+    if "paid_leave" not in sccols:
+        try: c.execute("ALTER TABLE salary_categories ADD COLUMN paid_leave REAL DEFAULT 0"); conn.commit()
+        except: pass
+    # ── Seed the five Annex III categories with their position lists (rates
+    # start at 0 — the Manager fills those in on the Salary Categories page).
+    # ON CONFLICT DO NOTHING so this never overwrites rates already set. ──
+    now_sc=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    SALARY_CATEGORY_SEED = [
+        ("A","BCH, Cleaner, FSA, Laborer, Gardner, Catering Helper, Waitress"),
+        ("B","Security Guard (Ticket Office)"),
+        ("C","Driver, Tire Repair Man, Tailor"),
+        ("D","Carpenter, Mason, Welder, Painter"),
+        ("E","Cook"),
+    ]
+    for cat_code,cat_positions in SALARY_CATEGORY_SEED:
+        try:
+            c.execute("""INSERT INTO salary_categories(category,position_examples,updated_by,updated_at)
+                VALUES(?,?,'system',?) ON CONFLICT(category) DO NOTHING""",(cat_code,cat_positions,now_sc))
+        except: pass
+    conn.commit()
 
     # ── SYSTEM SETTINGS (applicant gate control + leave/overtime policy) ──
     c.execute("""CREATE TABLE IF NOT EXISTS system_settings(
@@ -580,6 +603,7 @@ def init_db():
         "policy_medical_insurance":"0",
         "policy_overhead_profit_percent":"0",
         "policy_vat_percent":"15",
+        "policy_transport_tax_exemption":"600",
     }
     now_p=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     for pk,pv in POLICY_DEFAULTS.items():
@@ -3622,45 +3646,89 @@ with main_block:
                 disp_cat=cat_df.rename(columns={"category":"Category","position_examples":"Position Examples",
                     "basic_salary":"Basic Salary","transport_allowance":"Transport Allowance",
                     "meal_allowance":"Meal Allowance","medical_insurance":"Medical Insurance",
-                    "overhead_profit":"Overhead & Profit","updated_by":"Updated By","updated_at":"Updated At"})
-                st.dataframe(disp_cat,use_container_width=True,hide_index=True)
+                    "paid_leave":"Paid Leave","overhead_profit":"Overhead & Profit",
+                    "updated_by":"Updated By","updated_at":"Updated At"})
+                col_order=["Category","Position Examples","Basic Salary","Transport Allowance","Meal Allowance",
+                    "Medical Insurance","Paid Leave","Overhead & Profit","Updated By","Updated At"]
+                st.dataframe(disp_cat[[c for c in col_order if c in disp_cat.columns]],use_container_width=True,hide_index=True)
             else:
-                st.info("No salary categories configured yet — add the first one below (e.g. Category A, B, C... matching Annex III).")
+                st.info("No salary categories configured yet.")
 
             if st.session_state.role=="Manager":
                 st.markdown("<hr>",unsafe_allow_html=True)
                 st.markdown('<div class="fs">Add / Update a Category Rate</div>',unsafe_allow_html=True)
-                st.markdown('<div style="font-size:11px;color:#F59E0B;margin-bottom:8px">Increasing or decreasing any figure here is a manual Manager decision. After saving, use "Apply to Prepared Payroll" below to push the new rate into payroll that has already been prepared but not yet given final General Manager approval.</div>',unsafe_allow_html=True)
+                st.markdown('<div style="font-size:11px;color:#F59E0B;margin-bottom:8px">Categories A–E are pre-loaded with their position lists. Pick one (or type a new code), fill in the rates, and the full Annex III calculation updates live below as you type. After saving, use "Apply to Prepared Payroll" further down to push the new rate into payroll already prepared but not yet given final General Manager approval.</div>',unsafe_allow_html=True)
+
                 existing_cats=cat_df['category'].tolist() if len(cat_df)>0 else []
-                with st.form("salary_cat_form"):
-                    sc1,sc2=st.columns(2)
-                    with sc1: sc_cat=st.text_input("Category (e.g. A, B, C, D, E)",placeholder="A")
-                    with sc2: sc_examples=st.text_input("Position Examples",placeholder="Cleaner, Laborer, Gardener, Waitress...")
-                    sc3,sc4,sc5=st.columns(3)
-                    with sc3: sc_basic=st.number_input("Basic Salary Per Head",min_value=0.0,step=50.0)
-                    with sc4: sc_transport=st.number_input("Transport Allowance",min_value=0.0,step=50.0)
-                    with sc5: sc_meal=st.number_input("Meal Allowance (per month)",min_value=0.0,step=50.0,help="e.g. 30 birr/day × 26 days")
-                    sc6,sc7=st.columns(2)
-                    with sc6: sc_medical=st.number_input("Medical Insurance",min_value=0.0,step=50.0)
-                    with sc7: sc_overhead=st.number_input("Overhead and Profit Margin per person",min_value=0.0,step=50.0)
-                    if st.form_submit_button("Save Category Rate",use_container_width=True):
-                        if not sc_cat.strip():
-                            st.error("Category is required.")
-                        else:
-                            conn=get_conn()
-                            conn.execute("""INSERT INTO salary_categories(category,position_examples,basic_salary,
-                                transport_allowance,meal_allowance,medical_insurance,overhead_profit,updated_by,updated_at)
-                                VALUES(?,?,?,?,?,?,?,?,?)
-                                ON CONFLICT(category) DO UPDATE SET position_examples=?,basic_salary=?,
-                                transport_allowance=?,meal_allowance=?,medical_insurance=?,overhead_profit=?,updated_by=?,updated_at=?""",
-                                (sc_cat.strip().upper(),sc_examples,sc_basic,sc_transport,sc_meal,sc_medical,sc_overhead,
-                                 st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                 sc_examples,sc_basic,sc_transport,sc_meal,sc_medical,sc_overhead,
-                                 st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-                            conn.commit(); conn.close()
-                            get_salary_categories.clear()
-                            st.success(f"Category {sc_cat.strip().upper()} rate saved.")
-                            st.rerun()
+                cat_pick_opts=["+ New Category"]+existing_cats
+                cat_pick=st.selectbox("Category to edit",cat_pick_opts,key="sc_cat_pick")
+                if cat_pick=="+ New Category":
+                    pre={"category":"","position_examples":"","basic_salary":0.0,"transport_allowance":0.0,
+                        "meal_allowance":0.0,"medical_insurance":0.0,"paid_leave":0.0,"overhead_profit":0.0}
+                else:
+                    pre=cat_df[cat_df['category']==cat_pick].iloc[0].to_dict()
+
+                sc1,sc2=st.columns(2)
+                with sc1: sc_cat=st.text_input("Category (e.g. A, B, C, D, E)",value=pre.get("category") or "",placeholder="A",key="sc_cat_code")
+                with sc2: sc_examples=st.text_input("Position Examples",value=pre.get("position_examples") or "",placeholder="Cleaner, Laborer, Gardner, Waitress...",key="sc_positions")
+                sc3,sc4,sc5,sc6=st.columns(4)
+                with sc3: sc_basic=st.number_input("Basic Salary Per Head",min_value=0.0,value=float(pre.get("basic_salary") or 0),step=50.0,key="sc_basic_in")
+                with sc4: sc_transport=st.number_input("Transport Allowance",min_value=0.0,value=float(pre.get("transport_allowance") or 0),step=50.0,key="sc_transport_in")
+                with sc5: sc_meal=st.number_input("Meal Allowance",min_value=0.0,value=float(pre.get("meal_allowance") or 0),step=50.0,help="e.g. 30 birr/day × 26 days",key="sc_meal_in")
+                with sc6: sc_medical=st.number_input("Medical Insurance",min_value=0.0,value=float(pre.get("medical_insurance") or 0),step=50.0,key="sc_medical_in")
+                sc7,sc8=st.columns(2)
+                with sc7: sc_paidleave=st.number_input("Paid Leave",min_value=0.0,value=float(pre.get("paid_leave") or 0),step=10.0,key="sc_paidleave_in")
+                with sc8: sc_overhead=st.number_input("Overhead and Profit Margin per person",min_value=0.0,value=float(pre.get("overhead_profit") or 0),step=50.0,key="sc_overhead_in")
+
+                # ── Live Annex III calculation preview ──
+                vat_pct_cat=float(get_setting("policy_vat_percent","15"))
+                transport_exempt=float(get_setting("policy_transport_tax_exemption","600"))
+                sc_pension_er=round(sc_basic*0.11,2)
+                sc_pension_emp=round(sc_basic*0.07,2)
+                sc_gross_earning=round(sc_basic+sc_transport+sc_meal+sc_medical+sc_pension_er+sc_paidleave+sc_overhead,2)
+                sc_vat=round(sc_gross_earning*(vat_pct_cat/100.0),2)
+                sc_total_paid=round(sc_gross_earning+sc_vat,2)
+                sc_taxable=max(round(sc_basic+sc_transport-transport_exempt,2),0)
+                sc_income_tax=round(eth_tax(sc_taxable),2)
+                sc_net_pay=round(sc_basic+sc_transport-sc_income_tax-sc_pension_emp,2)
+
+                st.markdown(f"""<div class="ps" style="border-color:rgba(56,189,248,0.3);background:linear-gradient(135deg,#0D1526,#0A1A2A)">
+                  <div style="font-family:'Cinzel',serif;font-size:12px;color:#38BDF8;margin-bottom:10px;letter-spacing:.05em">LIVE PREVIEW — CATEGORY {sc_cat.strip().upper() or '—'}</div>
+                  <div class="pr"><span class="pl">Basic Salary</span><span class="pv">ETB {sc_basic:,.2f}</span></div>
+                  <div class="pr"><span class="pl">+ Transport Allowance</span><span class="pv">ETB {sc_transport:,.2f}</span></div>
+                  <div class="pr"><span class="pl">+ Meal Allowance</span><span class="pv">ETB {sc_meal:,.2f}</span></div>
+                  <div class="pr"><span class="pl">+ Medical Insurance</span><span class="pv">ETB {sc_medical:,.2f}</span></div>
+                  <div class="pr"><span class="pl">+ Employer Pension (11%)</span><span class="pv">ETB {sc_pension_er:,.2f}</span></div>
+                  <div class="pr"><span class="pl">+ Paid Leave</span><span class="pv">ETB {sc_paidleave:,.2f}</span></div>
+                  <div class="pr"><span class="pl">+ Overhead / Profit</span><span class="pv">ETB {sc_overhead:,.2f}</span></div>
+                  <div class="pr" style="border-top:1px solid rgba(56,189,248,0.3);margin-top:4px;padding-top:8px"><span class="pl" style="font-weight:600">= GROSS EARNING</span><span class="pv" style="color:#38BDF8;font-weight:600">ETB {sc_gross_earning:,.2f}</span></div>
+                  <div class="pr"><span class="pl">+ VAT ({vat_pct_cat:.0f}%)</span><span class="pv">ETB {sc_vat:,.2f}</span></div>
+                  <div class="pr" style="border-top:1px solid rgba(56,189,248,0.3);margin-top:4px;padding-top:8px"><span class="pl" style="font-size:13px;font-weight:600;color:#E8EEF7">= TOTAL PAID PER MM</span><span class="pv" style="color:#7DD3FC;font-weight:700">ETB {sc_total_paid:,.2f}</span></div>
+                  <div class="pr" style="margin-top:10px"><span class="pl">Taxable Amount (Basic+Transport − ETB {transport_exempt:,.0f} exemption)</span><span class="pv">ETB {sc_taxable:,.2f}</span></div>
+                  <div class="pr"><span class="pl">− Employee Pension (7%)</span><span class="pd">- ETB {sc_pension_emp:,.2f}</span></div>
+                  <div class="pr"><span class="pl">− Income Tax</span><span class="pd">- ETB {sc_income_tax:,.2f}</span></div>
+                  <div class="pr" style="border-top:1px solid rgba(16,185,129,0.3);margin-top:6px;padding-top:10px"><span class="pl" style="font-size:14px;font-weight:600;color:#E8EEF7">= NET PAY</span><span class="pn">ETB {sc_net_pay:,.2f}</span></div>
+                </div>""",unsafe_allow_html=True)
+                st.caption("Income Tax and the transport exemption use the standard PAYE brackets already built into the payroll engine — this preview shows what an employee in this Category would net, before any individual overrides at Process Payroll time.")
+
+                if st.button("Save Category Rate",use_container_width=True,key="sc_save_btn"):
+                    if not sc_cat.strip():
+                        st.error("Category is required.")
+                    else:
+                        conn=get_conn()
+                        conn.execute("""INSERT INTO salary_categories(category,position_examples,basic_salary,
+                            transport_allowance,meal_allowance,medical_insurance,paid_leave,overhead_profit,updated_by,updated_at)
+                            VALUES(?,?,?,?,?,?,?,?,?,?)
+                            ON CONFLICT(category) DO UPDATE SET position_examples=?,basic_salary=?,
+                            transport_allowance=?,meal_allowance=?,medical_insurance=?,paid_leave=?,overhead_profit=?,updated_by=?,updated_at=?""",
+                            (sc_cat.strip().upper(),sc_examples,sc_basic,sc_transport,sc_meal,sc_medical,sc_paidleave,sc_overhead,
+                             st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                             sc_examples,sc_basic,sc_transport,sc_meal,sc_medical,sc_paidleave,sc_overhead,
+                             st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                        conn.commit(); conn.close()
+                        get_salary_categories.clear()
+                        st.success(f"Category {sc_cat.strip().upper()} rate saved.")
+                        st.rerun()
 
                 if existing_cats:
                     st.markdown("<hr>",unsafe_allow_html=True)
