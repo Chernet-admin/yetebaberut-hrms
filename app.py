@@ -464,6 +464,16 @@ def init_db():
     if "nav_access" not in su_cols:
         try: c.execute("ALTER TABLE system_users ADD COLUMN nav_access TEXT"); conn.commit()
         except: pass
+    # ── Back-office Position & Salary — lets the Manager control every
+    # back-office account (Member/Admin, Manager, HR Staff, Supervisor,
+    # Finance/Payroll Officer) the same way a regular employee has a
+    # Position and salary, from the Control Center. ──
+    if "position_title" not in su_cols:
+        try: c.execute("ALTER TABLE system_users ADD COLUMN position_title TEXT"); conn.commit()
+        except: pass
+    if "salary" not in su_cols:
+        try: c.execute("ALTER TABLE system_users ADD COLUMN salary REAL DEFAULT 0"); conn.commit()
+        except: pass
     c.execute("SELECT COUNT(*) FROM system_users")
     if c.fetchone()[0]==0:
         now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -517,6 +527,25 @@ def init_db():
         is_active INTEGER DEFAULT 1,
         created_by TEXT,created_at TEXT)""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_division_active ON divisions(is_active)")
+
+    # ── SALARY CATEGORIES (Annex III master rate table) ──
+    # One row per Category (A, B, C, D, E...). This is the single source
+    # of truth for Basic Salary, Transport, Meal, Medical Insurance and
+    # Overhead & Profit per Category — company-wide, and NOT tied to any
+    # one Division or Cost Center. An employee connects to it purely via
+    # their own `category` field (set in Employee Profile), so the same
+    # rate applies no matter which Division/Cost Center they sit in.
+    # Only the Manager can edit this table (Payroll → Salary Categories).
+    c.execute("""CREATE TABLE IF NOT EXISTS salary_categories(
+        category TEXT PRIMARY KEY,
+        position_examples TEXT,
+        basic_salary REAL DEFAULT 0,
+        transport_allowance REAL DEFAULT 0,
+        meal_allowance REAL DEFAULT 0,
+        medical_insurance REAL DEFAULT 0,
+        overhead_profit REAL DEFAULT 0,
+        updated_by TEXT,
+        updated_at TEXT)""")
 
     # ── SYSTEM SETTINGS (applicant gate control + leave/overtime policy) ──
     c.execute("""CREATE TABLE IF NOT EXISTS system_settings(
@@ -609,6 +638,27 @@ def get_division_list():
     created=df['name'].tolist() if len(df)>0 else []
     extra=[d for d in legacy['division'].tolist() if d and d not in created]
     return created+extra
+
+@st.cache_data(ttl=20)
+def get_salary_categories():
+    """The Annex III master rate table — one row per Category, company-wide.
+    This is HOW category rates connect to every Division and Cost Center:
+    they don't attach to a Division or Cost Center at all — every employee,
+    in any Division/Cost Center, links to a rate purely via their own
+    `category` field on the employees table. Change a rate here once and
+    it applies everywhere that category is used."""
+    conn=get_conn()
+    df=pg_read_sql("SELECT * FROM salary_categories ORDER BY category",conn)
+    conn.close()
+    return df
+
+def get_category_rate(category):
+    """Returns a dict of rates for one category, or None if not configured."""
+    if not category: return None
+    df=get_salary_categories()
+    match=df[df['category']==category]
+    if len(match)==0: return None
+    return match.iloc[0].to_dict()
 
 @st.cache_data(ttl=20)
 def get_cost_centers(division=None):
@@ -753,6 +803,40 @@ def calc_billing(basic,transport,meal,medical,pension_employer,paid_leave_value,
     vat_amount = round(gross_earning*(vat_pct/100.0),2)
     total_paid = round(gross_earning+vat_amount,2)
     return round(gross_earning,2), vat_amount, total_paid
+
+def apply_category_rate_update(category, rates, user):
+    """Called when the Manager edits a Category's rates in Salary Categories.
+    Re-applies the new rates to every payroll record for employees in this
+    category that has NOT yet been finalized (payment_status still
+    'Pending Approval' — i.e. prepared but not GM-approved). Already
+    'Final Payroll' records are left untouched since they've been paid/
+    signed off. Returns the number of payroll rows updated."""
+    try: vat_pct=float(get_setting("policy_vat_percent","15"))
+    except: vat_pct=15.0
+    conn=get_conn()
+    pending=pg_read_sql("""SELECT p.id,p.emp_id,p.basic_salary,p.other_deductions,p.fine_amount,
+        p.unpaid_leave_days,p.absent_days,COALESCE(p.paid_leave_value,0) as paid_leave_value
+        FROM payroll p JOIN employees e ON p.emp_id=e.emp_id
+        WHERE e.category=? AND p.payment_status='Pending Approval'""",conn,params=(category,))
+    updated=0
+    for _,row in pending.iterrows():
+        basic=float(row['basic_salary'] or 0)
+        transport=float(rates.get('transport_allowance') or 0)
+        meal=float(rates.get('meal_allowance') or 0)
+        medical=float(rates.get('medical_insurance') or 0)
+        overhead=float(rates.get('overhead_profit') or 0)
+        net,tax,pen_emp,pen_er,daily,gross=calc_pay(basic,transport,0,0,
+            float(row['fine_amount'] or 0),float(row['unpaid_leave_days'] or 0),
+            float(row['absent_days'] or 0),float(row['other_deductions'] or 0))
+        gross_earning,vat_amount,total_billed=calc_billing(basic,transport,meal,medical,pen_er,
+            float(row['paid_leave_value'] or 0),overhead,vat_pct)
+        conn.execute("""UPDATE payroll SET transport_allowance=?,meal_allowance=?,medical_insurance=?,
+            overhead_profit=?,income_tax=?,pension_employee=?,pension_employer=?,gross_salary=?,net_salary=?,
+            vat_amount=?,total_billed_amount=? WHERE id=?""",
+            (transport,meal,medical,overhead,tax,pen_emp,pen_er,gross,net,vat_amount,total_billed,row['id']))
+        updated+=1
+    conn.commit(); conn.close()
+    return updated
 
 def b64file(data,name):
     if not data or not name: return None,None
@@ -2732,7 +2816,7 @@ with main_block:
         conn=get_conn()
         el=pg_read_sql("SELECT emp_id,full_name,division,cost_center,basic_salary,weekly_dayoff FROM employees WHERE current_status='Active Deployment' ORDER BY emp_id LIMIT 5000",conn); conn.close()
         if len(el)==0: st.warning("No active employees."); st.stop()
-        pt1,pt2,pt3,pt4,pt5=st.tabs(["Process Payroll","History","Day-Off Calendar","Cost Center Sheet","Pension & Tax Reports"])
+        pt1,pt2,pt3,pt4,pt5,pt6=st.tabs(["Process Payroll","History","Day-Off Calendar","Cost Center Sheet","Pension & Tax Reports","Salary Categories"])
         with pt1:
             st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Follows the master hierarchy: Division → Cost Center → Employee → Position/Category. Pick the payroll month, narrow by Division and Cost Center, then select the employee. Only HR + Manager-approved attendance, leave and absence feed into the figures below.</div>',unsafe_allow_html=True)
             ps0,ps1x,ps2x=st.columns(3)
@@ -2813,17 +2897,26 @@ with main_block:
                         st.success(f"Day-off changed to {new_wd}. System will recalculate dates automatically.")
                         st.rerun()
 
+            emp_category = er.get('category')
+            cat_rate = get_category_rate(emp_category)
+            if cat_rate:
+                st.markdown(f'<div style="font-size:11px;color:#34D399;margin-bottom:6px">Loaded from Category <b>{emp_category}</b> rate (Payroll → Salary Categories). Figures below are pre-filled — adjust here if this employee needs an exception; edit the Category itself to change the rate for everyone in it.</div>',unsafe_allow_html=True)
+            elif emp_category:
+                st.markdown(f'<div style="font-size:11px;color:#F59E0B;margin-bottom:6px">This employee\'s Category is "{emp_category}" but no rate is configured for it yet — set one in Payroll → Salary Categories to auto-fill these figures next time.</div>',unsafe_allow_html=True)
+            else:
+                st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:6px">This employee has no Category assigned (Employee Profile → Edit) — figures below default to zero/manual entry.</div>',unsafe_allow_html=True)
+
             st.markdown('<div class="fs">Allowances</div>',unsafe_allow_html=True)
             al1,al2,al3,al4=st.columns(4)
-            with al1: transport=st.number_input("Transport Allowance",min_value=0.0,value=500.0,step=50.0)
+            with al1: transport=st.number_input("Transport Allowance",min_value=0.0,value=float(cat_rate['transport_allowance']) if cat_rate else 500.0,step=50.0)
             with al2: housing=st.number_input("Housing Allowance",min_value=0.0,value=300.0,step=50.0)
             with al3: other_al=st.number_input("Other Allowance",min_value=0.0,value=0.0,step=50.0)
             with al4: st.markdown(f'<div style="background:#0D1526;border:1px solid rgba(212,168,71,0.2);border-radius:8px;padding:10px;margin-top:20px"><div style="color:#6B7FA3;font-size:9px">BASIC SALARY</div><div style="color:#F0C96B;font-size:17px;font-family:Cinzel,serif;font-weight:700">ETB {base:,.2f}</div></div>',unsafe_allow_html=True)
             st.markdown('<div class="fs">Annex III — Client Billing Inputs</div>',unsafe_allow_html=True)
             an1,an2,an3,an4=st.columns(4)
-            with an1: meal_al=st.number_input("Meal Allowance",min_value=0.0,value=float(get_setting("policy_meal_allowance","0")),step=50.0)
-            with an2: medical_ins=st.number_input("Medical Insurance",min_value=0.0,value=float(get_setting("policy_medical_insurance","0")),step=50.0)
-            with an3: overhead_profit=st.number_input("Overhead & Profit (ETB)",min_value=0.0,value=0.0,step=50.0,help="Enter the resolved ETB amount for this employee/contract, per the company's overhead & profit policy.")
+            with an1: meal_al=st.number_input("Meal Allowance",min_value=0.0,value=float(cat_rate['meal_allowance']) if cat_rate else float(get_setting("policy_meal_allowance","0")),step=50.0)
+            with an2: medical_ins=st.number_input("Medical Insurance",min_value=0.0,value=float(cat_rate['medical_insurance']) if cat_rate else float(get_setting("policy_medical_insurance","0")),step=50.0)
+            with an3: overhead_profit=st.number_input("Overhead & Profit (ETB)",min_value=0.0,value=float(cat_rate['overhead_profit']) if cat_rate else 0.0,step=50.0,help="Enter the resolved ETB amount for this employee/contract, per the company's overhead & profit policy. Auto-filled from the employee's Category rate when one is set.")
             with an4:
                 vat_pct=float(get_setting("policy_vat_percent","15"))
                 st.markdown(f'<div style="background:#0D1526;border:1px solid rgba(56,189,248,0.2);border-radius:8px;padding:10px;margin-top:20px"><div style="color:#6B7FA3;font-size:9px">VAT RATE</div><div style="color:#38BDF8;font-size:17px;font-family:Cinzel,serif;font-weight:700">{vat_pct:.1f}%</div></div>',unsafe_allow_html=True)
@@ -3450,6 +3543,86 @@ with main_block:
                     st.download_button("Export PAYE Tax Summary (Excel)",tax_buf.getvalue(),
                         file_name=f"PAYE_Summary_{rp_from}_to_{rp_to}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+
+        with pt6:
+            st.markdown('<div class="ey">Annex III — Master Rate Table</div>',unsafe_allow_html=True)
+            st.markdown('<div class="tl">Salary Categories</div>',unsafe_allow_html=True)
+            st.markdown("""<div class="card card-gold">
+              <div style="font-size:12px;color:#C8D8F0;line-height:1.7">
+                <b style="color:#F0C96B">How this connects to every Division and Cost Center:</b> a Category rate is
+                <b>not</b> tied to any Division or Cost Center at all — it connects purely through each employee's own
+                <b>Category</b> field (Employee Profile → Edit). Set an employee's Category once, and no matter which
+                Division or Cost Center they move to, their payroll always pulls the current rate for that Category
+                from this table. Only the Manager can change rates here.
+              </div></div>""",unsafe_allow_html=True)
+
+            cat_df=get_salary_categories()
+            if len(cat_df)>0:
+                disp_cat=cat_df.rename(columns={"category":"Category","position_examples":"Position Examples",
+                    "basic_salary":"Basic Salary","transport_allowance":"Transport Allowance",
+                    "meal_allowance":"Meal Allowance","medical_insurance":"Medical Insurance",
+                    "overhead_profit":"Overhead & Profit","updated_by":"Updated By","updated_at":"Updated At"})
+                st.dataframe(disp_cat,use_container_width=True,hide_index=True)
+            else:
+                st.info("No salary categories configured yet — add the first one below (e.g. Category A, B, C... matching Annex III).")
+
+            if st.session_state.role=="Manager":
+                st.markdown("<hr>",unsafe_allow_html=True)
+                st.markdown('<div class="fs">Add / Update a Category Rate</div>',unsafe_allow_html=True)
+                st.markdown('<div style="font-size:11px;color:#F59E0B;margin-bottom:8px">Increasing or decreasing any figure here is a manual Manager decision. After saving, use "Apply to Prepared Payroll" below to push the new rate into payroll that has already been prepared but not yet given final General Manager approval.</div>',unsafe_allow_html=True)
+                existing_cats=cat_df['category'].tolist() if len(cat_df)>0 else []
+                with st.form("salary_cat_form"):
+                    sc1,sc2=st.columns(2)
+                    with sc1: sc_cat=st.text_input("Category (e.g. A, B, C, D, E)",placeholder="A")
+                    with sc2: sc_examples=st.text_input("Position Examples",placeholder="Cleaner, Laborer, Gardener, Waitress...")
+                    sc3,sc4,sc5=st.columns(3)
+                    with sc3: sc_basic=st.number_input("Basic Salary Per Head",min_value=0.0,step=50.0)
+                    with sc4: sc_transport=st.number_input("Transport Allowance",min_value=0.0,step=50.0)
+                    with sc5: sc_meal=st.number_input("Meal Allowance (per month)",min_value=0.0,step=50.0,help="e.g. 30 birr/day × 26 days")
+                    sc6,sc7=st.columns(2)
+                    with sc6: sc_medical=st.number_input("Medical Insurance",min_value=0.0,step=50.0)
+                    with sc7: sc_overhead=st.number_input("Overhead and Profit Margin per person",min_value=0.0,step=50.0)
+                    if st.form_submit_button("Save Category Rate",use_container_width=True):
+                        if not sc_cat.strip():
+                            st.error("Category is required.")
+                        else:
+                            conn=get_conn()
+                            conn.execute("""INSERT INTO salary_categories(category,position_examples,basic_salary,
+                                transport_allowance,meal_allowance,medical_insurance,overhead_profit,updated_by,updated_at)
+                                VALUES(?,?,?,?,?,?,?,?,?)
+                                ON CONFLICT(category) DO UPDATE SET position_examples=?,basic_salary=?,
+                                transport_allowance=?,meal_allowance=?,medical_insurance=?,overhead_profit=?,updated_by=?,updated_at=?""",
+                                (sc_cat.strip().upper(),sc_examples,sc_basic,sc_transport,sc_meal,sc_medical,sc_overhead,
+                                 st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                 sc_examples,sc_basic,sc_transport,sc_meal,sc_medical,sc_overhead,
+                                 st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                            conn.commit(); conn.close()
+                            get_salary_categories.clear()
+                            st.success(f"Category {sc_cat.strip().upper()} rate saved.")
+                            st.rerun()
+
+                if existing_cats:
+                    st.markdown("<hr>",unsafe_allow_html=True)
+                    st.markdown('<div class="fs">Apply an Updated Rate to Already-Prepared Payroll</div>',unsafe_allow_html=True)
+                    apply_cat=st.selectbox("Category",existing_cats,key="apply_cat_sel")
+                    if st.button(f"Apply Category {apply_cat} Rate to Prepared (Not-Yet-Final) Payroll",use_container_width=True):
+                        rates=get_category_rate(apply_cat)
+                        if rates:
+                            n=apply_category_rate_update(apply_cat,rates,st.session_state.uid)
+                            st.cache_data.clear()
+                            if n>0:
+                                st.success(f"Updated {n} prepared payroll record(s) for Category {apply_cat} with the new rate. Already-finalized (General Manager approved) payroll was left untouched.")
+                            else:
+                                st.info(f"No prepared (Pending Approval) payroll records currently exist for Category {apply_cat}.")
+
+                    st.markdown("<hr>",unsafe_allow_html=True)
+                    st.markdown('<div class="fs">Remove a Category</div>',unsafe_allow_html=True)
+                    del_cat=st.selectbox("Category to remove",existing_cats,key="del_cat_sel")
+                    if st.button(f"Delete Category {del_cat}",use_container_width=True):
+                        conn=get_conn(); conn.execute("DELETE FROM salary_categories WHERE category=?",(del_cat,)); conn.commit(); conn.close()
+                        get_salary_categories.clear(); st.warning(f"Category {del_cat} rate removed."); st.rerun()
+            else:
+                st.info("Only the Manager can add, edit or remove Category rates.")
 
 
     # ════════════════════════════════════════════════════════
