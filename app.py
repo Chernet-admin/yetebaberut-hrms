@@ -1493,6 +1493,42 @@ if st.session_state.role:
                 if st.button(btn_label, use_container_width=True, key=f"nav_{v}"):
                     st.session_state.view=v; st.rerun()
                 if wrap_classes: st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="nav-group-label" style="margin-top:10px">ACCOUNT</div>', unsafe_allow_html=True)
+        with st.expander("🔑 Change Password", expanded=False):
+            with st.form("sidebar_change_pw_form", clear_on_submit=True):
+                cpw_current = st.text_input("Current Password", type="password", key="cpw_current")
+                cpw_new = st.text_input("New Password", type="password", key="cpw_new")
+                cpw_confirm = st.text_input("Confirm New Password", type="password", key="cpw_confirm")
+                if st.form_submit_button("Update Password", use_container_width=True):
+                    if not (cpw_current and cpw_new and cpw_confirm):
+                        st.error("Fill in all three fields.")
+                    elif len(cpw_new) < 6:
+                        st.error("New password must be at least 6 characters.")
+                    elif cpw_new != cpw_confirm:
+                        st.error("New password and confirmation do not match.")
+                    else:
+                        conn = get_conn(); cur = conn.cursor()
+                        cur.execute("SELECT password FROM system_users WHERE username=?", (st.session_state.uid,))
+                        db_row = cur.fetchone()
+                        if db_row:
+                            if db_row[0] != cpw_current:
+                                conn.close(); st.error("Current password is incorrect.")
+                            else:
+                                conn.execute("UPDATE system_users SET password=? WHERE username=?", (cpw_new, st.session_state.uid))
+                                conn.commit(); conn.close()
+                                st.success("Password updated. Use the new password next time you log in.")
+                        else:
+                            conn.close()
+                            # Fallback legacy accounts (ygs_manager / ygs_officer) aren't
+                            # stored in system_users — update the in-session credential
+                            # store instead so the change still works for this session.
+                            ur = st.session_state.get('572', {}).get('ur', {})
+                            if st.session_state.uid in ur and ur[st.session_state.uid]['pw'] == cpw_current:
+                                ur[st.session_state.uid]['pw'] = cpw_new
+                                st.success("Password updated for this session. This is a built-in demo account — ask the Manager to create you a proper account in Administration for a permanent password.")
+                            else:
+                                st.error("Current password is incorrect.")
         st.markdown(f'<div class="nav-footer">Yetebaberut HRMS<br>v2.8 (build check)</div>', unsafe_allow_html=True)
 
 main_block = st.container() if st.session_state.role else st.container()
@@ -1589,6 +1625,31 @@ with main_block:
                         "is_active":"Active","assigned_division":"Division","last_login":"Last Login"}).copy()
                     disp["Active"]=disp["Active"].apply(lambda x: "Yes" if int(x)==1 else "No")
                     st.dataframe(disp,use_container_width=True,hide_index=True)
+
+        st.markdown("<hr>",unsafe_allow_html=True)
+        st.markdown('<div class="ey">Back-Office Staff — Positions & Salary</div>',unsafe_allow_html=True)
+        st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">This is the control the Manager was missing: every back-office account — Admin, Manager, HR Staff, Supervisor, Finance (Payroll Officer) — gets its own Position and monthly Salary here, the same way a regular employee has one in the Employee Directory. Edit a cell below and click Save.</div>',unsafe_allow_html=True)
+        conn=get_conn()
+        bo_df=pg_read_sql("""SELECT username,full_name,role,COALESCE(position_title,'') as position_title,
+            COALESCE(salary,0) as salary FROM system_users ORDER BY role,full_name""",conn)
+        conn.close()
+        if len(bo_df)==0:
+            st.info("No back-office accounts yet.")
+        else:
+            bo_disp=bo_df.rename(columns={"username":"Username","full_name":"Full Name","role":"Role",
+                "position_title":"Position","salary":"Salary (ETB/month)"})
+            edited_bo=st.data_editor(bo_disp,hide_index=True,use_container_width=True,key="bo_salary_editor",
+                disabled=["Username","Full Name","Role"],
+                column_config={"Salary (ETB/month)": st.column_config.NumberColumn(min_value=0.0,step=100.0,format="%.2f")})
+            total_bo_salary = edited_bo["Salary (ETB/month)"].fillna(0).sum()
+            st.markdown(f'<div style="font-size:12px;color:#94A8C8;margin:6px 0">Total back-office monthly payroll cost: <b style="color:#10B981">ETB {total_bo_salary:,.2f}</b></div>',unsafe_allow_html=True)
+            if st.button("Save Back-Office Positions & Salary",use_container_width=True,key="save_bo_salary"):
+                conn=get_conn()
+                for _,row in edited_bo.iterrows():
+                    conn.execute("UPDATE system_users SET position_title=?,salary=? WHERE username=?",
+                        (row["Position"],float(row["Salary (ETB/month)"] or 0),row["Username"]))
+                conn.commit(); conn.close()
+                st.success("Back-office positions and salaries saved."); st.rerun()
 
         st.markdown("<hr>",unsafe_allow_html=True)
         st.markdown('<div class="ey">Company-Wide Workforce Snapshot</div>',unsafe_allow_html=True)
