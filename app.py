@@ -239,7 +239,21 @@ def init_db():
         "medical_doc_name":"TEXT","medical_doc_data":"BLOB","guarantee_letter_name":"TEXT",
         "guarantee_letter_data":"BLOB","police_clearance_name":"TEXT","police_clearance_data":"BLOB",
         "contract_doc_name":"TEXT","contract_doc_data":"BLOB","first_doc_name":"TEXT","first_doc_data":"BLOB",
-        "department":"TEXT","annual_leave_entitlement":"INTEGER DEFAULT 20"}
+        "department":"TEXT","annual_leave_entitlement":"INTEGER DEFAULT 20",
+        # ── Official HR Record Format fields (added to match the standardized
+        # company template — Personal / Address / Emergency Contact /
+        # Mortgage Condition (Guarantor) / Financial & IDs / Education /
+        # Employment & Division groups) ──
+        "contact2":"TEXT","city":"TEXT","national_id_number":"TEXT",
+        "emergency_contact_city":"TEXT","emergency_contact_subcity":"TEXT","emergency_contact_woreda":"TEXT",
+        "guarantor_name":"TEXT","guarantor_phone":"TEXT","guarantor_city":"TEXT",
+        "guarantor_subcity":"TEXT","guarantor_woreda":"TEXT","guarantor_company_id":"TEXT",
+        "guarantor_company_name":"TEXT","guarantor_letter_number":"TEXT","guarantor_date_written":"TEXT",
+        # ── Position / Category — the master hierarchy is now
+        # Division → Cost Center → Employee → Position/Category.
+        # job_title already stores the Position; category stores the
+        # salary/skill grade (e.g. "A", "B", "C") used by Annex III payroll.
+        "category":"TEXT","payment_method":"TEXT DEFAULT 'Bank Transfer'"}
     for col,typ in migrations.items():
         if col not in ex:
             try: c.execute(f"ALTER TABLE employees ADD COLUMN {col} {typ}"); conn.commit()
@@ -251,6 +265,9 @@ def init_db():
             c.execute("UPDATE employees SET division=department WHERE division IS NULL")
             conn.commit()
     except: pass
+    # One-time backfill: employees created before "Contact 01/02" split still
+    # have their phone number in the original `contact` column only — leave
+    # it there (it IS Contact 01) so no data is lost.
 
     # ── Repair legacy 'department' column: some databases still carry it
     # as NOT NULL from an older schema version, which blocks every new
@@ -302,10 +319,16 @@ def init_db():
         "maternity_leave_days":"INTEGER DEFAULT 0","mourning_leave_days":"INTEGER DEFAULT 0",
         "unpaid_leave_days":"INTEGER DEFAULT 0","pension_employer":"REAL DEFAULT 0",
         "full_name":"TEXT","division":"TEXT","cost_center":"TEXT",
-        "category":"TEXT","position_title":"TEXT","meal_allowance":"REAL DEFAULT 0",
-        "medical_insurance":"REAL DEFAULT 0","paid_leaves_amount":"REAL DEFAULT 0",
-        "overhead_profit_margin":"REAL DEFAULT 0","vat_amount":"REAL DEFAULT 0",
-        "total_paid_per_mm":"REAL DEFAULT 0","taxable_amount":"REAL DEFAULT 0"}.items():
+        # ── Annex III client-billing fields (separate from the employee's
+        # own NET PAY): Meal Allowance, Medical Insurance, Employer Pension
+        # is pension_employer above, Paid Leave value, Overhead & Profit,
+        # VAT, and the resulting Total Paid Per Month invoiced to the
+        # client — plus how the employee was actually paid out. ──
+        "meal_allowance":"REAL DEFAULT 0","medical_insurance":"REAL DEFAULT 0",
+        "paid_leave_value":"REAL DEFAULT 0","overhead_profit":"REAL DEFAULT 0",
+        "vat_amount":"REAL DEFAULT 0","total_billed_amount":"REAL DEFAULT 0",
+        "payment_method":"TEXT DEFAULT 'Bank Transfer'","category":"TEXT",
+        "gm_approval_status":"TEXT DEFAULT 'Not Submitted'"}.items():
         if pcol not in pcols:
             try: c.execute(f"ALTER TABLE payroll ADD COLUMN {pcol} {ptyp}"); conn.commit()
             except: pass
@@ -481,6 +504,20 @@ def init_db():
         budget REAL DEFAULT 0,description TEXT,is_active INTEGER DEFAULT 1,
         created_by TEXT,created_at TEXT)""")
 
+    # ── DIVISIONS table (manually created — same pattern as Cost Centers) ──
+    # Divisions are no longer a hardcoded list baked into the app. A Manager
+    # creates them here first (Cost Centers page → Divisions tab), and every
+    # division dropdown across the system (Applicant Intake, Employee
+    # Directory, Employee Profile, Payroll, Supervisor assignment, etc.)
+    # reads from this table.
+    c.execute("""CREATE TABLE IF NOT EXISTS divisions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        description TEXT,
+        is_active INTEGER DEFAULT 1,
+        created_by TEXT,created_at TEXT)""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_division_active ON divisions(is_active)")
+
     # ── SYSTEM SETTINGS (applicant gate control + leave/overtime policy) ──
     c.execute("""CREATE TABLE IF NOT EXISTS system_settings(
         key TEXT PRIMARY KEY, value TEXT, updated_by TEXT, updated_at TEXT)""")
@@ -507,6 +544,13 @@ def init_db():
         "policy_dayoff_payment_status":"Paid",
         "policy_sick_payment_status":"Paid",
         "policy_unpaid_leave_payment_status":"Unpaid",
+        # ── Annex III client-billing defaults — Payroll Officer can
+        # override per employee at process time; these are just the
+        # starting values. ──
+        "policy_meal_allowance":"0",
+        "policy_medical_insurance":"0",
+        "policy_overhead_profit_percent":"0",
+        "policy_vat_percent":"15",
     }
     now_p=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     for pk,pv in POLICY_DEFAULTS.items():
@@ -553,12 +597,18 @@ def get_stats():
 
 @st.cache_data(ttl=20)
 def get_division_list():
+    """Divisions are manually created by the Manager (Cost Centers page →
+    Divisions tab) — there is no hardcoded default list any more. Legacy
+    records that still carry a division name not (yet) registered in the
+    divisions table are appended at the end so old data never disappears
+    from filters/dropdowns."""
     conn=get_conn()
-    df=pg_read_sql("SELECT DISTINCT division FROM employees WHERE division IS NOT NULL ORDER BY division",conn)
+    df=pg_read_sql("SELECT name FROM divisions WHERE is_active=1 ORDER BY name",conn)
+    legacy=pg_read_sql("SELECT DISTINCT division FROM employees WHERE division IS NOT NULL AND division!='' ORDER BY division",conn)
     conn.close()
-    base=["Catering","MRO","Appearance","Ramp","Cargo"]
-    extra=[d for d in df['division'].tolist() if d not in base]
-    return base+extra
+    created=df['name'].tolist() if len(df)>0 else []
+    extra=[d for d in legacy['division'].tolist() if d and d not in created]
+    return created+extra
 
 @st.cache_data(ttl=20)
 def get_cost_centers(division=None):
@@ -688,40 +738,21 @@ def calc_pay(basic,transport,housing,other,fine,unpaid,absent,extra):
     net=max(gross-tax-pen-fine-(daily*(unpaid+absent))-extra,0)
     return round(net,2),round(tax,2),round(pen,2),round(pen_er,2),round(daily,2),round(gross,2)
 
-# ── AGENCY COST-BREAKDOWN PAYROLL MODEL (Annex III) ──
-# This replaces the simple in-house payroll model above for the primary
-# Process Payroll workflow. Formulas verified against the client's actual
-# signed Annex III document (all 5 category rows matched to the cent):
-#   Gross Earning = Basic + Transport + Meal + Medical + Company Pension(11%) + Paid Leaves + Overhead/Profit Margin
-#   VAT = Gross Earning x 15%
-#   Total Paid Per MM = Gross Earning + VAT  (this is what the CLIENT pays the agency)
-#   Taxable Amount = Basic + Transport - 600  (flat transport tax exemption)
-#   Net Pay = Basic + Transport + Meal - Employee Pension(7%) - Income Tax  (paid to the employee)
-# Income Tax uses this app's existing Ethiopian PAYE bracket function
-# (eth_tax) applied to the Taxable Amount above — this part is editable
-# in the UI in case the client's current bracket table differs slightly.
-CATEGORY_POSITIONS = {
-    "A": ["Cleaner","FSA","Laborer","Gardener","Catering Helper","Waitress","BCH"],
-    "B": ["Security Guard (Ticket Office)"],
-    "C": ["Driver","Tire Repair Man","Tailor"],
-    "D": ["Carpenter","Mason","Welder","Painter"],
-    "E": ["Cook"],
-}
-
-def calc_agency_payroll(basic,transport,meal,medical,paid_leaves,overhead_margin,income_tax_override=None):
-    company_pension=round(basic*0.11,2)
-    employee_pension=round(basic*0.07,2)
-    gross_earning=round(basic+transport+meal+medical+company_pension+paid_leaves+overhead_margin,2)
-    vat=round(gross_earning*0.15,2)
-    total_paid_per_mm=round(gross_earning+vat,2)
-    taxable_amount=max(round(basic+transport-600,2),0)
-    income_tax=round(income_tax_override,2) if income_tax_override is not None else round(eth_tax(taxable_amount),2)
-    net_pay=round(basic+transport+meal-employee_pension-income_tax,2)
-    return {
-        "company_pension":company_pension,"employee_pension":employee_pension,
-        "gross_earning":gross_earning,"vat":vat,"total_paid_per_mm":total_paid_per_mm,
-        "taxable_amount":taxable_amount,"income_tax":income_tax,"net_pay":net_pay,
-    }
+def calc_billing(basic,transport,meal,medical,pension_employer,paid_leave_value,overhead_profit,vat_pct):
+    """Annex III client-billing formula — what the client (not the
+    employee) is invoiced per month. Independent of the employee's own
+    NET PAY calculated by calc_pay():
+        Gross Earning = Basic + Transport + Meal + Medical Insurance
+                        + Employer Pension (11%) + Paid Leave + Overhead & Profit
+        Total Paid Per Month = Gross Earning + VAT (default 15%)
+    overhead_profit is the resolved ETB amount for this employee (the
+    Payroll Officer enters it directly, or derives it from the company's
+    overhead/profit percentage policy before calling this function).
+    """
+    gross_earning = basic+transport+meal+medical+pension_employer+paid_leave_value+overhead_profit
+    vat_amount = round(gross_earning*(vat_pct/100.0),2)
+    total_paid = round(gross_earning+vat_amount,2)
+    return round(gross_earning,2), vat_amount, total_paid
 
 def b64file(data,name):
     if not data or not name: return None,None
@@ -773,30 +804,28 @@ td{{padding:6px 10px;font-size:12px;border-bottom:1px solid #eee}}
 <div><div class="lbl">Full Name</div><div class="val">{emp.get("full_name","")}</div></div>
 <div><div class="lbl">Division</div><div class="val">{emp.get("division","")}</div></div>
 <div><div class="lbl">Cost Center</div><div class="val">{emp.get("cost_center","—")}</div></div>
-<div><div class="lbl">Job Title / Category</div><div class="val">{emp.get("job_title","—")} {f"(Cat. {pay.get('category')})" if pay.get('category') else ""}</div></div>
+<div><div class="lbl">Job Title</div><div class="val">{emp.get("job_title","—")}</div></div>
 <div><div class="lbl">Bank / Account</div><div class="val">{emp.get("bank_name","—")} / {emp.get("bank_account","—")}</div></div>
 </div>
-<table><tr><th>COST BREAKDOWN (AGENCY BILLING)</th><th style="text-align:right">ETB</th></tr>
+<table><tr><th>EARNINGS</th><th style="text-align:right">ETB</th></tr>
 <tr><td>Basic Salary</td><td style="text-align:right">{float(pay.get("basic_salary",0)):,.2f}</td></tr>
 <tr><td>Transport Allowance</td><td style="text-align:right">{float(pay.get("transport_allowance",0)):,.2f}</td></tr>
-<tr><td>Meal Allowance</td><td style="text-align:right">{float(pay.get("meal_allowance",0)):,.2f}</td></tr>
-<tr><td>Medical Insurance</td><td style="text-align:right">{float(pay.get("medical_insurance",0)):,.2f}</td></tr>
-<tr><td>Pension Contribution by Company (11%)</td><td style="text-align:right">{float(pay.get("pension_employer",0)):,.2f}</td></tr>
-<tr><td>Paid Leaves</td><td style="text-align:right">{float(pay.get("paid_leaves_amount",0)):,.2f}</td></tr>
-<tr><td>Overhead & Profit Margin</td><td style="text-align:right">{float(pay.get("overhead_profit_margin",0)):,.2f}</td></tr>
-<tr style="font-weight:bold;background:#f5f5f5"><td>GROSS EARNING</td><td style="text-align:right">{float(pay.get("gross_salary",0)):,.2f}</td></tr>
-<tr><td>VAT (15%)</td><td style="text-align:right">{float(pay.get("vat_amount",0)):,.2f}</td></tr>
-<tr style="font-weight:bold;background:#f5f5f5"><td>TOTAL PAID PER MM (billed to client)</td><td style="text-align:right">{float(pay.get("total_paid_per_mm",0)):,.2f}</td></tr></table>
-<table><tr><th>EMPLOYEE PAY</th><th style="text-align:right">ETB</th></tr>
-<tr><td>Taxable Amount</td><td style="text-align:right">{float(pay.get("taxable_amount",0)):,.2f}</td></tr>
+<tr><td>Housing Allowance</td><td style="text-align:right">{float(pay.get("housing_allowance",0)):,.2f}</td></tr>
+<tr><td>Other Allowance</td><td style="text-align:right">{float(pay.get("other_allowance",0)):,.2f}</td></tr>
+<tr style="font-weight:bold;background:#f5f5f5"><td>GROSS</td><td style="text-align:right">{float(pay.get("gross_salary",0)):,.2f}</td></tr></table>
+<table><tr><th>DEDUCTIONS</th><th style="text-align:right">ETB</th></tr>
 <tr><td class="ded">Income Tax</td><td class="ded" style="text-align:right">-{float(pay.get("income_tax",0)):,.2f}</td></tr>
-<tr><td class="ded">Employee Pension (7%)</td><td class="ded" style="text-align:right">-{float(pay.get("pension_employee",0)):,.2f}</td></tr>
+<tr><td class="ded">Employee Pension 7%</td><td class="ded" style="text-align:right">-{float(pay.get("pension_employee",0)):,.2f}</td></tr>
 <tr><td class="ded">Fines ({pay.get("fine_days",0)} days)</td><td class="ded" style="text-align:right">-{float(pay.get("fine_amount",0)):,.2f}</td></tr>
+<tr><td class="ded">Unpaid Leave ({pay.get("unpaid_leave_days",0)} days)</td><td class="ded" style="text-align:right">-{float(pay.get("unpaid_leave_days",0))*daily:,.2f}</td></tr>
 <tr><td class="ded">Absent ({pay.get("absent_days",0)} days)</td><td class="ded" style="text-align:right">-{float(pay.get("absent_days",0))*daily:,.2f}</td></tr>
 <tr><td class="ded">Other Deductions</td><td class="ded" style="text-align:right">-{float(pay.get("other_deductions",0)):,.2f}</td></tr>
+<tr><td class="add">Paid Leave (Sick/Annual/Mat/Mourning)</td><td class="add" style="text-align:right"> Paid</td></tr>
 <tr><td class="add">Day-Off ({pay.get("dayoff_days",4)} days — {pay.get("dayoff_weekday","Sunday")}s)</td><td class="add" style="text-align:right"> Paid</td></tr>
 <tr><td class="add">Public Holidays ({pay.get("holiday_days",0)} days)</td><td class="add" style="text-align:right"> Paid</td></tr></table>
-<table><tr class="nr"><td>FINAL NET PAY</td><td style="text-align:right;font-size:16px">ETB {float(pay.get("net_salary",0)):,.2f}</td></tr></table>
+<table><tr class="nr"><td>NET SALARY</td><td style="text-align:right;font-size:16px">ETB {float(pay.get("net_salary",0)):,.2f}</td></tr></table>
+<table><tr><th>EMPLOYER</th><th style="text-align:right">ETB</th></tr>
+<tr><td class="add">Employer Pension 11%</td><td class="add" style="text-align:right">{float(pay.get("pension_employer",0)):,.2f}</td></tr></table>
 <div class="footer">
 <div><div class="sig">Employee Signature</div></div>
 <div><div class="sig">HR Officer</div></div>
@@ -828,6 +857,122 @@ def export_excel(df):
     return buf.getvalue()
 
 # ════════════════════════════════════════════════════════
+# OFFICIAL HR RECORD FORMAT — "NEW HR Personal Record Data Format 2026"
+# Standardized company template. Every full employee-record export (and
+# the printable single-employee record) uses this exact grouping and
+# column order:
+#   Personal Information | Address | Emergency Contact |
+#   Mortgage Condition (Guarantor) | Financial & IDs | Education |
+#   Employment & Division
+# ════════════════════════════════════════════════════════
+HR_FORMAT_GROUPS = [
+    ("Personal Information", [
+        ("Employee ID","emp_id"),("Full Name","full_name"),("Contact 01","contact"),
+        ("Contact 02","contact2"),("Email","email"),("Sex","sex"),("Marital","marital_status"),
+        ("Nationality","nationality"),("Religion","religion"),("Age","age"),
+        ("Place of Birth","place_of_birth"),("Blood","blood_type"),("Resident ID","resident_id"),
+    ]),
+    ("Address", [
+        ("City","city"),("Subcity","subcity"),("Woreda","woreda"),("House","house_address"),
+    ]),
+    ("Emergency Contact", [
+        ("Name","emergency_contact_name"),("Phone","emergency_contact_phone"),
+        ("City","emergency_contact_city"),("Subcity","emergency_contact_subcity"),
+        ("Woreda","emergency_contact_woreda"),
+    ]),
+    ("Mortgage Condition", [
+        ("Name","guarantor_name"),("Phone","guarantor_phone"),("City","guarantor_city"),
+        ("Subcity","guarantor_subcity"),("Woreda","guarantor_woreda"),
+        ("Company ID","guarantor_company_id"),("Company Name","guarantor_company_name"),
+        ("Letter Number","guarantor_letter_number"),("Date Written","guarantor_date_written"),
+    ]),
+    ("Financial & IDs", [
+        ("National Id Number","national_id_number"),("TIN Id Number","tin_number"),
+        ("Pension Id Number","pension_number"),("Bank Name","bank_name"),("Account","bank_account"),
+    ]),
+    ("Education", [
+        ("Level","edu_background"),("Field","field_of_graduate"),("Grad Year","graduation_year"),
+        ("Institution","institution_name"),
+    ]),
+    ("Employment & Division", [
+        ("Position (Job Title)","job_title"),("Category","category"),("Type","employment_type"),("Division","division"),
+        ("Cost Center","cost_center"),("Basic Salary","basic_salary"),
+        ("Weekly Day-Off","weekly_dayoff"),("Start Date (YYYY-MM-DD)","start_date"),
+        ("Contract End (YYYY-MM-DD)","contract_end_date"),("Status","current_status"),
+        ("Internal Notes","notes"),
+    ]),
+]
+HR_FORMAT_FIELDS = [f for _,fields in HR_FORMAT_GROUPS for _,f in fields]
+
+def export_excel_hr_official(df):
+    """Export employee records to the standardized company template
+    (NEW HR Personal Record Data Format 2026) — two header rows: a merged
+    group-label row, then the exact field-name row, in the exact column
+    order the company uses for every official HR register."""
+    buf=io.BytesIO()
+    with pd.ExcelWriter(buf,engine="xlsxwriter") as wr:
+        wb=wr.book
+        ws=wb.add_worksheet("Data")
+        grp_fmt=wb.add_format({"bold":True,"bg_color":"#0D1526","font_color":"#D4A847","border":1,
+            "align":"center","valign":"vcenter","font_size":11})
+        hdr_fmt=wb.add_format({"bold":True,"bg_color":"#D4A847","font_color":"#0D1526","border":1,
+            "align":"center","valign":"vcenter","font_size":10})
+        cell_fmt=wb.add_format({"bg_color":"#060B18","font_color":"#E8EEF7","border":1,"font_size":10})
+        alt_fmt=wb.add_format({"bg_color":"#0A1020","font_color":"#C8D8F0","border":1,"font_size":10})
+
+        col=0
+        for group_label,fields in HR_FORMAT_GROUPS:
+            span=len(fields)
+            if span>1:
+                ws.merge_range(0,col,0,col+span-1,group_label,grp_fmt)
+            else:
+                ws.write(0,col,group_label,grp_fmt)
+            for label,_ in fields:
+                ws.write(1,col,label,hdr_fmt)
+                ws.set_column(col,col,max(len(label)+3,14))
+                col+=1
+
+        for ri in range(len(df)):
+            row=df.iloc[ri]
+            for ci,field in enumerate(HR_FORMAT_FIELDS):
+                val=row[field] if field in df.columns else ""
+                if val is None or (isinstance(val,float) and pd.isna(val)): val=""
+                ws.write(2+ri,ci,val,cell_fmt if ri%2==0 else alt_fmt)
+        ws.freeze_panes(2,1)
+    return buf.getvalue()
+
+def print_employee_record_html(emp,company="Yetebaberut General Service Provider"):
+    """Single-employee printable record in the same standardized grouping
+    and order as the Excel export — for a full personal-record printout
+    (not the payroll slip, which stays a separate document)."""
+    sections=""
+    for group_label,fields in HR_FORMAT_GROUPS:
+        rows="".join([
+            f'<tr><td class="lbl">{label}</td><td class="val">{emp.get(field,"") or "—"}</td></tr>'
+            for label,field in fields])
+        sections+=f'<div class="grp"><div class="grp-title">{group_label}</div><table>{rows}</table></div>'
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
+body{{font-family:Arial,sans-serif;margin:0;padding:18px;color:#000}}
+.wrap{{max-width:820px;margin:auto;border:2px solid #D4A847;border-radius:8px;padding:20px}}
+.header{{text-align:center;border-bottom:2px solid #D4A847;padding-bottom:10px;margin-bottom:14px}}
+.co{{font-size:18px;font-weight:bold;color:#0D1526}}.ti{{font-size:12px;color:#666;margin-top:2px}}
+.grp{{margin-bottom:12px}}
+.grp-title{{background:#0D1526;color:#D4A847;font-size:11px;font-weight:bold;text-transform:uppercase;
+  padding:5px 10px;border-radius:4px 4px 0 0}}
+table{{width:100%;border-collapse:collapse}}
+td{{padding:5px 10px;font-size:12px;border:1px solid #ddd}}
+.lbl{{background:#F8F8F8;color:#555;font-weight:600;width:34%}}
+.val{{color:#111}}
+@media print{{body{{margin:0}}}}
+</style></head><body><div class="wrap">
+<div class="header"><div class="co">{company}</div>
+<div class="ti">OFFICIAL EMPLOYEE PERSONAL RECORD</div>
+<div style="font-size:9px;color:#888;margin-top:2px">Addis Ababa, Ethiopia | Printed {datetime.now().strftime("%Y-%m-%d")}</div></div>
+{sections}
+</div>
+<script>window.onload=function(){{window.print()}}</script></body></html>"""
+
+# ════════════════════════════════════════════════════════
 # CLEANUP — remove any auto-seeded cost centers.
 # This app used to auto-create a default set of cost centers on first
 # run. The user manages cost centers manually, so this now does the
@@ -837,6 +982,7 @@ def export_excel(df):
 def seed_if_empty():
     conn=get_conn()
     conn.execute("DELETE FROM cost_centers WHERE created_by='system'")
+    conn.execute("DELETE FROM divisions WHERE created_by='system'")
     conn.commit(); conn.close()
 
 seed_if_empty()
@@ -1133,7 +1279,7 @@ components.html("""
 # view) to any user created in Administration. If a user
 # has no custom nav_access saved, the role default applies.
 # ════════════════════════════════════════════════════════
-ALL_NAV_VIEWS = ["Home","Applicant Intake","Employee Directory","Employee Profile",
+ALL_NAV_VIEWS = ["Home","Control Center","Applicant Intake","Employee Directory","Employee Profile",
     "Supervisor Console","Payroll","Payroll Approvals","Leave & Discipline","Leave Records","Vacation",
     "HR Review","HR Manager Approval","Demotion","Public Holidays","Cost Centers","Recycle Bin","Administration"]
 
@@ -1142,7 +1288,10 @@ ROLE_DEFAULT_VIEWS = {
     "Payroll Section": ["Home","Payroll Approvals","Payroll","Employee Directory","Employee Profile","Public Holidays","Cost Centers"],
     "Department Head": ["Home","Vacation","Employee Directory","Employee Profile","Public Holidays"],
     "HR Staff": ["Home","HR Review","Applicant Intake","Employee Directory","Employee Profile","Leave & Discipline","Leave Records","Vacation","Demotion","Public Holidays"],
-    "Manager": ["Home","Applicant Intake","Employee Directory","Employee Profile","Payroll",
+    # "Control Center" is a Manager-only, always-on-top oversight page (owner-level
+    # control of every office function — payroll, all leave, vacation, staff — in
+    # one place) and is never granted to any other role.
+    "Manager": ["Home","Control Center","Applicant Intake","Employee Directory","Employee Profile","Payroll",
         "Payroll Approvals","Leave & Discipline","Leave Records","Vacation","HR Manager Approval","Demotion","Public Holidays","Cost Centers","Recycle Bin","Administration"],
 }
 ROLE_DEFAULT_FALLBACK = ["Home","Applicant Intake","Employee Directory","Employee Profile",
@@ -1154,9 +1303,16 @@ def get_user_nav_views(role, nav_access_json):
         try:
             access = json.loads(nav_access_json)
             views = [v for v in ALL_NAV_VIEWS if v in access]
+            # "Control Center" is Manager-only regardless of any custom nav_access
+            # grant an Administrator might have accidentally saved for someone else.
+            if role != "Manager" and "Control Center" in views:
+                views = [v for v in views if v != "Control Center"]
             if views: return views
         except: pass
-    return ROLE_DEFAULT_VIEWS.get(role, ROLE_DEFAULT_FALLBACK)
+    base = ROLE_DEFAULT_VIEWS.get(role, ROLE_DEFAULT_FALLBACK)
+    if role != "Manager":
+        base = [v for v in base if v != "Control Center"]
+    return base
 
 def get_user_view_permission(view_name, role, nav_access_json):
     """Returns one of 'view','edit','both','full_control' for a given view.
@@ -1189,7 +1345,12 @@ else:
 V=st.session_state.view
 
 # Group views under labeled sections for fast scanning at scale.
+# "OWNER CONTROL" is pinned at the very top of the sidebar and only ever
+# appears for the Manager (VIEWS already excludes it for everyone else),
+# so this is the single place a Manager goes to control every office
+# function — HR, Finance, Admin, Supervisors — in one pane.
 NAV_GROUPS = [
+    ("OWNER CONTROL", ["Control Center"]),
     ("OVERVIEW", ["Home"]),
     ("RECRUITMENT", ["Applicant Intake"]),
     ("WORKFORCE", ["Employee Directory","Employee Profile","Supervisor Console"]),
@@ -1217,6 +1378,13 @@ section[data-testid="stSidebar"] div.stButton button:hover{
     background:linear-gradient(135deg,#1A6B3C,#22C55E) !important;
     color:#fff !important; font-weight:600 !important;
     border-color:transparent !important;}
+.nav-owner button{
+    background:linear-gradient(135deg,#7B2FBE,#9333EA) !important;
+    color:#fff !important; font-weight:700 !important;
+    border-color:rgba(212,168,71,0.5) !important;}
+.nav-owner.nav-active button{
+    background:linear-gradient(135deg,#D4A847,#F0C96B) !important;
+    color:#0D1526 !important;}
 .nav-footer{margin-top:10px;padding:6px 8px;border-top:1px solid rgba(255,255,255,0.07);
     font-size:9px;color:#6B7FA3;text-align:center}
 </style>""",unsafe_allow_html=True)
@@ -1234,11 +1402,14 @@ if st.session_state.role:
             st.markdown(f'<div class="nav-group-label">{group_label}</div>', unsafe_allow_html=True)
             for v in visible_in_group:
                 is_active = (st.session_state.view == v)
-                if is_active: st.markdown('<div class="nav-active">', unsafe_allow_html=True)
-                if st.button(v, use_container_width=True, key=f"nav_{v}"):
+                is_owner = (v == "Control Center")
+                wrap_classes = " ".join(filter(None,["nav-active" if is_active else "", "nav-owner" if is_owner else ""]))
+                if wrap_classes: st.markdown(f'<div class="{wrap_classes}">', unsafe_allow_html=True)
+                btn_label = f"👑 {v}" if is_owner else v
+                if st.button(btn_label, use_container_width=True, key=f"nav_{v}"):
                     st.session_state.view=v; st.rerun()
-                if is_active: st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="nav-footer">Yetebaberut HRMS<br>v2.7 (build check)</div>', unsafe_allow_html=True)
+                if wrap_classes: st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="nav-footer">Yetebaberut HRMS<br>v2.8 (build check)</div>', unsafe_allow_html=True)
 
 main_block = st.container() if st.session_state.role else st.container()
 
@@ -1247,11 +1418,112 @@ main_block = st.container() if st.session_state.role else st.container()
 def sclass(s):
     return {"Active Deployment":"sa","Pending Screening":"spe","Pre-Employment Process":"spr","On Leave":"sl","Terminated":"st"}.get(s,"spe")
 
+
 # ════════════════════════════════════════════════════════
-# HOME — with Applicant Gate Control
+# CONTROL CENTER — Manager-only owner oversight page.
+# Single pane of glass to control every office function: HR, Finance
+# (Payroll), Admin, Supervisors, and the Manager's own approvals — all
+# pending approvals across every workflow, staff-by-role breakdown, and
+# one-click jump buttons into each operational page.
 # ════════════════════════════════════════════════════════
 with main_block:
-    if V=="Home":
+    if V=="Control Center":
+        if st.session_state.role!="Manager":
+            st.warning("Control Center is restricted to the Manager role."); st.stop()
+
+        st.markdown('<div class="ey">Owner Oversight</div>',unsafe_allow_html=True)
+        st.markdown('<div class="tl">Control Center — All Office Staff & Operations</div>',unsafe_allow_html=True)
+        st.markdown("""<div class="card card-gold">
+          <div style="font-size:12px;color:#C8D8F0;line-height:1.7">
+            One place to see and steer every part of the company — HR, Finance/Payroll,
+            Supervisors, and Administration. Everything pending anyone's action shows up
+            here first; use the jump buttons to go straight to it.
+          </div></div>""",unsafe_allow_html=True)
+
+        # ── Pull every cross-cutting pending count in one pass ──
+        conn=get_conn()
+        pending_payroll_sub=pg_read_sql("SELECT COUNT(*) as c FROM payroll_submissions WHERE status='Pending Approval'",conn).iloc[0]['c']
+        pending_payroll_bulk=pg_read_sql("SELECT COUNT(*) as c FROM payroll WHERE payment_status='Pending Approval'",conn).iloc[0]['c']
+        pending_hr_review=pg_read_sql("SELECT COUNT(*) as c FROM daily_status_records WHERE workflow_stage='Pending HR Review'",conn).iloc[0]['c']
+        pending_hr_manager=pg_read_sql("SELECT COUNT(*) as c FROM daily_status_records WHERE workflow_stage='Pending HR Manager Approval'",conn).iloc[0]['c']
+        pending_dept_leave=pg_read_sql("SELECT COUNT(*) as c FROM leave_records WHERE status='Pending Dept Head Approval'",conn).iloc[0]['c']
+        pending_dept_fines=pg_read_sql("SELECT COUNT(*) as c FROM fine_letters WHERE applied_to_payroll='Pending Dept Head Approval'",conn).iloc[0]['c']
+        pending_demotion=pg_read_sql("SELECT COUNT(*) as c FROM demotion_records WHERE status='Pending Manager Approval'",conn).iloc[0]['c']
+        pending_applicants=pg_read_sql("SELECT COUNT(*) as c FROM employees WHERE current_status='Pending Screening'",conn).iloc[0]['c']
+        total_pending_leave_related = pending_hr_review+pending_hr_manager+pending_dept_leave+pending_dept_fines
+        conn.close()
+
+        st.markdown('<div class="ey" style="margin-top:6px">Pending Across The Organization</div>',unsafe_allow_html=True)
+        st.markdown(f"""<div class="mg" style="grid-template-columns:repeat(6,1fr)">
+          <div class="mb mg-amber"><div class="ml ml-amber">Payroll Sheets</div><div class="mv">{pending_payroll_sub}</div></div>
+          <div class="mb mg-amber"><div class="ml ml-amber">Bulk Payroll Runs</div><div class="mv">{pending_payroll_bulk}</div></div>
+          <div class="mb mg-cyan"><div class="ml ml-cyan">HR Review</div><div class="mv">{pending_hr_review}</div></div>
+          <div class="mb mg-cyan"><div class="ml ml-cyan">HR Mgr Approval</div><div class="mv">{pending_hr_manager}</div></div>
+          <div class="mb mg-purple"><div class="ml ml-purple">Demotion/Status</div><div class="mv">{pending_demotion}</div></div>
+          <div class="mb mg-teal"><div class="ml ml-teal">New Applicants</div><div class="mv">{pending_applicants}</div></div>
+        </div>""",unsafe_allow_html=True)
+        if total_pending_leave_related>0 or pending_dept_leave>0 or pending_dept_fines>0:
+            st.markdown(f'<div style="font-size:11px;color:#6B7FA3;margin:-8px 0 12px">Older-workflow leftovers still awaiting Department Head sign-off: {pending_dept_leave} leave record(s), {pending_dept_fines} fine letter(s).</div>',unsafe_allow_html=True)
+
+        st.markdown("<hr>",unsafe_allow_html=True)
+        st.markdown('<div class="ey">Jump To</div>',unsafe_allow_html=True)
+        jc1,jc2,jc3,jc4,jc5,jc6=st.columns(6)
+        jump_map=[(jc1,"Payroll Approvals","💰 Payroll Approvals"),(jc2,"Payroll","🧾 Run Payroll"),
+            (jc3,"HR Review","📋 HR Review"),(jc4,"HR Manager Approval","✅ HR Mgr Approval"),
+            (jc5,"Vacation","🏖 Vacation"),(jc6,"Demotion","📊 Demotion/Status")]
+        for col,target_view,label in jump_map:
+            with col:
+                if st.button(label,use_container_width=True,key=f"cc_jump_{target_view}"):
+                    st.session_state.view=target_view; st.rerun()
+        jc7,jc8,jc9,jc10,jc11,jc12=st.columns(6)
+        jump_map2=[(jc7,"Leave & Discipline","📝 Leave & Discipline"),(jc8,"Leave Records","📆 Leave Records"),
+            (jc9,"Employee Directory","👥 Employee Directory"),(jc10,"Cost Centers","🏢 Divisions & Cost Centers"),
+            (jc11,"Recycle Bin","♻️ Recycle Bin"),(jc12,"Administration","⚙️ Administration / Users")]
+        for col,target_view,label in jump_map2:
+            with col:
+                if st.button(label,use_container_width=True,key=f"cc_jump_{target_view}"):
+                    st.session_state.view=target_view; st.rerun()
+
+        st.markdown("<hr>",unsafe_allow_html=True)
+        st.markdown('<div class="ey">Office Staff — By Role</div>',unsafe_allow_html=True)
+        st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Every login account in the system, grouped by role, with active/inactive status at a glance. Manage accounts in Administration.</div>',unsafe_allow_html=True)
+        conn=get_conn()
+        staff_df=pg_read_sql("""SELECT username,full_name,role,is_active,assigned_division,last_login
+            FROM system_users ORDER BY role,full_name""",conn)
+        conn.close()
+        if len(staff_df)==0:
+            st.info("No staff accounts yet.")
+        else:
+            role_order=["Manager","HR Staff","Payroll Section","Supervisor","Department Head","Data Officer"]
+            present_roles=[r for r in role_order if r in staff_df['role'].unique().tolist()]
+            present_roles += [r for r in staff_df['role'].unique().tolist() if r not in present_roles]
+            for role_name in present_roles:
+                grp=staff_df[staff_df['role']==role_name]
+                active_n=int((grp['is_active']==1).sum()); total_n=len(grp)
+                with st.expander(f"{role_name} — {total_n} account(s), {active_n} active",expanded=False):
+                    disp=grp.rename(columns={"username":"Username","full_name":"Full Name","role":"Role",
+                        "is_active":"Active","assigned_division":"Division","last_login":"Last Login"}).copy()
+                    disp["Active"]=disp["Active"].apply(lambda x: "Yes" if int(x)==1 else "No")
+                    st.dataframe(disp,use_container_width=True,hide_index=True)
+
+        st.markdown("<hr>",unsafe_allow_html=True)
+        st.markdown('<div class="ey">Company-Wide Workforce Snapshot</div>',unsafe_allow_html=True)
+        stats_cc=get_stats()
+        total_cc=sum(stats_cc.values())
+        st.markdown(f"""<div class="mg">
+          <div class="mb mg-gold"><div class="ml ml-gold">Total Employees</div><div class="mv">{total_cc}</div></div>
+          <div class="mb mg-green"><div class="ml ml-green">Active Deployment</div><div class="mv">{stats_cc.get("Active Deployment",0)}</div></div>
+          <div class="mb mg-cyan"><div class="ml ml-cyan">Applicants</div><div class="mv">{stats_cc.get("Pending Screening",0)}</div></div>
+          <div class="mb mg-amber"><div class="ml ml-amber">Pre-Employment</div><div class="mv">{stats_cc.get("Pre-Employment Process",0)}</div></div>
+          <div class="mb mg-purple"><div class="ml ml-purple">On Leave</div><div class="mv">{stats_cc.get("On Leave",0)}</div></div>
+          <div class="mb mg-red"><div class="ml ml-red">Terminated</div><div class="mv">{stats_cc.get("Terminated",0)}</div></div>
+        </div>""",unsafe_allow_html=True)
+
+
+    # ════════════════════════════════════════════════════════
+    # HOME — with Applicant Gate Control
+    # ════════════════════════════════════════════════════════
+    elif V=="Home":
         if st.session_state.role:
             st.markdown('<div class="ey">Live Status — Today</div>',unsafe_allow_html=True)
             st.markdown('<div class="tl">Workforce Attendance Snapshot</div>',unsafe_allow_html=True)
@@ -1266,7 +1538,11 @@ with main_block:
             with seg2:
                 seg_value="All"
                 if seg_mode=="By Division":
-                    seg_value=st.selectbox("Division",get_division_list(),key="live_seg_div")
+                    div_list_home=get_division_list()
+                    if div_list_home:
+                        seg_value=st.selectbox("Division",div_list_home,key="live_seg_div")
+                    else:
+                        st.info("No divisions created yet.")
                 elif seg_mode=="By Cost Center":
                     all_cc_live=get_cost_centers()
                     cc_opts_live=all_cc_live['code'].tolist() if len(all_cc_live)>0 else []
@@ -1357,7 +1633,7 @@ with main_block:
                         with a7: ha=st.text_input("House No.")
                         with a8: wo=st.text_input("Woreda")
                         with a9: sc=st.text_input("Subcity")
-                        with a10: ke=st.text_input("Kebele")
+                        with a10: ke=st.text_input("City")
                         a11,a12,a13=st.columns(3)
                         with a11: ri=st.text_input("Resident ID")
                         with a12: pb=st.text_input("Place of Birth")
@@ -1376,16 +1652,22 @@ with main_block:
                                 try:
                                     conn=get_conn(); cur=conn.cursor()
                                     cur.execute("SELECT COUNT(*) FROM employees"); cnt=cur.fetchone()[0]
-                                    nid=f"YGS-{2000+cnt}"; div=random.choice(["Catering","MRO","Appearance","Ramp","Cargo"])
+                                    nid=f"YGS-{2000+cnt}"
+                                    # Divisions are manually created (Cost Centers page → Divisions tab) —
+                                    # no hardcoded default list any more. If none exist yet, leave the
+                                    # applicant unassigned; the reviewer assigns a division during
+                                    # screening below, same as before.
+                                    div_choices=get_division_list()
+                                    div = random.choice(div_choices) if div_choices else None
                                     conn.execute("""INSERT INTO employees(emp_id,full_name,division,contact,email,house_address,
-                                        woreda,subcity,kebele,resident_id,place_of_birth,age,sex,edu_background,field_of_graduate,
+                                        woreda,subcity,city,resident_id,place_of_birth,age,sex,edu_background,field_of_graduate,
                                         current_status,registration_date,edu_doc_name,edu_doc_data)
                                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Pending Screening',?,?,?)""",
                                         (nid,name,div,ph,em,ha,wo,sc,ke,ri,pb,int(ag),sx,ed,fi,
                                          datetime.now().strftime("%Y-%m-%d"),doc_name,doc_data))
                                     conn.commit(); conn.close()
                                     get_emp_list_cached.clear(); get_stats.clear()
-                                    st.success(f"Application received! ID: **{nid}**  {div}"); st.balloons()
+                                    st.success(f"Application received! ID: **{nid}**{'  '+div if div else ' — division not yet assigned'}"); st.balloons()
                                 except sqlite3.Error as dberr:
                                     st.error(f"Could not save application: {dberr}")
                 if st.session_state.get("show_apply"): st.session_state.show_apply=False; apply_dlg()
@@ -1430,19 +1712,24 @@ with main_block:
             with p1:
                 tid=st.selectbox("Applicant ID",sdf["emp_id"].unique())
                 div_list=get_division_list()
-                da=st.selectbox("Assign Division",div_list)
-                ccs=get_cost_centers(da)
+                if not div_list:
+                    st.warning("No divisions have been created yet. A Manager must create one first in Cost Centers → Divisions.")
+                    da=None
+                else:
+                    da=st.selectbox("Assign Division",div_list)
+                ccs=get_cost_centers(da) if da else pd.DataFrame()
                 cc_opts=["Unassigned"]+ccs['code'].tolist() if len(ccs)>0 else ["Unassigned"]
                 dcc=st.selectbox("Assign Cost Center",cc_opts)
             with p2:
                 st.write(""); st.write(""); st.write("")
-                if st.button("Transfer to Pre-Employment",use_container_width=True):
+                if st.button("Transfer to Pre-Employment",use_container_width=True,disabled=(da is None)):
                     conn=get_conn()
                     conn.execute("UPDATE employees SET current_status='Pre-Employment Process',division=?,cost_center=? WHERE emp_id=?",
                         (da, None if dcc=="Unassigned" else dcc, tid))
                     conn.commit(); conn.close()
                     st.cache_data.clear()
                     st.success(f"{tid}  {da} ({dcc}) — Pre-Employment"); st.rerun()
+
 
     # ════════════════════════════════════════════════════════
     # EMPLOYEE DIRECTORY (formerly Master Records)
@@ -1466,7 +1753,8 @@ with main_block:
         </div>""",unsafe_allow_html=True)
         st.markdown('<div style="font-size:10px;color:#6B7FA3;margin:-10px 0 12px">*All Active = every employee except Terminated (includes Deployed, On Leave, Sick, Maternity, Mourning, Pre-Employment)</div>',unsafe_allow_html=True)
 
-        with st.expander("Export Full Employee Data to Excel"):
+        with st.expander("Export Full Employee Data to Excel — Official HR Record Format"):
+            st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Exports in the standardized company template (Personal Information · Address · Emergency Contact · Mortgage Condition · Financial & IDs · Education · Employment & Division) — the same layout used for every official HR register.</div>',unsafe_allow_html=True)
             ex1,ex2,ex3=st.columns(3)
             with ex1: xst=st.selectbox("Status",["All","Active Deployment","Pending Screening","Pre-Employment Process","On Leave","Terminated"])
             with ex2: xdp=st.selectbox("Division",["All"]+get_division_list())
@@ -1481,8 +1769,8 @@ with main_block:
                 if xdp!="All": xq+=" AND division=?"; xp.append(xdp)
                 if xcc!="All": xq+=" AND cost_center=?"; xp.append(xcc)
                 xdf=pg_read_sql(xq,conn,params=xp); conn.close()
-                st.download_button(f"Download ({len(xdf)} employees)",export_excel(xdf),
-                    file_name=f"YGSP_{xst}_{xdp}_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                st.download_button(f"Download — Official HR Format ({len(xdf)} employees)",export_excel_hr_official(xdf),
+                    file_name=f"YGSP_HR_Record_{xst}_{xdp}_{datetime.now().strftime('%Y%m%d')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
         st.markdown("<hr>",unsafe_allow_html=True)
         f1,f2,f3,f4=st.columns(4)
@@ -1525,12 +1813,16 @@ with main_block:
                         with st.form("qe"):
                             q1,q2,q3=st.columns(3)
                             with q1: qn=st.text_input("Full Name",value=r.get("full_name","") or "")
-                            with q2: qc=st.text_input("Contact",value=r.get("contact","") or "")
+                            with q2: qc=st.text_input("Contact 01",value=r.get("contact","") or "")
                             with q3: qe=st.text_input("Email",value=r.get("email","") or "")
                             q4,q5,q6,q7=st.columns(4)
                             dlist=get_division_list()
                             so=["Pending Screening","Pre-Employment Process","Active Deployment","On Leave","Terminated"]
-                            with q4: qdiv=st.selectbox("Division",dlist,index=dlist.index(r.get("division","Catering")) if r.get("division") in dlist else 0)
+                            with q4:
+                                if dlist:
+                                    qdiv=st.selectbox("Division",dlist,index=dlist.index(r.get("division")) if r.get("division") in dlist else 0)
+                                else:
+                                    st.warning("No divisions created."); qdiv=r.get("division")
                             qcc_list=get_cost_centers(qdiv)
                             qcc_opts=["Unassigned"]+qcc_list['code'].tolist() if len(qcc_list)>0 else ["Unassigned"]
                             with q5:
@@ -1546,20 +1838,24 @@ with main_block:
                                 st.cache_data.clear()
                                 st.success("Saved"); st.rerun()
             with t2:
+                div_list_add=get_division_list()
+                if not div_list_add:
+                    st.warning("No divisions have been created yet. Go to Cost Centers → Divisions to create the first one before adding employees.")
                 with st.form("af2"):
                     a1,a2,a3,a4=st.columns(4)
                     with a1: aid=st.text_input("Employee ID")
                     with a2: anam=st.text_input("Full Name")
-                    with a3: apho=st.text_input("Phone")
+                    with a3: apho=st.text_input("Phone (Contact 01)")
                     with a4: asal=st.number_input("Basic Salary",min_value=0.0,step=100.0)
                     a5,a6=st.columns(2)
-                    with a5: adiv=st.selectbox("Division",get_division_list())
+                    with a5: adiv=st.selectbox("Division",div_list_add) if div_list_add else None
                     with a6:
-                        acc_list=get_cost_centers(adiv)
+                        acc_list=get_cost_centers(adiv) if adiv else pd.DataFrame()
                         acc_opts=["Unassigned"]+acc_list['code'].tolist() if len(acc_list)>0 else ["Unassigned"]
                         acc=st.selectbox("Cost Center",acc_opts)
                     if st.form_submit_button("Add",use_container_width=True):
                         if not(aid and anam): st.error("ID and Name required.")
+                        elif not adiv: st.error("Create a division first (Cost Centers → Divisions).")
                         else:
                             conn=get_conn()
                             try:
@@ -1582,6 +1878,7 @@ with main_block:
                         st.cache_data.clear(); get_employee.clear()
                         st.session_state.eid=None; st.success("Moved to Recycle Bin."); st.rerun()
                 else: st.info("Select a row above.")
+
 
     # ════════════════════════════════════════════════════════
     # EMPLOYEE PROFILE (Full View + Documents with Delete)
@@ -1613,12 +1910,13 @@ with main_block:
               </div>
               <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:9px">
                 <div><div class="ifl">Full Name</div><div class="ifv">{r.get("full_name","")}</div></div>
-                <div><div class="ifl">Job Title</div><div class="ifv">{r.get("job_title","—")}</div></div>
+                <div><div class="ifl">Position / Category</div><div class="ifv">{r.get("job_title","—")} / {r.get("category","—")}</div></div>
                 <div><div class="ifl">Division</div><div class="ifv">{r.get("division","")}{cc_tag}</div></div>
                 <div><div class="ifl">Type</div><div class="ifv">{r.get("employment_type","—")}</div></div>
                 <div><div class="ifl">Start Date</div><div class="ifv">{r.get("start_date","—")}</div></div>
                 <div><div class="ifl">Contract End</div><div class="ifv">{r.get("contract_end_date","—")}</div></div>
-                <div><div class="ifl">Contact</div><div class="ifv">{r.get("contact","—")}</div></div>
+                <div><div class="ifl">Contact 01</div><div class="ifv">{r.get("contact","—")}</div></div>
+                <div><div class="ifl">Contact 02</div><div class="ifv">{r.get("contact2","—")}</div></div>
                 <div><div class="ifl">Email</div><div class="ifv">{r.get("email","—")}</div></div>
                 <div><div class="ifl">Salary</div><div class="ifv" style="color:#10B981">ETB {bs:,.2f}</div></div>
                 <div><div class="ifl">Bank/Account</div><div class="ifv">{r.get("bank_name","—")}/{r.get("bank_account","—")}</div></div>
@@ -1633,6 +1931,10 @@ with main_block:
                     st.markdown(f'<div class="pb"><img src="data:image/{extp};base64,{b64p}" style="max-width:100%;max-height:190px;border-radius:8px;object-fit:contain"/></div>',unsafe_allow_html=True)
             else:
                 st.markdown('<div class="pb" style="display:flex;align-items:center;justify-content:center;min-height:170px;flex-direction:column;gap:6px"><div style="font-size:36px;opacity:0.25"></div><div style="font-size:10px;color:#6B7FA3">No photo</div></div>',unsafe_allow_html=True)
+            st.write("")
+            print_html_full=print_employee_record_html(r)
+            b64_full=base64.b64encode(print_html_full.encode()).decode()
+            st.markdown(f'<a href="data:text/html;base64,{b64_full}" download="Record_{eid2}.html" target="_blank"><button style="width:100%;background:linear-gradient(135deg,#7B2FBE,#9333EA);color:#fff;border:none;border-radius:8px;padding:9px;font-weight:600;font-size:11px;cursor:pointer">🖨 Print Full Record (Official Format)</button></a>',unsafe_allow_html=True)
         st.markdown("<hr>",unsafe_allow_html=True)
         t1,t2,t3,t4,t5,t6,t7=st.tabs(["Personal","Edu & Work","Financial","Documents","Edit","History","Document History"])
         with t1:
@@ -1652,13 +1954,23 @@ with main_block:
             with c2:
                 st.markdown(f"""<div class="card">
                   <div class="fs">Address</div>
-                  <div><div class="ifl">House No.</div><div class="ifv">{r.get("house_address","—")}</div></div>
-                  <div><div class="ifl">Woreda</div><div class="ifv">{r.get("woreda","—")}</div></div>
+                  <div><div class="ifl">City</div><div class="ifv">{r.get("city","—")}</div></div>
                   <div><div class="ifl">Subcity</div><div class="ifv">{r.get("subcity","—")}</div></div>
-                  <div><div class="ifl">Kebele</div><div class="ifv">{r.get("kebele","—")}</div></div>
+                  <div><div class="ifl">Woreda</div><div class="ifv">{r.get("woreda","—")}</div></div>
+                  <div><div class="ifl">House</div><div class="ifv">{r.get("house_address","—")}</div></div>
                   <div class="fs" style="margin-top:10px">Emergency Contact</div>
                   <div><div class="ifl">Name</div><div class="ifv">{r.get("emergency_contact_name","—")}</div></div>
                   <div><div class="ifl">Phone</div><div class="ifv">{r.get("emergency_contact_phone","—")}</div></div>
+                  <div><div class="ifl">City / Subcity / Woreda</div><div class="ifv">{r.get("emergency_contact_city","—")} / {r.get("emergency_contact_subcity","—")} / {r.get("emergency_contact_woreda","—")}</div></div>
+                </div>""",unsafe_allow_html=True)
+                st.markdown(f"""<div class="card">
+                  <div class="fs">Mortgage Condition — Guarantor</div>
+                  <div><div class="ifl">Name</div><div class="ifv">{r.get("guarantor_name","—")}</div></div>
+                  <div><div class="ifl">Phone</div><div class="ifv">{r.get("guarantor_phone","—")}</div></div>
+                  <div><div class="ifl">City / Subcity / Woreda</div><div class="ifv">{r.get("guarantor_city","—")} / {r.get("guarantor_subcity","—")} / {r.get("guarantor_woreda","—")}</div></div>
+                  <div><div class="ifl">Company ID / Name</div><div class="ifv">{r.get("guarantor_company_id","—")} / {r.get("guarantor_company_name","—")}</div></div>
+                  <div><div class="ifl">Letter Number</div><div class="ifv">{r.get("guarantor_letter_number","—")}</div></div>
+                  <div><div class="ifl">Date Written</div><div class="ifv">{r.get("guarantor_date_written","—")}</div></div>
                 </div>""",unsafe_allow_html=True)
         with t2:
             c1,c2=st.columns(2)
@@ -1673,7 +1985,8 @@ with main_block:
             with c2:
                 st.markdown(f"""<div class="card">
                   <div class="fs">Employment</div>
-                  <div><div class="ifl">Job Title</div><div class="ifv">{r.get("job_title","—")}</div></div>
+                  <div><div class="ifl">Position (Job Title)</div><div class="ifv">{r.get("job_title","—")}</div></div>
+                  <div><div class="ifl">Category</div><div class="ifv">{r.get("category","—")}</div></div>
                   <div><div class="ifl">Division</div><div class="ifv">{r.get("division","—")}</div></div>
                   <div><div class="ifl">Cost Center</div><div class="ifv">{r.get("cost_center","—")}</div></div>
                   <div><div class="ifl">Type</div><div class="ifv">{r.get("employment_type","—")}</div></div>
@@ -1683,7 +1996,7 @@ with main_block:
         with t3:
             bs2=float(r.get("basic_salary") or 0)
             st.markdown(f"""<div class="card">
-              <div class="fs">Financial</div>
+              <div class="fs">Financial & IDs</div>
               <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
                 <div><div class="ifl">Basic Salary</div><div class="ifv" style="color:#10B981;font-size:15px;font-family:'Cinzel',serif">ETB {bs2:,.2f}</div></div>
                 <div><div class="ifl">Daily Rate (÷26)</div><div class="ifv">ETB {bs2/26:,.2f}</div></div>
@@ -1691,6 +2004,7 @@ with main_block:
                 <div><div class="ifl">Income Tax (est.)</div><div class="ifv" style="color:#FCA5A5">ETB {eth_tax(bs2):,.2f}</div></div>
                 <div><div class="ifl">Pension Emp 7%</div><div class="ifv" style="color:#FCA5A5">ETB {bs2*0.07:,.2f}</div></div>
                 <div><div class="ifl">Pension Er 11%</div><div class="ifv" style="color:#38BDF8">ETB {bs2*0.11:,.2f}</div></div>
+                <div><div class="ifl">National ID Number</div><div class="ifv">{r.get("national_id_number","—")}</div></div>
                 <div><div class="ifl">TIN</div><div class="ifv">{r.get("tin_number","—")}</div></div>
                 <div><div class="ifl">Pension No.</div><div class="ifv">{r.get("pension_number","—")}</div></div>
                 <div><div class="ifl">Bank/Account</div><div class="ifv">{r.get("bank_name","—")} {r.get("bank_account","—")}</div></div>
@@ -1772,8 +2086,11 @@ with main_block:
                     st.markdown('<div class="fs">Personal Information</div>',unsafe_allow_html=True)
                     p1,p2,p3=st.columns(3)
                     with p1: en=st.text_input("Full Name",value=r.get("full_name","") or "")
-                    with p2: ec=st.text_input("Contact",value=r.get("contact","") or "")
-                    with p3: ee=st.text_input("Email",value=r.get("email","") or "")
+                    with p2: ec=st.text_input("Contact 01",value=r.get("contact","") or "")
+                    with p3: ec2=st.text_input("Contact 02",value=r.get("contact2","") or "")
+                    pe1,pe2=st.columns(2)
+                    with pe1: ee=st.text_input("Email",value=r.get("email","") or "")
+                    with pe2: enatid=st.text_input("National Id Number",value=r.get("national_id_number","") or "")
                     p4,p5,p6,p7=st.columns(4)
                     with p4: esx=st.selectbox("Sex",["Male","Female"],index=0 if r.get("sex")=="Male" else 1)
                     with p5:
@@ -1792,19 +2109,34 @@ with main_block:
                     with p11: eres=st.text_input("Resident ID",value=r.get("resident_id","") or "")
                     st.markdown('<div class="fs">Address</div>',unsafe_allow_html=True)
                     a1,a2,a3,a4=st.columns(4)
-                    with a1: eha=st.text_input("House",value=r.get("house_address","") or "")
-                    with a2: ewo=st.text_input("Woreda",value=r.get("woreda","") or "")
-                    with a3: esc2=st.text_input("Subcity",value=r.get("subcity","") or "")
-                    with a4: eke=st.text_input("Kebele",value=r.get("kebele","") or "")
+                    with a1: ecity=st.text_input("City",value=r.get("city","") or "")
+                    with a2: esc2=st.text_input("Subcity",value=r.get("subcity","") or "")
+                    with a3: ewo=st.text_input("Woreda",value=r.get("woreda","") or "")
+                    with a4: eha=st.text_input("House",value=r.get("house_address","") or "")
                     st.markdown('<div class="fs">Emergency Contact</div>',unsafe_allow_html=True)
-                    ec1,ec2=st.columns(2)
+                    ec1,ec2b,ec3,ec4,ec5=st.columns(5)
                     with ec1: eecn=st.text_input("Name",value=r.get("emergency_contact_name","") or "")
-                    with ec2: eecp=st.text_input("Phone",value=r.get("emergency_contact_phone","") or "")
+                    with ec2b: eecp=st.text_input("Phone",value=r.get("emergency_contact_phone","") or "")
+                    with ec3: eeccity=st.text_input("City",value=r.get("emergency_contact_city","") or "",key="eeccity")
+                    with ec4: eecsc=st.text_input("Subcity",value=r.get("emergency_contact_subcity","") or "",key="eecsc")
+                    with ec5: eecwo=st.text_input("Woreda",value=r.get("emergency_contact_woreda","") or "",key="eecwo")
+                    st.markdown('<div class="fs">Mortgage Condition — Guarantor</div>',unsafe_allow_html=True)
+                    g1,g2,g3,g4,g5=st.columns(5)
+                    with g1: egn=st.text_input("Guarantor Name",value=r.get("guarantor_name","") or "")
+                    with g2: egp=st.text_input("Guarantor Phone",value=r.get("guarantor_phone","") or "")
+                    with g3: egcity=st.text_input("City",value=r.get("guarantor_city","") or "",key="egcity")
+                    with g4: egsc=st.text_input("Subcity",value=r.get("guarantor_subcity","") or "",key="egsc")
+                    with g5: egwo=st.text_input("Woreda",value=r.get("guarantor_woreda","") or "",key="egwo")
+                    g6,g7,g8,g9=st.columns(4)
+                    with g6: egcid=st.text_input("Company ID",value=r.get("guarantor_company_id","") or "")
+                    with g7: egcname=st.text_input("Company Name",value=r.get("guarantor_company_name","") or "")
+                    with g8: egletter=st.text_input("Letter Number",value=r.get("guarantor_letter_number","") or "")
+                    with g9: egdate=st.text_input("Date Written (YYYY-MM-DD)",value=r.get("guarantor_date_written","") or "")
                     st.markdown('<div class="fs">Financial & IDs</div>',unsafe_allow_html=True)
                     f1,f2,f3,f4=st.columns(4)
-                    with f1: etin=st.text_input("TIN",value=r.get("tin_number","") or "")
-                    with f2: epen2=st.text_input("Pension No.",value=r.get("pension_number","") or "")
-                    with f3: ebnk=st.text_input("Bank",value=r.get("bank_name","") or "")
+                    with f1: etin=st.text_input("TIN Id Number",value=r.get("tin_number","") or "")
+                    with f2: epen2=st.text_input("Pension Id Number",value=r.get("pension_number","") or "")
+                    with f3: ebnk=st.text_input("Bank Name",value=r.get("bank_name","") or "")
                     with f4: eacc=st.text_input("Account",value=r.get("bank_account","") or "")
                     st.markdown('<div class="fs">Education</div>',unsafe_allow_html=True)
                     ed1,ed2,ed3,ed4=st.columns(4)
@@ -1813,16 +2145,25 @@ with main_block:
                     with ed2: efld=st.text_input("Field",value=r.get("field_of_graduate","") or "")
                     with ed3: egry=st.text_input("Grad Year",value=r.get("graduation_year","") or "")
                     with ed4: eins=st.text_input("Institution",value=r.get("institution_name","") or "")
-                    st.markdown('<div class="fs">Employment & Division</div>',unsafe_allow_html=True)
+                    st.markdown('<div class="fs">Employment & Division — Position / Category</div>',unsafe_allow_html=True)
+                    em0a,em0b=st.columns(2)
+                    with em0a: ejob=st.text_input("Position (Job Title)",value=r.get("job_title","") or "",help="e.g. Cleaner, Guard, Waiter")
+                    with em0b:
+                        cat_opts=["A","B","C","D","Other"]
+                        cur_cat=r.get("category") or "A"
+                        ecat=st.selectbox("Category",cat_opts,index=cat_opts.index(cur_cat) if cur_cat in cat_opts else 0,help="Salary/skill grade used for Annex III payroll")
                     em1,em2b,em3=st.columns(3)
-                    with em1: ejob=st.text_input("Job Title",value=r.get("job_title","") or "")
+                    with em1: pass
                     with em2b:
                         et=["Permanent","Contract","Temporary","Part-Time"]
                         eety=st.selectbox("Type",et,index=et.index(r.get("employment_type","Permanent")) if r.get("employment_type") in et else 0)
                     with em3:
                         dlist2=get_division_list()
-                        edep=st.selectbox("Division",dlist2,index=dlist2.index(r.get("division","Catering")) if r.get("division") in dlist2 else 0)
-                    em_cc_list=get_cost_centers(edep)
+                        if dlist2:
+                            edep=st.selectbox("Division",dlist2,index=dlist2.index(r.get("division")) if r.get("division") in dlist2 else 0)
+                        else:
+                            st.warning("No divisions created yet."); edep=r.get("division")
+                    em_cc_list=get_cost_centers(edep) if edep else pd.DataFrame()
                     em_cc_opts=["Unassigned"]+em_cc_list['code'].tolist() if len(em_cc_list)>0 else ["Unassigned"]
                     em4,em5,em6=st.columns(3)
                     with em4:
@@ -1842,13 +2183,19 @@ with main_block:
                     enotes=st.text_area("Internal Notes",value=r.get("notes","") or "")
                     if st.form_submit_button("Save All Changes",use_container_width=True):
                         conn=get_conn()
-                        conn.execute("""UPDATE employees SET full_name=?,contact=?,email=?,sex=?,marital_status=?,nationality=?,religion=?,
-                            age=?,place_of_birth=?,blood_type=?,resident_id=?,house_address=?,woreda=?,subcity=?,kebele=?,
-                            emergency_contact_name=?,emergency_contact_phone=?,tin_number=?,pension_number=?,bank_name=?,bank_account=?,
-                            edu_background=?,field_of_graduate=?,graduation_year=?,institution_name=?,job_title=?,employment_type=?,
+                        conn.execute("""UPDATE employees SET full_name=?,contact=?,contact2=?,email=?,national_id_number=?,sex=?,marital_status=?,nationality=?,religion=?,
+                            age=?,place_of_birth=?,blood_type=?,resident_id=?,city=?,subcity=?,woreda=?,house_address=?,
+                            emergency_contact_name=?,emergency_contact_phone=?,emergency_contact_city=?,emergency_contact_subcity=?,emergency_contact_woreda=?,
+                            guarantor_name=?,guarantor_phone=?,guarantor_city=?,guarantor_subcity=?,guarantor_woreda=?,
+                            guarantor_company_id=?,guarantor_company_name=?,guarantor_letter_number=?,guarantor_date_written=?,
+                            tin_number=?,pension_number=?,bank_name=?,bank_account=?,
+                            edu_background=?,field_of_graduate=?,graduation_year=?,institution_name=?,job_title=?,category=?,employment_type=?,
                             division=?,cost_center=?,basic_salary=?,weekly_dayoff=?,start_date=?,contract_end_date=?,current_status=?,notes=? WHERE emp_id=?""",
-                            (en,ec,ee,esx,emar,enat,erel,eage,epob,ebt,eres,eha,ewo,esc2,eke,eecn,eecp,etin,epen2,ebnk,eacc,
-                             eedu,efld,egry,eins,ejob,eety,edep,None if eccsel=="Unassigned" else eccsel,esal,ewd,esd,ecd,est,enotes,eid2))
+                            (en,ec,ec2,ee,enatid,esx,emar,enat,erel,eage,epob,ebt,eres,ecity,esc2,ewo,eha,
+                             eecn,eecp,eeccity,eecsc,eecwo,
+                             egn,egp,egcity,egsc,egwo,egcid,egcname,egletter,egdate,
+                             etin,epen2,ebnk,eacc,
+                             eedu,efld,egry,eins,ejob,ecat,eety,edep,None if eccsel=="Unassigned" else eccsel,esal,ewd,esd,ecd,est,enotes,eid2))
                         conn.commit(); conn.close()
                         st.cache_data.clear()
                         st.success("Profile saved!"); st.rerun()
@@ -1992,6 +2339,7 @@ with main_block:
                 if len(leave_docs)>0:
                     st.markdown('<div style="font-size:12px;color:#F0C96B;margin-top:14px">Leave Attachments</div>',unsafe_allow_html=True)
                     st.dataframe(leave_docs[["doc_type","doc_name","notes","uploaded_at"]],use_container_width=True,hide_index=True)
+
 
     # ════════════════════════════════════════════════════════
     # SUPERVISOR CONSOLE
@@ -2374,6 +2722,7 @@ with main_block:
                         "hr_reviewed_by":"HR Manager","hr_comments":"HR Manager Comment"
                     }).drop(columns=["id"]),use_container_width=True,hide_index=True)
 
+
     # ════════════════════════════════════════════════════════
     # PAYROLL — with autonomous day-off date calculation
     # ════════════════════════════════════════════════════════
@@ -2385,14 +2734,25 @@ with main_block:
         if len(el)==0: st.warning("No active employees."); st.stop()
         pt1,pt2,pt3,pt4,pt5=st.tabs(["Process Payroll","History","Day-Off Calendar","Cost Center Sheet","Pension & Tax Reports"])
         with pt1:
-            ps1,ps2=st.columns(2)
-            with ps1:
-                eo2={f"{r['emp_id']} — {r['full_name']}":r['emp_id'] for _,r in el.iterrows()}
-                slbl=st.selectbox("Employee",list(eo2.keys()))
-                seid=eo2[slbl]
-            with ps2:
+            st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Follows the master hierarchy: Division → Cost Center → Employee → Position/Category. Pick the payroll month, narrow by Division and Cost Center, then select the employee. Only HR + Manager-approved attendance, leave and absence feed into the figures below.</div>',unsafe_allow_html=True)
+            ps0,ps1x,ps2x=st.columns(3)
+            with ps0:
                 yr=datetime.now().year
-                pay_month=st.selectbox("Month",[f"{yr}-{m:02d}" for m in range(1,13)]+[f"{yr+1}-{m:02d}" for m in range(1,4)],index=datetime.now().month-1)
+                pay_month=st.selectbox("Payroll Month",[f"{yr}-{m:02d}" for m in range(1,13)]+[f"{yr+1}-{m:02d}" for m in range(1,4)],index=datetime.now().month-1)
+            with ps1x:
+                pp_div=st.selectbox("Division",["All Divisions"]+get_division_list(),key="pp_div_filter")
+            with ps2x:
+                pp_cc_list=get_cost_centers(pp_div if pp_div!="All Divisions" else None)
+                pp_cc_opts=["All Cost Centers"]+(pp_cc_list['code'].tolist() if len(pp_cc_list)>0 else [])
+                pp_cc=st.selectbox("Cost Center",pp_cc_opts,key="pp_cc_filter")
+            el_scoped=el.copy()
+            if pp_div!="All Divisions": el_scoped=el_scoped[el_scoped['division']==pp_div]
+            if pp_cc!="All Cost Centers": el_scoped=el_scoped[el_scoped['cost_center']==pp_cc]
+            if len(el_scoped)==0:
+                st.warning("No active employees match this Division / Cost Center scope."); st.stop()
+            eo2={f"{r['emp_id']} — {r['full_name']}":r['emp_id'] for _,r in el_scoped.iterrows()}
+            slbl=st.selectbox("Employee",list(eo2.keys()))
+            seid=eo2[slbl]
             conn=get_conn()
             er=pg_read_sql("SELECT * FROM employees WHERE emp_id=?",conn,params=(seid,))
             fines_df=pg_read_sql("""SELECT id,emp_id,COALESCE(month,'—') as month,issue_date,
@@ -2400,10 +2760,22 @@ with main_block:
                 fine_days,fine_amount,letter_name,applied_to_payroll
                 FROM fine_letters WHERE emp_id=? AND applied_to_payroll='No'
                 AND COALESCE(record_status,'Active')='Active'""",conn,params=(seid,))
+            # Absences for this month — excluding Cancelled and Compensated records automatically
             ab_count=pg_read_sql("""SELECT COUNT(*) as c FROM absent_records
                 WHERE emp_id=? AND is_excused=0 AND substr(absent_date,1,7)=?
                 AND COALESCE(record_status,'Active')='Active'""",conn,params=(seid,pay_month)).iloc[0]['c']
+            # Leave days for this month — auto-collected from approved leave records, excluding Cancelled
+            leave_this_month=pg_read_sql("""SELECT leave_type, SUM(days_taken) as total_days FROM leave_records
+                WHERE emp_id=? AND status IN ('Approved') AND
+                ((substr(start_date,1,7)=?) OR (substr(end_date,1,7)=?))
+                GROUP BY leave_type""",conn,params=(seid,pay_month,pay_month))
             conn.close()
+            leave_lookup_auto = dict(zip(leave_this_month['leave_type'], leave_this_month['total_days'])) if len(leave_this_month)>0 else {}
+            auto_sick = int(leave_lookup_auto.get("Sick Leave",0))
+            auto_annual = int(leave_lookup_auto.get("Annual Leave",0))
+            auto_maternity = int(leave_lookup_auto.get("Maternity Leave",0))
+            auto_mourning = int(leave_lookup_auto.get("Mourning Leave",0))
+            auto_unpaid = int(leave_lookup_auto.get("Unpaid Leave",0))
             if len(er)==0: st.warning("Not found."); st.stop()
             er=er.iloc[0]; base=float(er.get("basic_salary",0) or 0)
             weekly_dayoff = er.get("weekly_dayoff") or "Sunday"
@@ -2411,23 +2783,15 @@ with main_block:
             holidays=get_holidays(pay_yr)
             month_hols=[d for d in holidays if d.month==pay_mo]
             hol_count=len(month_hols)
+
+            # ── AUTONOMOUS DAY-OFF CALCULATION ──
+            # System knows the employee's chosen weekday and automatically finds
+            # every matching calendar date in the selected month — no manual entry needed.
             dayoff_dates = get_dayoff_dates(weekly_dayoff, pay_yr, pay_mo)
             dayoff_count = len(dayoff_dates)
             absent_count=int(ab_count)
 
             st.markdown("<hr>",unsafe_allow_html=True)
-            st.markdown('<div class="fs">Category & Position (Annex III Cost Breakdown)</div>',unsafe_allow_html=True)
-            cat1,cat2=st.columns(2)
-            emp_job_title = er.get("job_title") or ""
-            suggested_cat = next((c for c,positions in CATEGORY_POSITIONS.items()
-                if any(p.lower() in emp_job_title.lower() or emp_job_title.lower() in p.lower() for p in positions)), "A")
-            with cat1:
-                cat_opts=list(CATEGORY_POSITIONS.keys())
-                sel_category=st.selectbox("Category",cat_opts,index=cat_opts.index(suggested_cat),
-                    format_func=lambda c: f"{c} — {', '.join(CATEGORY_POSITIONS[c])}")
-            with cat2:
-                position_title=st.text_input("Position Title",value=emp_job_title or CATEGORY_POSITIONS[sel_category][0])
-
             st.markdown('<div class="fs">Employee Weekly Day-Off Setting</div>',unsafe_allow_html=True)
             wd_disp_col,wd_edit_col=st.columns([2,1])
             with wd_disp_col:
@@ -2449,63 +2813,80 @@ with main_block:
                         st.success(f"Day-off changed to {new_wd}. System will recalculate dates automatically.")
                         st.rerun()
 
-            st.markdown('<div class="fs">Agency Cost Breakdown — Annex III</div>',unsafe_allow_html=True)
-            st.caption("Formulas verified against the signed Annex III document. Paid Leaves and Overhead/Profit Margin are business-set values you enter per employee — adjust anytime.")
-            ac1,ac2,ac3=st.columns(3)
-            with ac1: transport=st.number_input("Transport Allowance",min_value=0.0,value=500.0,step=50.0)
-            with ac2: meal_allow=st.number_input("Meal Allowance (30 birr × 26 days default)",min_value=0.0,value=780.0,step=10.0)
-            with ac3: medical_ins=st.number_input("Medical Insurance",min_value=0.0,value=150.0,step=10.0)
-            ac4,ac5,ac6=st.columns(3)
-            with ac4: paid_leaves_amt=st.number_input("Paid Leaves (ETB)",min_value=0.0,value=0.0,step=10.0)
-            with ac5: overhead_margin=st.number_input("Overhead & Profit Margin per person",min_value=0.0,value=0.0,step=10.0)
-            with ac6: st.markdown(f'<div style="background:#0D1526;border:1px solid rgba(212,168,71,0.2);border-radius:8px;padding:10px;margin-top:20px"><div style="color:#6B7FA3;font-size:9px">BASIC SALARY</div><div style="color:#F0C96B;font-size:17px;font-family:Cinzel,serif;font-weight:700">ETB {base:,.2f}</div></div>',unsafe_allow_html=True)
-
-            calc=calc_agency_payroll(base,transport,meal_allow,medical_ins,paid_leaves_amt,overhead_margin)
-            tax_override=st.number_input("Income Tax (auto-calculated — override here if your current PAYE bracket table differs)",
-                min_value=0.0,value=float(calc["income_tax"]),step=1.0,
-                help="Auto value uses this app's built-in Ethiopian PAYE brackets applied to the Taxable Amount below. Edit if your accountant's current table gives a different figure.")
-            if tax_override != calc["income_tax"]:
-                calc=calc_agency_payroll(base,transport,meal_allow,medical_ins,paid_leaves_amt,overhead_margin,income_tax_override=tax_override)
-
-            st.markdown('<div class="fs">Absence & Public Holidays (Auto-Detected, applied as extra deduction below)</div>',unsafe_allow_html=True)
+            st.markdown('<div class="fs">Allowances</div>',unsafe_allow_html=True)
+            al1,al2,al3,al4=st.columns(4)
+            with al1: transport=st.number_input("Transport Allowance",min_value=0.0,value=500.0,step=50.0)
+            with al2: housing=st.number_input("Housing Allowance",min_value=0.0,value=300.0,step=50.0)
+            with al3: other_al=st.number_input("Other Allowance",min_value=0.0,value=0.0,step=50.0)
+            with al4: st.markdown(f'<div style="background:#0D1526;border:1px solid rgba(212,168,71,0.2);border-radius:8px;padding:10px;margin-top:20px"><div style="color:#6B7FA3;font-size:9px">BASIC SALARY</div><div style="color:#F0C96B;font-size:17px;font-family:Cinzel,serif;font-weight:700">ETB {base:,.2f}</div></div>',unsafe_allow_html=True)
+            st.markdown('<div class="fs">Annex III — Client Billing Inputs</div>',unsafe_allow_html=True)
+            an1,an2,an3,an4=st.columns(4)
+            with an1: meal_al=st.number_input("Meal Allowance",min_value=0.0,value=float(get_setting("policy_meal_allowance","0")),step=50.0)
+            with an2: medical_ins=st.number_input("Medical Insurance",min_value=0.0,value=float(get_setting("policy_medical_insurance","0")),step=50.0)
+            with an3: overhead_profit=st.number_input("Overhead & Profit (ETB)",min_value=0.0,value=0.0,step=50.0,help="Enter the resolved ETB amount for this employee/contract, per the company's overhead & profit policy.")
+            with an4:
+                vat_pct=float(get_setting("policy_vat_percent","15"))
+                st.markdown(f'<div style="background:#0D1526;border:1px solid rgba(56,189,248,0.2);border-radius:8px;padding:10px;margin-top:20px"><div style="color:#6B7FA3;font-size:9px">VAT RATE</div><div style="color:#38BDF8;font-size:17px;font-family:Cinzel,serif;font-weight:700">{vat_pct:.1f}%</div></div>',unsafe_allow_html=True)
+            payment_method=st.selectbox("Payment Method",["Bank Transfer","Cash","Mobile Money"],key="pp_payment_method")
+            st.markdown('<div class="fs">Leave This Month — Auto-Collected from Leave Records (editable)</div>',unsafe_allow_html=True)
+            lv1,lv2,lv3,lv4,lv5=st.columns(5)
+            with lv1: sick_days=st.number_input("Sick Leave",min_value=0,max_value=30,value=auto_sick,step=1)
+            with lv2: annual_days=st.number_input("Annual Leave",min_value=0,max_value=30,value=auto_annual,step=1)
+            with lv3: mat_days=st.number_input("Maternity",min_value=0,max_value=90,value=auto_maternity,step=1)
+            with lv4: mourning_days=st.number_input("Mourning",min_value=0,max_value=5,value=auto_mourning,step=1)
+            with lv5: unpaid_days=st.number_input("Unpaid Leave",min_value=0,max_value=30,value=auto_unpaid,step=1)
+            st.markdown('<div class="fs">Absence & Public Holidays (Auto-Detected — Cancelled and Compensated days excluded)</div>',unsafe_allow_html=True)
             ab1,ab2,ab3=st.columns(3)
             with ab1: absent_input=st.number_input("Absent Days (unexcused, deducted)",min_value=0,max_value=30,value=absent_count,step=1)
             with ab2: st.markdown(f'<div style="background:#0D1526;border:1px solid rgba(56,189,248,0.2);border-radius:8px;padding:10px;margin-top:20px"><div style="color:#6B7FA3;font-size:9px">DAY-OFF ({weekly_dayoff}s) — AUTO</div><div style="color:#38BDF8;font-size:17px;font-family:Cinzel,serif;font-weight:700">{dayoff_count} days  Paid</div></div>',unsafe_allow_html=True)
-            with ab3: st.markdown(f'<div style="background:#0D1526;border:1px solid rgba(212,168,71,0.2);border-radius:8px;padding:10px;margin-top:20px"><div style="color:#6B7FA3;font-size:9px">PAID HOLIDAYS — AUTO</div><div style="color:#F0C96B;font-size:17px;font-family:Cinzel,serif;font-weight:700">{hol_count} days  Paid</div></div>',unsafe_allow_html=True)
+            with ab3: st.markdown(f'<div style="background:#0D1526;border:1px solid rgba(212,168,71,0.2);border-radius:8px;padding:10px;margin-top:20px"><div style="color:#6B7FA3;font-size:9px">PAID HOLIDAYS — AUTO</div><div style="color:#F0C96B;font-size:17px;font-family:Cinzel,serif;font-weight:700">{hol_count} days  Paid</div><div style="font-size:9px;color:#6B7FA3">{"  ".join([d.strftime("%b %d") for d in month_hols]) or "None this month"}</div></div>',unsafe_allow_html=True)
             total_fine_days=0; total_fine_amt=0.0; apply_all=False
             if len(fines_df)>0:
                 st.markdown('<div class="fs">Pending Fine Letters (Auto-Collected)</div>',unsafe_allow_html=True)
                 st.dataframe(fines_df[["id","month","issue_date","fine_reason","fine_type","fine_days","fine_amount","letter_name"]],use_container_width=True,hide_index=True)
-                apply_all=st.checkbox("Apply all pending fines to this payroll",value=True)
+                apply_all=st.checkbox("Apply all pending fines to this payroll (Cancelled and Compensated fines are excluded automatically)",value=True)
                 if apply_all:
                     total_fine_days=int(fines_df["fine_days"].sum()); total_fine_amt=float(fines_df["fine_amount"].sum())
+                    st.markdown(f'<div style="color:#FCA5A5;font-size:12px">Fine: <b>ETB {total_fine_amt:,.2f}</b> ({total_fine_days} days)</div>',unsafe_allow_html=True)
             else:
                 st.success("No pending fines.")
             other_ded=st.number_input("Other Deductions (ETB)",min_value=0.0,value=0.0,step=50.0)
             notes_pay=st.text_area("Payroll Notes",placeholder="Optional...")
-
-            daily_rate=round(base/26,2) if base else 0
-            extra_deductions=round(total_fine_amt+other_ded+(daily_rate*absent_input),2)
-            final_net=round(max(calc["net_pay"]-extra_deductions,0),2)
-
+            net,tax,pen_emp,pen_er,daily_rate,gross=calc_pay(base,transport,housing,other_al,total_fine_amt,unpaid_days,absent_input,other_ded)
             st.markdown(f"""<div class="ps">
-              <div style="font-family:'Cinzel',serif;font-size:12px;color:#D4A847;margin-bottom:10px;letter-spacing:.05em">AGENCY COST BREAKDOWN — {pay_month} — Category {sel_category}</div>
+              <div style="font-family:'Cinzel',serif;font-size:12px;color:#D4A847;margin-bottom:10px;letter-spacing:.05em">AUTO PAYROLL — {pay_month}</div>
+              <div class="pr"><span class="pl">Basic Salary</span><span class="pv">ETB {base:,.2f}</span></div>
+              <div class="pr"><span class="pl">Transport</span><span class="pv">ETB {transport:,.2f}</span></div>
+              <div class="pr"><span class="pl">Housing</span><span class="pv">ETB {housing:,.2f}</span></div>
+              <div class="pr"><span class="pl">Other Allow.</span><span class="pv">ETB {other_al:,.2f}</span></div>
+              <div class="pr"><span class="pl" style="font-weight:600">GROSS</span><span class="pv" style="color:#F0C96B;font-weight:600">ETB {gross:,.2f}</span></div>
+              <div class="pr"><span class="pl">Income Tax</span><span class="pd">- ETB {tax:,.2f}</span></div>
+              <div class="pr"><span class="pl">Pension Emp 7%</span><span class="pd">- ETB {pen_emp:,.2f}</span></div>
+              <div class="pr"><span class="pl">Pension Er 11%</span><span class="pv" style="color:#38BDF8">ETB {pen_er:,.2f} (company)</span></div>
+              <div class="pr"><span class="pl">Fines ({total_fine_days} days)</span><span class="pd">- ETB {total_fine_amt:,.2f}</span></div>
+              <div class="pr"><span class="pl">Unpaid Leave ({unpaid_days} × ETB {daily_rate:.2f})</span><span class="pd">- ETB {daily_rate*unpaid_days:,.2f}</span></div>
+              <div class="pr"><span class="pl">Absent ({absent_input} × ETB {daily_rate:.2f})</span><span class="pd">- ETB {daily_rate*absent_input:,.2f}</span></div>
+              <div class="pr"><span class="pl">Other Deductions</span><span class="pd">- ETB {other_ded:,.2f}</span></div>
+              <div class="pr"><span class="pl" style="color:#10B981">Paid Leave (Sick {sick_days}+Annual {annual_days}+Mat {mat_days}+Mourning {mourning_days})</span><span class="pv" style="color:#10B981"> Paid</span></div>
+              <div class="pr"><span class="pl" style="color:#10B981">Day-Off {dayoff_count} days ({weekly_dayoff}) + Holidays {hol_count}</span><span class="pv" style="color:#10B981"> Paid</span></div>
+              <div class="pr" style="border-top:1px solid rgba(16,185,129,0.3);margin-top:6px;padding-top:10px"><span class="pl" style="font-size:14px;font-weight:600;color:#E8EEF7">NET SALARY</span><span class="pn">ETB {net:,.2f}</span></div>
+            </div>""",unsafe_allow_html=True)
+
+            # ── Annex III — what the CLIENT is billed, separate from the employee's own NET SALARY above ──
+            paid_leave_value = round(daily_rate*(sick_days+annual_days+mat_days+mourning_days),2)
+            gross_earning,vat_amount,total_billed = calc_billing(base,transport,meal_al,medical_ins,pen_er,paid_leave_value,overhead_profit,vat_pct)
+            st.markdown(f"""<div class="ps" style="border-color:rgba(56,189,248,0.3);background:linear-gradient(135deg,#0D1526,#0A1A2A)">
+              <div style="font-family:'Cinzel',serif;font-size:12px;color:#38BDF8;margin-bottom:10px;letter-spacing:.05em">ANNEX III — CLIENT BILLING — {pay_month}</div>
               <div class="pr"><span class="pl">Basic Salary</span><span class="pv">ETB {base:,.2f}</span></div>
               <div class="pr"><span class="pl">Transport Allowance</span><span class="pv">ETB {transport:,.2f}</span></div>
-              <div class="pr"><span class="pl">Meal Allowance</span><span class="pv">ETB {meal_allow:,.2f}</span></div>
+              <div class="pr"><span class="pl">Meal Allowance</span><span class="pv">ETB {meal_al:,.2f}</span></div>
               <div class="pr"><span class="pl">Medical Insurance</span><span class="pv">ETB {medical_ins:,.2f}</span></div>
-              <div class="pr"><span class="pl">Pension Contribution by Company (11%)</span><span class="pv" style="color:#38BDF8">ETB {calc['company_pension']:,.2f}</span></div>
-              <div class="pr"><span class="pl">Paid Leaves</span><span class="pv">ETB {paid_leaves_amt:,.2f}</span></div>
-              <div class="pr"><span class="pl">Overhead & Profit Margin</span><span class="pv">ETB {overhead_margin:,.2f}</span></div>
-              <div class="pr" style="border-top:1px solid rgba(212,168,71,0.2);margin-top:4px;padding-top:8px"><span class="pl" style="font-weight:600">GROSS EARNING</span><span class="pv" style="color:#F0C96B;font-weight:600">ETB {calc['gross_earning']:,.2f}</span></div>
-              <div class="pr"><span class="pl">VAT (15%)</span><span class="pv">ETB {calc['vat']:,.2f}</span></div>
-              <div class="pr" style="border-top:1px solid rgba(212,168,71,0.2);margin-top:4px;padding-top:8px"><span class="pl" style="font-weight:600">TOTAL PAID PER MM (billed to client)</span><span class="pv" style="color:#F0C96B;font-weight:600">ETB {calc['total_paid_per_mm']:,.2f}</span></div>
-              <div class="pr" style="margin-top:10px"><span class="pl">Taxable Amount</span><span class="pv">ETB {calc['taxable_amount']:,.2f}</span></div>
-              <div class="pr"><span class="pl">Income Tax</span><span class="pd">- ETB {calc['income_tax']:,.2f}</span></div>
-              <div class="pr"><span class="pl">Pension by the Employee (7%)</span><span class="pd">- ETB {calc['employee_pension']:,.2f}</span></div>
-              <div class="pr" style="border-top:1px solid rgba(16,185,129,0.3);margin-top:6px;padding-top:10px"><span class="pl" style="font-size:13px;font-weight:600;color:#E8EEF7">NET PAY (per Annex III)</span><span class="pn">ETB {calc['net_pay']:,.2f}</span></div>
-              <div class="pr" style="margin-top:8px"><span class="pl">Fines / Absences / Other Deductions</span><span class="pd">- ETB {extra_deductions:,.2f}</span></div>
-              <div class="pr" style="border-top:1px solid rgba(16,185,129,0.3);margin-top:6px;padding-top:10px"><span class="pl" style="font-size:14px;font-weight:600;color:#E8EEF7">FINAL NET PAY</span><span class="pn">ETB {final_net:,.2f}</span></div>
+              <div class="pr"><span class="pl">Employer Pension (11%)</span><span class="pv">ETB {pen_er:,.2f}</span></div>
+              <div class="pr"><span class="pl">Paid Leave</span><span class="pv">ETB {paid_leave_value:,.2f}</span></div>
+              <div class="pr"><span class="pl">Overhead and Profit</span><span class="pv">ETB {overhead_profit:,.2f}</span></div>
+              <div class="pr" style="border-top:1px solid rgba(56,189,248,0.3);margin-top:4px;padding-top:8px"><span class="pl" style="font-weight:600">GROSS EARNING</span><span class="pv" style="color:#38BDF8;font-weight:600">ETB {gross_earning:,.2f}</span></div>
+              <div class="pr"><span class="pl">VAT ({vat_pct:.1f}%)</span><span class="pv">ETB {vat_amount:,.2f}</span></div>
+              <div class="pr" style="border-top:1px solid rgba(56,189,248,0.3);margin-top:6px;padding-top:10px"><span class="pl" style="font-size:14px;font-weight:600;color:#E8EEF7">TOTAL PAID PER MONTH</span><span class="pn" style="color:#7DD3FC">ETB {total_billed:,.2f}</span></div>
             </div>""",unsafe_allow_html=True)
             st.write("")
             sc1,sc2=st.columns(2)
@@ -2518,32 +2899,33 @@ with main_block:
                         conn.close()
                         st.error(f"Payroll for {seid} — {pay_month} has already been processed. The system blocks duplicate payroll entries automatically. Check Payroll History to review or correct the existing record.")
                     else:
-                        conn.execute("""INSERT INTO payroll(emp_id,month,basic_salary,transport_allowance,
-                            income_tax,pension_employee,pension_employer,other_deductions,fine_amount,fine_days,
+                        conn.execute("""INSERT INTO payroll(emp_id,month,basic_salary,transport_allowance,housing_allowance,
+                            other_allowance,income_tax,pension_employee,pension_employer,other_deductions,fine_amount,fine_days,
+                            sick_leave_days,annual_leave_days,maternity_leave_days,mourning_leave_days,unpaid_leave_days,
                             absent_days,holiday_days,dayoff_days,gross_salary,net_salary,payment_status,notes,created_at,
-                            full_name,division,cost_center,category,position_title,meal_allowance,medical_insurance,
-                            paid_leaves_amount,overhead_profit_margin,vat_amount,total_paid_per_mm,taxable_amount)
-                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Processed',?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (seid,pay_month,base,transport,calc['income_tax'],calc['employee_pension'],calc['company_pension'],
-                             extra_deductions,total_fine_amt,total_fine_days,absent_input,hol_count,dayoff_count,
-                             calc['gross_earning'],final_net,notes_pay,datetime.now().strftime("%Y-%m-%d"),
-                             er['full_name'],er['division'],er['cost_center'],sel_category,position_title,meal_allow,
-                             medical_ins,paid_leaves_amt,overhead_margin,calc['vat'],calc['total_paid_per_mm'],calc['taxable_amount']))
+                            full_name,division,cost_center,meal_allowance,medical_insurance,paid_leave_value,
+                            overhead_profit,vat_amount,total_billed_amount,payment_method,category,gm_approval_status)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Processed',?,?,?,?,?,?,?,?,?,?,?,?,?,'Not Submitted')""",
+                            (seid,pay_month,base,transport,housing,other_al,tax,pen_emp,pen_er,other_ded,
+                             total_fine_amt,total_fine_days,sick_days,annual_days,mat_days,mourning_days,
+                             unpaid_days,absent_input,hol_count,dayoff_count,gross,net,notes_pay,datetime.now().strftime("%Y-%m-%d"),
+                             er['full_name'],er['division'],er['cost_center'],meal_al,medical_ins,paid_leave_value,
+                             overhead_profit,vat_amount,total_billed,payment_method,er.get('category')))
                         if apply_all and len(fines_df)>0:
                             ids=tuple(fines_df["id"].tolist())
                             if len(ids)==1: conn.execute("UPDATE fine_letters SET applied_to_payroll='Yes' WHERE id=?",(ids[0],))
                             else: conn.execute(f"UPDATE fine_letters SET applied_to_payroll='Yes' WHERE id IN {ids}")
                         conn.commit(); conn.close()
-                        st.success(f"Payroll saved — Final Net Pay: ETB {final_net:,.2f}"); st.balloons()
+                        st.success(f"Payroll saved — Net: ETB {net:,.2f}"); st.balloons()
             with sc2:
                 er_dict=er.to_dict()
-                pay_row={"month":pay_month,"basic_salary":base,"transport_allowance":transport,"meal_allowance":meal_allow,
-                    "medical_insurance":medical_ins,"gross_salary":calc['gross_earning'],"income_tax":calc['income_tax'],
-                    "pension_employee":calc['employee_pension'],"pension_employer":calc['company_pension'],
-                    "vat_amount":calc['vat'],"total_paid_per_mm":calc['total_paid_per_mm'],"taxable_amount":calc['taxable_amount'],
-                    "fine_days":total_fine_days,"fine_amount":total_fine_amt,"absent_days":absent_input,
+                pay_row={"month":pay_month,"basic_salary":base,"transport_allowance":transport,"housing_allowance":housing,
+                    "other_allowance":other_al,"gross_salary":gross,"income_tax":tax,"pension_employee":pen_emp,
+                    "pension_employer":pen_er,"fine_days":total_fine_days,"fine_amount":total_fine_amt,
+                    "unpaid_leave_days":unpaid_days,"absent_days":absent_input,"sick_leave_days":sick_days,
+                    "annual_leave_days":annual_days,"maternity_leave_days":mat_days,"mourning_leave_days":mourning_days,
                     "holiday_days":hol_count,"dayoff_days":dayoff_count,"dayoff_weekday":weekly_dayoff,
-                    "other_deductions":other_ded,"net_salary":final_net,"category":sel_category,"position_title":position_title}
+                    "other_deductions":other_ded,"net_salary":net}
                 html_slip=print_slip(er_dict,pay_row)
                 b64_slip=base64.b64encode(html_slip.encode()).decode()
                 st.markdown(f'<a href="data:text/html;base64,{b64_slip}" download="Payroll_{seid}_{pay_month}.html" target="_blank"><button style="width:100%;background:linear-gradient(135deg,#7B2FBE,#9333EA);color:#fff;border:none;border-radius:8px;padding:10px;font-weight:600;font-size:12px;cursor:pointer"> Print / Download Payroll Statement</button></a>',unsafe_allow_html=True)
@@ -3095,7 +3477,7 @@ with main_block:
           <div class="mb mg-red"><div class="ml ml-red">Rejected</div><div class="mv">{len(rejected)}</div></div>
         </div>""",unsafe_allow_html=True)
 
-        pa1,pa2,pa3,pa4=st.tabs(["Pending Review","Approved History","Rejected History","Bulk Payroll Runs"])
+        pa1,pa2,pa3,pa4=st.tabs(["Pending Review","Approved History","Rejected History","General Manager Final Approval"])
 
         with pa1:
             if len(pending)==0:
@@ -3168,34 +3550,58 @@ with main_block:
                 st.dataframe(rejected[['cost_center','division','month','submitted_by','reviewed_by','reviewed_at','review_notes']],use_container_width=True,hide_index=True)
 
         with pa4:
-            st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">Bulk payroll runs from Payroll → Cost Center Sheet wait here for approval before they count as final. Only Manager or Payroll Section can approve.</div>',unsafe_allow_html=True)
-            if st.session_state.role not in ("Manager","Payroll Section"):
-                st.info("Only Manager or Payroll Section can review bulk payroll runs.")
+            st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">Final step of the payroll pipeline: the Payroll Officer prepares payroll by Division (via Cost Center Sheet), submits it here, and the <b style="color:#F0C96B">General Manager</b> gives final approval before payment is released. Only the Manager (General Manager) can approve or reject here — this is the last checkpoint before payslips and reports go out.</div>',unsafe_allow_html=True)
+            if st.session_state.role != "Manager":
+                st.info("Only the General Manager (Manager role) can give final payroll approval here.")
             else:
                 conn=get_conn()
                 bulk_pending=pg_read_sql("""SELECT id,emp_id,full_name,division,cost_center,month,basic_salary,
-                    gross_salary,net_salary,income_tax,pension_employee,created_at
-                    FROM payroll WHERE payment_status='Pending Approval' ORDER BY cost_center,month,created_at""",conn)
+                    gross_salary,net_salary,income_tax,pension_employee,
+                    COALESCE(total_billed_amount,0) as total_billed_amount,
+                    COALESCE(payment_method,'Bank Transfer') as payment_method,created_at
+                    FROM payroll WHERE payment_status='Pending Approval' ORDER BY division,month,created_at""",conn)
                 conn.close()
                 if len(bulk_pending)==0:
-                    st.info("No bulk payroll runs waiting for approval.")
+                    st.info("No payroll runs waiting for General Manager approval.")
                 else:
-                    for (cc_grp,mo_grp),grp in bulk_pending.groupby(['cost_center','month']):
-                        with st.expander(f"{cc_grp} — {mo_grp} — {len(grp)} employee(s) — Net Total ETB {grp['net_salary'].sum():,.2f}"):
-                            st.dataframe(grp[['emp_id','full_name','division','basic_salary','gross_salary','income_tax','pension_employee','net_salary']],use_container_width=True,hide_index=True)
+                    for (div_grp,mo_grp),grp in bulk_pending.groupby(['division','month']):
+                        with st.expander(f"{div_grp} — {mo_grp} — {len(grp)} employee(s) across {grp['cost_center'].nunique()} cost center(s) — Net Total ETB {grp['net_salary'].sum():,.2f}"):
+                            st.dataframe(grp[['emp_id','full_name','cost_center','basic_salary','gross_salary','income_tax','pension_employee','net_salary','payment_method']],use_container_width=True,hide_index=True)
+                            total_billed_grp = grp['total_billed_amount'].sum()
+                            if total_billed_grp>0:
+                                st.markdown(f'<div style="font-size:12px;color:#38BDF8;margin:6px 0">Annex III Total Paid Per Month (client billing) for this batch: <b>ETB {total_billed_grp:,.2f}</b></div>',unsafe_allow_html=True)
                             bpc1,bpc2=st.columns(2)
                             with bpc1:
-                                if st.button(f"Approve All ({len(grp)})",key=f"appr_bulk_{cc_grp}_{mo_grp}",use_container_width=True):
+                                if st.button(f"Final Approve ({len(grp)})",key=f"appr_bulk_{div_grp}_{mo_grp}",use_container_width=True):
                                     conn=get_conn()
-                                    conn.execute("UPDATE payroll SET payment_status='Processed' WHERE cost_center=? AND month=? AND payment_status='Pending Approval'",(cc_grp,mo_grp))
+                                    conn.execute("""UPDATE payroll SET payment_status='Final Payroll',gm_approval_status='Approved'
+                                        WHERE division=? AND month=? AND payment_status='Pending Approval'""",(div_grp,mo_grp))
                                     conn.commit(); conn.close()
-                                    st.success(f"Approved payroll for {cc_grp} — {mo_grp}. Now final in payroll history and each employee's profile."); st.rerun()
+                                    st.success(f"Final payroll approved for {div_grp} — {mo_grp}. Ready for payment, payslips and reports."); st.rerun()
                             with bpc2:
-                                if st.button(f"Reject All ({len(grp)})",key=f"rej_bulk_{cc_grp}_{mo_grp}",use_container_width=True):
+                                if st.button(f"Reject All ({len(grp)})",key=f"rej_bulk_{div_grp}_{mo_grp}",use_container_width=True):
                                     conn=get_conn()
-                                    conn.execute("DELETE FROM payroll WHERE cost_center=? AND month=? AND payment_status='Pending Approval'",(cc_grp,mo_grp))
+                                    conn.execute("""UPDATE payroll SET payment_status='Rejected by GM',gm_approval_status='Rejected'
+                                        WHERE division=? AND month=? AND payment_status='Pending Approval'""",(div_grp,mo_grp))
                                     conn.commit(); conn.close()
-                                    st.warning(f"Rejected and removed payroll run for {cc_grp} — {mo_grp}. It can be regenerated from Cost Center Sheet."); st.rerun()
+                                    st.warning(f"Rejected payroll run for {div_grp} — {mo_grp}. It can be corrected and regenerated from Cost Center Sheet."); st.rerun()
+
+                st.markdown("<hr>",unsafe_allow_html=True)
+                st.markdown('<div class="fs">Final Payroll — Approved by General Manager (Ready for Payment)</div>',unsafe_allow_html=True)
+                conn=get_conn()
+                final_payroll=pg_read_sql("""SELECT emp_id,full_name,division,cost_center,month,net_salary,
+                    COALESCE(payment_method,'Bank Transfer') as payment_method,
+                    COALESCE(total_billed_amount,0) as total_billed_amount,created_at
+                    FROM payroll WHERE payment_status='Final Payroll' ORDER BY month DESC,division LIMIT 500""",conn)
+                conn.close()
+                if len(final_payroll)==0:
+                    st.info("No finalized payroll yet.")
+                else:
+                    st.dataframe(final_payroll,use_container_width=True,hide_index=True)
+                    fp_buf=io.BytesIO()
+                    with pd.ExcelWriter(fp_buf,engine="xlsxwriter") as w: final_payroll.to_excel(w,index=False,sheet_name="Final_Payroll")
+                    st.download_button("Export Final Payroll Report",fp_buf.getvalue(),file_name=f"Final_Payroll_Report_{datetime.now().strftime('%Y%m%d')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+
 
     # ════════════════════════════════════════════════════════
     # LEAVE & DISCIPLINE
@@ -3605,6 +4011,7 @@ with main_block:
                                     conn.commit(); conn.close()
                                     st.warning("Fine rejected."); st.rerun()
 
+
     # ════════════════════════════════════════════════════════
     # LEAVE RECORDS — reporting view: who is absent/on leave, by date range
     # ════════════════════════════════════════════════════════
@@ -3797,6 +4204,7 @@ with main_block:
                                     conn.commit(); conn.close()
                                     st.warning("Vacation request rejected."); st.rerun()
 
+
     # ════════════════════════════════════════════════════════
     # HR REVIEW — Step 1: HR Staff reviews Supervisor submissions
     # ════════════════════════════════════════════════════════
@@ -3898,7 +4306,9 @@ with main_block:
     # HR MANAGER APPROVAL — Step 2 (final): Manager gives final sign-off
     # ════════════════════════════════════════════════════════
     elif V=="HR Manager Approval":
+        st.markdown('<div class="ey">Manager Review — Final HR Sign-Off</div>',unsafe_allow_html=True)
         st.markdown('<div class="tl">HR Manager Approval</div>',unsafe_allow_html=True)
+        st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:10px">Third step of the pipeline: Supervisor records attendance/leave → HR reviews → <b style="color:#F0C96B">Manager reviews and approves here</b> → the record becomes automatically available to the Payroll Officer in the Payroll module.</div>',unsafe_allow_html=True)
         if st.session_state.role not in ("Manager",):
             st.info("Only the Manager (acting as HR Manager) can give final approval here.")
         else:
@@ -4003,12 +4413,13 @@ with main_block:
                     with pd.ExcelWriter(hr_hist_buf,engine="xlsxwriter") as w: hr_hist.to_excel(w,index=False,sheet_name="HR_Validation_History")
                     st.download_button("Export History",hr_hist_buf.getvalue(),file_name=f"HR_Validation_History_{hr_hist_from}_to_{hr_hist_to}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+
     # ════════════════════════════════════════════════════════
     # DEMOTION & STATUS MANAGEMENT
-    # HR Staff (or Manager) submits a grade/title/salary change.
-    # Manager gives final sign-off; approval marks Finance as
-    # notified and applies the new title/salary to the employee
-    # record so the next payroll run picks it up automatically.
+    # HR submits a grade/title/salary change request; Manager gives
+    # final sign-off; approval marks Finance as notified and applies
+    # the new title/salary to the employee record so the next payroll
+    # run picks it up automatically.
     # ════════════════════════════════════════════════════════
     elif V=="Demotion":
         st.markdown('<div class="ey">HR Lifecycle</div>',unsafe_allow_html=True)
@@ -4209,87 +4620,181 @@ with main_block:
         with pd.ExcelWriter(hbuf2,engine="xlsxwriter") as w: hdf.to_excel(w,index=False,sheet_name="Holidays")
         st.download_button("Export Holiday Calendar",hbuf2.getvalue(),file_name=f"Holidays_{yr}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+
     # ════════════════════════════════════════════════════════
-    # COST CENTERS — manually created per division
+    # COST CENTERS & DIVISIONS — Organizational Structure
+    # Divisions are no longer hardcoded — a Manager creates them here
+    # first (same manual-creation pattern as Cost Centers), and every
+    # division dropdown across the system reads from this list.
     # ════════════════════════════════════════════════════════
     elif V=="Cost Centers":
-        st.markdown('<div class="ey">Financial Structure</div>',unsafe_allow_html=True)
-        st.markdown('<div class="tl">Division Cost Centers</div>',unsafe_allow_html=True)
+        st.markdown('<div class="ey">Financial & Organizational Structure</div>',unsafe_allow_html=True)
+        st.markdown('<div class="tl">Divisions & Cost Centers</div>',unsafe_allow_html=True)
+
+        oc1,oc2=st.columns(2)
+        with oc1: total_div_count=len(get_division_list())
         conn=get_conn()
-        cc_all=pg_read_sql("SELECT * FROM cost_centers ORDER BY division,code",conn); conn.close()
-        st.markdown(f'<div class="card"><span style="color:#D4A847;font-weight:600"> Total Cost Centers:</span> <b style="color:#E8EEF7">{len(cc_all)}</b></div>',unsafe_allow_html=True)
-        if len(cc_all)>0:
-            for div in cc_all['division'].unique():
-                div_ccs=cc_all[cc_all['division']==div]
-                st.markdown(f'<div class="fs">{div} Division</div>',unsafe_allow_html=True)
-                for _,ccr in div_ccs.iterrows():
-                    status_label="Active" if ccr['is_active']==1 else "Inactive"
+        cc_all=pg_read_sql("SELECT * FROM cost_centers ORDER BY division,code",conn)
+        div_all=pg_read_sql("SELECT * FROM divisions ORDER BY name",conn)
+        conn.close()
+        st.markdown(f"""<div class="mg" style="grid-template-columns:repeat(2,1fr)">
+          <div class="mb mg-teal"><div class="ml ml-teal">Divisions</div><div class="mv">{total_div_count}</div></div>
+          <div class="mb mg-gold"><div class="ml ml-gold">Cost Centers</div><div class="mv">{len(cc_all)}</div></div>
+        </div>""",unsafe_allow_html=True)
+
+        cc_div_tab, cc_cc_tab = st.tabs(["Divisions","Cost Centers"])
+
+        # ── DIVISIONS TAB ──
+        with cc_div_tab:
+            st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">Divisions are created manually here — there is no built-in default list. Every division dropdown in the system (Applicant Intake, Employee Directory, Employee Profile, Payroll, Supervisor assignment) reads from this list.</div>',unsafe_allow_html=True)
+            if len(div_all)>0:
+                for _,dv in div_all.iterrows():
+                    status_label="Active" if dv['is_active']==1 else "Inactive"
                     st.markdown(f"""<div class="card" style="padding:12px 16px;margin-bottom:8px">
                       <div style="display:flex;justify-content:space-between;align-items:center">
                         <div>
-                          <span style="font-family:'Cinzel',serif;color:#F0C96B;font-weight:700;font-size:14px">{ccr['code']}</span>
-                          <span style="color:#94A8C8;font-size:12px;margin-left:8px">{ccr['name']}</span>
+                          <span style="font-family:'Cinzel',serif;color:#F0C96B;font-weight:700;font-size:14px">{dv['name']}</span>
+                          <span style="color:#94A8C8;font-size:12px;margin-left:8px">{dv['description'] or ''}</span>
                         </div>
-                        <div style="text-align:right">
-                          <div style="color:#10B981;font-size:13px;font-weight:600">ETB {ccr['budget']:,.2f}</div>
-                          <div style="font-size:10px;color:#6B7FA3">{status_label}</div>
-                        </div>
+                        <div style="text-align:right"><div style="font-size:10px;color:#6B7FA3">{status_label}</div></div>
                       </div>
                     </div>""",unsafe_allow_html=True)
-        st.markdown("<hr>",unsafe_allow_html=True)
-        if st.session_state.role=="Manager":
-            t1,t2=st.tabs(["Create Cost Center","Manage Cost Centers"])
-            with t1:
-                with st.form("cc_form"):
-                    c1,c2=st.columns(2)
-                    with c1: cc_code=st.text_input("Cost Center Code *",placeholder="e.g. CC-CAT-03")
-                    with c2: cc_division=st.selectbox("Division *",get_division_list())
-                    cc_name=st.text_input("Cost Center Name *",placeholder="e.g. Catering Operations Phase 2")
-                    c3,c4=st.columns(2)
-                    with c3: cc_budget=st.number_input("Annual Budget (ETB)",min_value=0.0,step=10000.0)
-                    with c4: cc_active=st.selectbox("Status",["Active","Inactive"])
-                    cc_desc=st.text_area("Description",placeholder="Purpose of this cost center...")
-                    if st.form_submit_button("Create Cost Center",use_container_width=True):
-                        if not(cc_code and cc_name): st.error("Code and Name required.")
-                        else:
-                            conn=get_conn()
-                            try:
-                                conn.execute("INSERT INTO cost_centers(code,name,division,budget,description,is_active,created_by,created_at)VALUES(?,?,?,?,?,?,?,?)",
-                                    (cc_code,cc_name,cc_division,cc_budget,cc_desc,1 if cc_active=="Active" else 0,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-                                conn.commit()
-                                get_cost_centers.clear()
-                                st.success(f"Cost center {cc_code} created for {cc_division} division.")
-                            except sqlite3.IntegrityError:
-                                st.error(f"Code '{cc_code}' already exists.")
-                            finally: conn.close()
-            with t2:
-                if len(cc_all)>0:
-                    cc_opts={f"{r['code']} — {r['name']} ({r['division']})":r['code'] for _,r in cc_all.iterrows()}
-                    sel_cc=st.selectbox("Select Cost Center",list(cc_opts.keys()))
-                    sel_code=cc_opts[sel_cc]
-                    mc1,mc2,mc3=st.columns(3)
-                    with mc1:
-                        if st.button("Activate",use_container_width=True):
-                            conn=get_conn(); conn.execute("UPDATE cost_centers SET is_active=1 WHERE code=?",(sel_code,)); conn.commit(); conn.close()
-                            get_cost_centers.clear(); st.success("Activated."); st.rerun()
-                    with mc2:
-                        if st.button("Deactivate",use_container_width=True):
-                            conn=get_conn(); conn.execute("UPDATE cost_centers SET is_active=0 WHERE code=?",(sel_code,)); conn.commit(); conn.close()
-                            get_cost_centers.clear(); st.warning("Deactivated."); st.rerun()
-                    with mc3:
-                        if st.button("Delete",use_container_width=True):
-                            conn=get_conn(); cur=conn.cursor()
-                            cur.execute("SELECT * FROM cost_centers WHERE code=?",(sel_code,))
-                            cc_cols=[d[0] for d in cur.description]; cc_row=cur.fetchone()
-                            cc_dict=dict(zip(cc_cols,cc_row)) if cc_row else {}
-                            conn.execute("DELETE FROM cost_centers WHERE code=?",(sel_code,)); conn.commit(); conn.close()
-                            soft_delete("Cost Center", sel_code, f"{sel_code} — {cc_dict.get('name','')}", cc_dict, st.session_state.uid)
-                            get_cost_centers.clear(); st.error("Moved to Recycle Bin."); st.rerun()
-                else:
-                    st.info("No cost centers yet. Create one in the first tab.")
-        cc_buf=io.BytesIO()
-        with pd.ExcelWriter(cc_buf,engine="xlsxwriter") as w: cc_all.to_excel(w,index=False,sheet_name="CostCenters")
-        st.download_button("Export Cost Center List",cc_buf.getvalue(),file_name=f"CostCenters_{datetime.now().strftime('%Y%m%d')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            else:
+                st.info("No divisions created yet — add the first one below.")
+
+            legacy_only=[d for d in get_division_list() if d not in div_all['name'].tolist()] if len(div_all)>0 else get_division_list()
+            if legacy_only:
+                st.markdown(f'<div style="font-size:11px;color:#F59E0B;margin:8px 0">Legacy division name(s) found on existing employee records but not yet registered here: <b>{", ".join(legacy_only)}</b>. They still work in dropdowns, but consider adding them below to keep everything in one place.</div>',unsafe_allow_html=True)
+
+            if st.session_state.role=="Manager":
+                dt1,dt2=st.tabs(["Create Division","Manage Divisions"])
+                with dt1:
+                    with st.form("division_form"):
+                        dv_name=st.text_input("Division Name *",placeholder="e.g. Catering")
+                        dv_desc=st.text_area("Description",placeholder="What this division covers...")
+                        dv_active=st.selectbox("Status",["Active","Inactive"])
+                        if st.form_submit_button("Create Division",use_container_width=True):
+                            if not dv_name: st.error("Division name required.")
+                            else:
+                                conn=get_conn()
+                                try:
+                                    conn.execute("INSERT INTO divisions(name,description,is_active,created_by,created_at)VALUES(?,?,?,?,?)",
+                                        (dv_name.strip(),dv_desc,1 if dv_active=="Active" else 0,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                                    conn.commit()
+                                    get_division_list.clear()
+                                    st.success(f"Division '{dv_name}' created.")
+                                except sqlite3.IntegrityError:
+                                    st.error(f"Division '{dv_name}' already exists.")
+                                finally: conn.close()
+                with dt2:
+                    if len(div_all)>0:
+                        dv_opts={f"{r['name']}":r['name'] for _,r in div_all.iterrows()}
+                        sel_dv=st.selectbox("Select Division",list(dv_opts.keys()))
+                        dvc1,dvc2,dvc3=st.columns(3)
+                        with dvc1:
+                            if st.button("Activate",use_container_width=True,key="div_activate"):
+                                conn=get_conn(); conn.execute("UPDATE divisions SET is_active=1 WHERE name=?",(sel_dv,)); conn.commit(); conn.close()
+                                get_division_list.clear(); st.success("Activated."); st.rerun()
+                        with dvc2:
+                            if st.button("Deactivate",use_container_width=True,key="div_deactivate"):
+                                conn=get_conn(); conn.execute("UPDATE divisions SET is_active=0 WHERE name=?",(sel_dv,)); conn.commit(); conn.close()
+                                get_division_list.clear(); st.warning("Deactivated."); st.rerun()
+                        with dvc3:
+                            if st.button("Delete",use_container_width=True,key="div_delete"):
+                                conn=get_conn(); cur=conn.cursor()
+                                cur.execute("SELECT * FROM divisions WHERE name=?",(sel_dv,))
+                                dv_cols=[d[0] for d in cur.description]; dv_row=cur.fetchone()
+                                dv_dict=dict(zip(dv_cols,dv_row)) if dv_row else {}
+                                conn.execute("DELETE FROM divisions WHERE name=?",(sel_dv,)); conn.commit(); conn.close()
+                                soft_delete("Division", sel_dv, f"Division — {sel_dv}", dv_dict, st.session_state.uid)
+                                get_division_list.clear(); st.error("Moved to Recycle Bin."); st.rerun()
+                    else:
+                        st.info("No divisions yet. Create one in the first tab.")
+            div_buf=io.BytesIO()
+            with pd.ExcelWriter(div_buf,engine="xlsxwriter") as w:
+                (div_all if len(div_all)>0 else pd.DataFrame(columns=["name","description","is_active"])).to_excel(w,index=False,sheet_name="Divisions")
+            st.download_button("Export Division List",div_buf.getvalue(),file_name=f"Divisions_{datetime.now().strftime('%Y%m%d')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        # ── COST CENTERS TAB (unchanged behavior, now nested here) ──
+        with cc_cc_tab:
+            st.markdown(f'<div class="card"><span style="color:#D4A847;font-weight:600"> Total Cost Centers:</span> <b style="color:#E8EEF7">{len(cc_all)}</b></div>',unsafe_allow_html=True)
+            if len(cc_all)>0:
+                for div in cc_all['division'].unique():
+                    div_ccs=cc_all[cc_all['division']==div]
+                    st.markdown(f'<div class="fs">{div} Division</div>',unsafe_allow_html=True)
+                    for _,ccr in div_ccs.iterrows():
+                        status_label="Active" if ccr['is_active']==1 else "Inactive"
+                        st.markdown(f"""<div class="card" style="padding:12px 16px;margin-bottom:8px">
+                          <div style="display:flex;justify-content:space-between;align-items:center">
+                            <div>
+                              <span style="font-family:'Cinzel',serif;color:#F0C96B;font-weight:700;font-size:14px">{ccr['code']}</span>
+                              <span style="color:#94A8C8;font-size:12px;margin-left:8px">{ccr['name']}</span>
+                            </div>
+                            <div style="text-align:right">
+                              <div style="color:#10B981;font-size:13px;font-weight:600">ETB {ccr['budget']:,.2f}</div>
+                              <div style="font-size:10px;color:#6B7FA3">{status_label}</div>
+                            </div>
+                          </div>
+                        </div>""",unsafe_allow_html=True)
+            st.markdown("<hr>",unsafe_allow_html=True)
+            if st.session_state.role=="Manager":
+                t1,t2=st.tabs(["Create Cost Center","Manage Cost Centers"])
+                with t1:
+                    div_list_for_cc=get_division_list()
+                    if not div_list_for_cc:
+                        st.warning("Create a Division first (Divisions tab above) — a cost center must belong to a division.")
+                    with st.form("cc_form"):
+                        c1,c2=st.columns(2)
+                        with c1: cc_code=st.text_input("Cost Center Code *",placeholder="e.g. CC-CAT-03")
+                        with c2: cc_division=st.selectbox("Division *",div_list_for_cc) if div_list_for_cc else None
+                        cc_name=st.text_input("Cost Center Name *",placeholder="e.g. Catering Operations Phase 2")
+                        c3,c4=st.columns(2)
+                        with c3: cc_budget=st.number_input("Annual Budget (ETB)",min_value=0.0,step=10000.0)
+                        with c4: cc_active=st.selectbox("Status",["Active","Inactive"])
+                        cc_desc=st.text_area("Description",placeholder="Purpose of this cost center...")
+                        if st.form_submit_button("Create Cost Center",use_container_width=True):
+                            if not(cc_code and cc_name): st.error("Code and Name required.")
+                            elif not cc_division: st.error("Create a division first.")
+                            else:
+                                conn=get_conn()
+                                try:
+                                    conn.execute("INSERT INTO cost_centers(code,name,division,budget,description,is_active,created_by,created_at)VALUES(?,?,?,?,?,?,?,?)",
+                                        (cc_code,cc_name,cc_division,cc_budget,cc_desc,1 if cc_active=="Active" else 0,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                                    conn.commit()
+                                    get_cost_centers.clear()
+                                    st.success(f"Cost center {cc_code} created for {cc_division} division.")
+                                except sqlite3.IntegrityError:
+                                    st.error(f"Code '{cc_code}' already exists.")
+                                finally: conn.close()
+                with t2:
+                    if len(cc_all)>0:
+                        cc_opts={f"{r['code']} — {r['name']} ({r['division']})":r['code'] for _,r in cc_all.iterrows()}
+                        sel_cc=st.selectbox("Select Cost Center",list(cc_opts.keys()))
+                        sel_code=cc_opts[sel_cc]
+                        mc1,mc2,mc3=st.columns(3)
+                        with mc1:
+                            if st.button("Activate",use_container_width=True):
+                                conn=get_conn(); conn.execute("UPDATE cost_centers SET is_active=1 WHERE code=?",(sel_code,)); conn.commit(); conn.close()
+                                get_cost_centers.clear(); st.success("Activated."); st.rerun()
+                        with mc2:
+                            if st.button("Deactivate",use_container_width=True):
+                                conn=get_conn(); conn.execute("UPDATE cost_centers SET is_active=0 WHERE code=?",(sel_code,)); conn.commit(); conn.close()
+                                get_cost_centers.clear(); st.warning("Deactivated."); st.rerun()
+                        with mc3:
+                            if st.button("Delete",use_container_width=True):
+                                conn=get_conn(); cur=conn.cursor()
+                                cur.execute("SELECT * FROM cost_centers WHERE code=?",(sel_code,))
+                                cc_cols=[d[0] for d in cur.description]; cc_row=cur.fetchone()
+                                cc_dict=dict(zip(cc_cols,cc_row)) if cc_row else {}
+                                conn.execute("DELETE FROM cost_centers WHERE code=?",(sel_code,)); conn.commit(); conn.close()
+                                soft_delete("Cost Center", sel_code, f"{sel_code} — {cc_dict.get('name','')}", cc_dict, st.session_state.uid)
+                                get_cost_centers.clear(); st.error("Moved to Recycle Bin."); st.rerun()
+                    else:
+                        st.info("No cost centers yet. Create one in the first tab.")
+            cc_buf=io.BytesIO()
+            with pd.ExcelWriter(cc_buf,engine="xlsxwriter") as w: cc_all.to_excel(w,index=False,sheet_name="CostCenters")
+            st.download_button("Export Cost Center List",cc_buf.getvalue(),file_name=f"CostCenters_{datetime.now().strftime('%Y%m%d')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 
     # ════════════════════════════════════════════════════════
     # RECYCLE BIN — restore accidentally deleted records
@@ -4299,8 +4804,8 @@ with main_block:
         st.markdown('<div class="tl">Recycle Bin</div>',unsafe_allow_html=True)
         st.markdown("""<div class="card card-gold">
           <div style="font-size:12px;color:#C8D8F0;line-height:1.7">
-            Deleted employees, cost centers, and user accounts are kept here before being
-            permanently erased. A Manager can restore any item or permanently purge it.
+            Deleted employees, divisions, cost centers, and user accounts are kept here before
+            being permanently erased. A Manager can restore any item or permanently purge it.
           </div></div>""",unsafe_allow_html=True)
 
         conn=get_conn()
@@ -4308,8 +4813,9 @@ with main_block:
         conn.close()
 
         type_counts = bin_items['record_type'].value_counts().to_dict() if len(bin_items)>0 else {}
-        st.markdown(f"""<div class="mg" style="grid-template-columns:repeat(3,1fr)">
+        st.markdown(f"""<div class="mg" style="grid-template-columns:repeat(4,1fr)">
           <div class="mb mg-amber"><div class="ml ml-amber">Deleted Employees</div><div class="mv">{type_counts.get("Employee",0)}</div></div>
+          <div class="mb mg-teal"><div class="ml ml-teal">Deleted Divisions</div><div class="mv">{type_counts.get("Division",0)}</div></div>
           <div class="mb mg-purple"><div class="ml ml-purple">Deleted Cost Centers</div><div class="mv">{type_counts.get("Cost Center",0)}</div></div>
           <div class="mb mg-cyan"><div class="ml ml-cyan">Deleted Users</div><div class="mv">{type_counts.get("User Account",0)}</div></div>
         </div>""",unsafe_allow_html=True)
@@ -4346,6 +4852,15 @@ with main_block:
                                     restored_ok=True
                                 except Exception as ex:
                                     st.error(f"Could not restore — a record with this ID may already exist. ({ex})")
+                            elif item['record_type']=="Division" and data_dict:
+                                try:
+                                    conn.execute("""INSERT INTO divisions(name,description,is_active,created_by,created_at)
+                                        VALUES(?,?,?,?,?)""",
+                                        (data_dict.get('name'),data_dict.get('description'),1,
+                                         data_dict.get('created_by'),data_dict.get('created_at')))
+                                    restored_ok=True
+                                except Exception as ex:
+                                    st.error(f"Could not restore — division name may already exist. ({ex})")
                             elif item['record_type']=="Cost Center" and data_dict:
                                 try:
                                     conn.execute("""INSERT INTO cost_centers(code,name,division,budget,description,is_active,created_by,created_at)
@@ -4361,7 +4876,7 @@ with main_block:
                             if restored_ok:
                                 conn.execute("UPDATE recycle_bin SET restored=1 WHERE id=?",(item['id'],))
                                 conn.commit()
-                                st.cache_data.clear(); get_employee.clear(); get_cost_centers.clear()
+                                st.cache_data.clear(); get_employee.clear(); get_cost_centers.clear(); get_division_list.clear()
                                 st.success("Restored successfully.")
                             conn.close()
                             st.rerun()
@@ -4380,6 +4895,7 @@ with main_block:
                 conn.commit(); conn.close()
                 st.warning("Recycle Bin emptied permanently.")
                 st.rerun()
+
 
     # ════════════════════════════════════════════════════════
     # ADMINISTRATION (Manager only)
@@ -4561,10 +5077,12 @@ with main_block:
                 with cu4: new_email=st.text_input("Email",placeholder="user@company.com")
                 with cu5: new_role=st.selectbox("Role *",["Supervisor","Payroll Section","Data Officer","HR Staff","Payroll Officer","Department Head","Manager"])
                 with cu6:
+                    div_list_admin=get_division_list()
                     if new_role=="Supervisor":
-                        dept_assign=st.selectbox("Assigned Division *",get_division_list())
+                        dept_assign=st.selectbox("Assigned Division *",div_list_admin) if div_list_admin else None
+                        if not div_list_admin: st.caption("Create a division first (Cost Centers → Divisions).")
                     else:
-                        dept_assign=st.selectbox("Division Scope",["All Divisions"]+get_division_list())
+                        dept_assign=st.selectbox("Division Scope",["All Divisions"]+div_list_admin)
                 PERM_DETAILS={"Manager":("full","Full access — all modules, admin, edit, delete, payroll","#D4A847"),
                     "Supervisor":("division_control","Controls attendance, leave and absence for one division. Submits monthly sheets for approval.","#06B6D4"),
                     "Payroll Section":("payroll_approve","Reviews and approves monthly submissions from supervisors. Releases salary payments.","#EAB308"),
@@ -4579,7 +5097,7 @@ with main_block:
                 </div>""",unsafe_allow_html=True)
 
                 st.markdown('<div class="fs" style="margin-top:14px">Navigation Access — Set Authority Per Module</div>',unsafe_allow_html=True)
-                st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Role Default uses the permission level above. Otherwise, override per module: View (read-only), Edit (change data, no delete), Both (view and edit), or Full Control (view, edit and delete). Click a cell in the Access Level column to change it.</div>',unsafe_allow_html=True)
+                st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Role Default uses the permission level above. Otherwise, override per module: View (read-only), Edit (change data, no delete), Both (view and edit), or Full Control (view, edit and delete). Click a cell in the Access Level column to change it. "Control Center" is reserved for the Manager role and is never shown to other roles even if granted here.</div>',unsafe_allow_html=True)
                 nav_matrix_df = pd.DataFrame({"Module":ALL_NAV_VIEWS,"Access Level":["Role Default"]*len(ALL_NAV_VIEWS)})
                 edited_nav_matrix = st.data_editor(
                     nav_matrix_df,
@@ -4592,6 +5110,8 @@ with main_block:
                     })
                 custom_nav_selection = {row["Module"]:row["Access Level"].lower().replace(" ","_")
                     for _,row in edited_nav_matrix.iterrows() if row["Access Level"]!="Role Default"}
+                if new_role!="Manager":
+                    custom_nav_selection.pop("Control Center",None)
 
                 if st.form_submit_button("Create User Account",use_container_width=True):
                     if not(new_uname and new_pw and new_fullname): st.error("Username, password and full name required.")
@@ -4654,7 +5174,7 @@ with main_block:
                         with ep2: e_confirmpw=st.text_input("Confirm Password",type="password")
 
                         st.markdown('<div class="fs" style="margin-top:14px">Navigation Access — Set Authority Per Module</div>',unsafe_allow_html=True)
-                        st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Role Default uses this user\'s role permission level. Otherwise, override per module: View (read-only), Edit (change data, no delete), Both (view and edit), or Full Control (view, edit and delete). Click a cell in the Access Level column to change it.</div>',unsafe_allow_html=True)
+                        st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Role Default uses this user\'s role permission level. Otherwise, override per module: View (read-only), Edit (change data, no delete), Both (view and edit), or Full Control (view, edit and delete). Click a cell in the Access Level column to change it. "Control Center" is reserved for the Manager role.</div>',unsafe_allow_html=True)
                         perm_levels_map = {"view":"View","edit":"Edit","both":"Both","full_control":"Full Control","delete":"Full Control"}
                         existing_levels = [perm_levels_map.get(existing_nav_access.get(ev),"Role Default") if existing_nav_access.get(ev) else "Role Default" for ev in ALL_NAV_VIEWS]
                         edit_nav_matrix_df = pd.DataFrame({"Module":ALL_NAV_VIEWS,"Access Level":existing_levels})
@@ -4674,6 +5194,7 @@ with main_block:
                             "Department Head":"dept_view","Manager":"full","Supervisor":"division_control","Payroll Section":"payroll_approve"}
                         new_perm2=perm_map.get(e_role,"view_only")
                         if st.form_submit_button("Save Changes",use_container_width=True):
+                            if e_role!="Manager": edit_nav_selection.pop("Control Center",None)
                             if e_newpw and e_newpw!=e_confirmpw: st.error("Passwords do not match.")
                             elif e_newpw and len(e_newpw)<6: st.error("Min 6 characters.")
                             elif e_role=="Supervisor" and e_division=="All Divisions": st.error("Supervisors must be assigned a specific division.")
