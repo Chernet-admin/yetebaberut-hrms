@@ -528,6 +528,30 @@ def init_db():
         created_by TEXT,created_at TEXT)""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_division_active ON divisions(is_active)")
 
+    # ── COMPANY SHARE MEMBERS (owners/partners — not login accounts) ──
+    c.execute("""CREATE TABLE IF NOT EXISTS share_members(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        full_name TEXT NOT NULL,
+        authority_title TEXT,
+        share_percentage REAL DEFAULT 0,
+        monthly_salary REAL DEFAULT 0,
+        contact TEXT,
+        is_active INTEGER DEFAULT 1,
+        created_by TEXT,created_at TEXT)""")
+
+    # ── STAFF ATTENDANCE (simple daily mark for back-office accounts —
+    # HR, Finance/Payroll, Supervisor, Manager/Admin — separate from the
+    # detailed employee attendance sheets, since these are login accounts
+    # not rows in the employees table). One row per username per date. ──
+    c.execute("""CREATE TABLE IF NOT EXISTS staff_attendance(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        attendance_date TEXT NOT NULL,
+        status TEXT DEFAULT 'Present',
+        marked_by TEXT,marked_at TEXT,
+        UNIQUE(username,attendance_date))""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_staffatt_user ON staff_attendance(username)")
+
     # ── SALARY CATEGORIES (Annex III master rate table) ──
     # One row per Category (A, B, C, D, E...). This is the single source
     # of truth for Basic Salary, Transport, Meal, Medical Insurance and
@@ -1576,117 +1600,106 @@ with main_block:
             st.warning("Control Center is restricted to the Manager role."); st.stop()
 
         st.markdown('<div class="ey">Owner Oversight</div>',unsafe_allow_html=True)
-        st.markdown('<div class="tl">Control Center — All Office Staff & Operations</div>',unsafe_allow_html=True)
+        st.markdown('<div class="tl">Control Center — Back-Office & Share Members</div>',unsafe_allow_html=True)
         st.markdown("""<div class="card card-gold">
           <div style="font-size:12px;color:#C8D8F0;line-height:1.7">
-            One place to see and steer every part of the company — HR, Finance/Payroll,
-            Supervisors, and Administration. Everything pending anyone's action shows up
-            here first; use the jump buttons to go straight to it.
+            Follow-up register for everyone who runs the company day-to-day — HR, Finance
+            (Payroll Officer), Supervisors, Admin/Manager — and the company's Share Members.
+            For each person: their Authority, monthly Salary, and today's Attendance.
           </div></div>""",unsafe_allow_html=True)
 
-        # ── Pull every cross-cutting pending count in one pass ──
+        today_str_cc = date.today().isoformat()
+
+        # ═══════════════════════════════════════════
+        # BACK-OFFICE STAFF — Authority, Salary, Attendance
+        # ═══════════════════════════════════════════
+        st.markdown('<div class="ey" style="margin-top:10px">Back-Office Staff</div>',unsafe_allow_html=True)
         conn=get_conn()
-        pending_payroll_sub=pg_read_sql("SELECT COUNT(*) as c FROM payroll_submissions WHERE status='Pending Approval'",conn).iloc[0]['c']
-        pending_payroll_bulk=pg_read_sql("SELECT COUNT(*) as c FROM payroll WHERE payment_status='Pending Approval'",conn).iloc[0]['c']
-        pending_hr_review=pg_read_sql("SELECT COUNT(*) as c FROM daily_status_records WHERE workflow_stage='Pending HR Review'",conn).iloc[0]['c']
-        pending_hr_manager=pg_read_sql("SELECT COUNT(*) as c FROM daily_status_records WHERE workflow_stage='Pending HR Manager Approval'",conn).iloc[0]['c']
-        pending_dept_leave=pg_read_sql("SELECT COUNT(*) as c FROM leave_records WHERE status='Pending Dept Head Approval'",conn).iloc[0]['c']
-        pending_dept_fines=pg_read_sql("SELECT COUNT(*) as c FROM fine_letters WHERE applied_to_payroll='Pending Dept Head Approval'",conn).iloc[0]['c']
-        pending_demotion=pg_read_sql("SELECT COUNT(*) as c FROM demotion_records WHERE status='Pending Manager Approval'",conn).iloc[0]['c']
-        pending_applicants=pg_read_sql("SELECT COUNT(*) as c FROM employees WHERE current_status='Pending Screening'",conn).iloc[0]['c']
-        total_pending_leave_related = pending_hr_review+pending_hr_manager+pending_dept_leave+pending_dept_fines
-        conn.close()
-
-        st.markdown('<div class="ey" style="margin-top:6px">Pending Across The Organization</div>',unsafe_allow_html=True)
-        st.markdown(f"""<div class="mg" style="grid-template-columns:repeat(6,1fr)">
-          <div class="mb mg-amber"><div class="ml ml-amber">Payroll Sheets</div><div class="mv">{pending_payroll_sub}</div></div>
-          <div class="mb mg-amber"><div class="ml ml-amber">Bulk Payroll Runs</div><div class="mv">{pending_payroll_bulk}</div></div>
-          <div class="mb mg-cyan"><div class="ml ml-cyan">HR Review</div><div class="mv">{pending_hr_review}</div></div>
-          <div class="mb mg-cyan"><div class="ml ml-cyan">HR Mgr Approval</div><div class="mv">{pending_hr_manager}</div></div>
-          <div class="mb mg-purple"><div class="ml ml-purple">Demotion/Status</div><div class="mv">{pending_demotion}</div></div>
-          <div class="mb mg-teal"><div class="ml ml-teal">New Applicants</div><div class="mv">{pending_applicants}</div></div>
-        </div>""",unsafe_allow_html=True)
-        if total_pending_leave_related>0 or pending_dept_leave>0 or pending_dept_fines>0:
-            st.markdown(f'<div style="font-size:11px;color:#6B7FA3;margin:-8px 0 12px">Older-workflow leftovers still awaiting Department Head sign-off: {pending_dept_leave} leave record(s), {pending_dept_fines} fine letter(s).</div>',unsafe_allow_html=True)
-
-        st.markdown("<hr>",unsafe_allow_html=True)
-        st.markdown('<div class="ey">Jump To</div>',unsafe_allow_html=True)
-        jc1,jc2,jc3,jc4,jc5,jc6=st.columns(6)
-        jump_map=[(jc1,"Payroll Approvals","💰 Payroll Approvals"),(jc2,"Payroll","🧾 Run Payroll"),
-            (jc3,"HR Review","📋 HR Review"),(jc4,"HR Manager Approval","✅ HR Mgr Approval"),
-            (jc5,"Vacation","🏖 Vacation"),(jc6,"Demotion","📊 Demotion/Status")]
-        for col,target_view,label in jump_map:
-            with col:
-                if st.button(label,use_container_width=True,key=f"cc_jump_{target_view}"):
-                    st.session_state.view=target_view; st.rerun()
-        jc7,jc8,jc9,jc10,jc11,jc12=st.columns(6)
-        jump_map2=[(jc7,"Leave & Discipline","📝 Leave & Discipline"),(jc8,"Leave Records","📆 Leave Records"),
-            (jc9,"Employee Directory","👥 Employee Directory"),(jc10,"Cost Centers","🏢 Divisions & Cost Centers"),
-            (jc11,"Recycle Bin","♻️ Recycle Bin"),(jc12,"Administration","⚙️ Administration / Users")]
-        for col,target_view,label in jump_map2:
-            with col:
-                if st.button(label,use_container_width=True,key=f"cc_jump_{target_view}"):
-                    st.session_state.view=target_view; st.rerun()
-
-        st.markdown("<hr>",unsafe_allow_html=True)
-        st.markdown('<div class="ey">Office Staff — By Role</div>',unsafe_allow_html=True)
-        st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Every login account in the system, grouped by role, with active/inactive status at a glance. Manage accounts in Administration.</div>',unsafe_allow_html=True)
-        conn=get_conn()
-        staff_df=pg_read_sql("""SELECT username,full_name,role,is_active,assigned_division,last_login
-            FROM system_users ORDER BY role,full_name""",conn)
-        conn.close()
-        if len(staff_df)==0:
-            st.info("No staff accounts yet.")
-        else:
-            role_order=["Manager","HR Staff","Payroll Section","Supervisor","Department Head","Data Officer"]
-            present_roles=[r for r in role_order if r in staff_df['role'].unique().tolist()]
-            present_roles += [r for r in staff_df['role'].unique().tolist() if r not in present_roles]
-            for role_name in present_roles:
-                grp=staff_df[staff_df['role']==role_name]
-                active_n=int((grp['is_active']==1).sum()); total_n=len(grp)
-                with st.expander(f"{role_name} — {total_n} account(s), {active_n} active",expanded=False):
-                    disp=grp.rename(columns={"username":"Username","full_name":"Full Name","role":"Role",
-                        "is_active":"Active","assigned_division":"Division","last_login":"Last Login"}).copy()
-                    disp["Active"]=disp["Active"].apply(lambda x: "Yes" if int(x)==1 else "No")
-                    st.dataframe(disp,use_container_width=True,hide_index=True)
-
-        st.markdown("<hr>",unsafe_allow_html=True)
-        st.markdown('<div class="ey">Back-Office Staff — Positions & Salary</div>',unsafe_allow_html=True)
-        st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">This is the control the Manager was missing: every back-office account — Admin, Manager, HR Staff, Supervisor, Finance (Payroll Officer) — gets its own Position and monthly Salary here, the same way a regular employee has one in the Employee Directory. Edit a cell below and click Save.</div>',unsafe_allow_html=True)
-        conn=get_conn()
-        bo_df=pg_read_sql("""SELECT username,full_name,role,COALESCE(position_title,'') as position_title,
+        bo_df=pg_read_sql("""SELECT username,full_name,role,is_active,COALESCE(position_title,'') as position_title,
             COALESCE(salary,0) as salary FROM system_users ORDER BY role,full_name""",conn)
+        today_att=pg_read_sql("SELECT username,status FROM staff_attendance WHERE attendance_date=?",conn,params=(today_str_cc,))
         conn.close()
-        if len(bo_df)==0:
-            st.info("No back-office accounts yet.")
-        else:
-            bo_disp=bo_df.rename(columns={"username":"Username","full_name":"Full Name","role":"Role",
-                "position_title":"Position","salary":"Salary (ETB/month)"})
-            edited_bo=st.data_editor(bo_disp,hide_index=True,use_container_width=True,key="bo_salary_editor",
-                disabled=["Username","Full Name","Role"],
-                column_config={"Salary (ETB/month)": st.column_config.NumberColumn(min_value=0.0,step=100.0,format="%.2f")})
-            total_bo_salary = edited_bo["Salary (ETB/month)"].fillna(0).sum()
-            st.markdown(f'<div style="font-size:12px;color:#94A8C8;margin:6px 0">Total back-office monthly payroll cost: <b style="color:#10B981">ETB {total_bo_salary:,.2f}</b></div>',unsafe_allow_html=True)
-            if st.button("Save Back-Office Positions & Salary",use_container_width=True,key="save_bo_salary"):
-                conn=get_conn()
-                for _,row in edited_bo.iterrows():
-                    conn.execute("UPDATE system_users SET position_title=?,salary=? WHERE username=?",
-                        (row["Position"],float(row["Salary (ETB/month)"] or 0),row["Username"]))
-                conn.commit(); conn.close()
-                st.success("Back-office positions and salaries saved."); st.rerun()
+        att_lookup=dict(zip(today_att['username'],today_att['status'])) if len(today_att)>0 else {}
 
+        if len(bo_df)==0:
+            st.info("No back-office accounts yet — create them in Administration.")
+        else:
+            total_bo_salary=float(bo_df['salary'].fillna(0).sum())
+            st.markdown(f'<div style="font-size:12px;color:#94A8C8;margin-bottom:8px">Total back-office monthly payroll cost: <b style="color:#10B981">ETB {total_bo_salary:,.2f}</b></div>',unsafe_allow_html=True)
+            status_opts_bo=["Present","Absent","On Leave"]
+            for _,su in bo_df.iterrows():
+                uname=su['username']
+                cur_status=att_lookup.get(uname,"Present")
+                is_active_su=int(su['is_active'])==1
+                with st.expander(f"{su['full_name'] or uname}  —  {su['role']}{'' if is_active_su else '  (Disabled)'}",expanded=False):
+                    r1,r2,r3,r4=st.columns(4)
+                    with r1:
+                        st.markdown(f'<div style="font-size:9px;color:#6B7FA3;text-transform:uppercase">Authority</div><div style="font-size:13px;color:#F0C96B;font-weight:600">{su["role"]}</div>',unsafe_allow_html=True)
+                    with r2:
+                        pos_val=st.text_input("Position",value=su['position_title'] or "",key=f"cc_pos_{uname}")
+                    with r3:
+                        sal_val=st.number_input("Monthly Salary (ETB)",min_value=0.0,value=float(su['salary'] or 0),step=100.0,key=f"cc_sal_{uname}")
+                    with r4:
+                        att_val=st.selectbox("Today's Attendance",status_opts_bo,index=status_opts_bo.index(cur_status) if cur_status in status_opts_bo else 0,key=f"cc_att_{uname}")
+                    if st.button("Save",key=f"cc_save_{uname}",use_container_width=True):
+                        conn=get_conn()
+                        conn.execute("UPDATE system_users SET position_title=?,salary=? WHERE username=?",(pos_val,sal_val,uname))
+                        conn.execute("""INSERT INTO staff_attendance(username,attendance_date,status,marked_by,marked_at)
+                            VALUES(?,?,?,?,?) ON CONFLICT(username,attendance_date) DO UPDATE SET status=?,marked_by=?,marked_at=?""",
+                            (uname,today_str_cc,att_val,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                             att_val,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                        conn.commit(); conn.close()
+                        st.success(f"Saved for {su['full_name'] or uname}."); st.rerun()
+
+            bo_export=bo_df.copy()
+            bo_export['todays_attendance']=bo_export['username'].apply(lambda u: att_lookup.get(u,"Present"))
+            bo_buf=io.BytesIO()
+            with pd.ExcelWriter(bo_buf,engine="xlsxwriter") as w: bo_export.to_excel(w,index=False,sheet_name="BackOffice")
+            st.download_button("Export Back-Office Staff",bo_buf.getvalue(),file_name=f"BackOffice_{today_str_cc}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+
+        # ═══════════════════════════════════════════
+        # COMPANY SHARE MEMBERS
+        # ═══════════════════════════════════════════
         st.markdown("<hr>",unsafe_allow_html=True)
-        st.markdown('<div class="ey">Company-Wide Workforce Snapshot</div>',unsafe_allow_html=True)
-        stats_cc=get_stats()
-        total_cc=sum(stats_cc.values())
-        st.markdown(f"""<div class="mg">
-          <div class="mb mg-gold"><div class="ml ml-gold">Total Employees</div><div class="mv">{total_cc}</div></div>
-          <div class="mb mg-green"><div class="ml ml-green">Active Deployment</div><div class="mv">{stats_cc.get("Active Deployment",0)}</div></div>
-          <div class="mb mg-cyan"><div class="ml ml-cyan">Applicants</div><div class="mv">{stats_cc.get("Pending Screening",0)}</div></div>
-          <div class="mb mg-amber"><div class="ml ml-amber">Pre-Employment</div><div class="mv">{stats_cc.get("Pre-Employment Process",0)}</div></div>
-          <div class="mb mg-purple"><div class="ml ml-purple">On Leave</div><div class="mv">{stats_cc.get("On Leave",0)}</div></div>
-          <div class="mb mg-red"><div class="ml ml-red">Terminated</div><div class="mv">{stats_cc.get("Terminated",0)}</div></div>
-        </div>""",unsafe_allow_html=True)
+        st.markdown('<div class="ey">Company Share Members</div>',unsafe_allow_html=True)
+        st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Owners/partners tracked here even though they may not have a login account. Authority is their title (e.g. Chairman, Managing Partner), separate from the system Roles above.</div>',unsafe_allow_html=True)
+        conn=get_conn()
+        sm_df=pg_read_sql("SELECT * FROM share_members WHERE is_active=1 ORDER BY full_name",conn)
+        conn.close()
+        if len(sm_df)>0:
+            total_sm_salary=float(sm_df['monthly_salary'].fillna(0).sum())
+            st.markdown(f'<div style="font-size:12px;color:#94A8C8;margin-bottom:8px">Total share-member monthly draw: <b style="color:#10B981">ETB {total_sm_salary:,.2f}</b></div>',unsafe_allow_html=True)
+            for _,sm in sm_df.iterrows():
+                with st.expander(f"{sm['full_name']} — {sm['authority_title'] or 'Share Member'} ({sm['share_percentage'] or 0:.1f}%)",expanded=False):
+                    m1,m2,m3=st.columns(3)
+                    with m1: st.markdown(f'<div style="font-size:9px;color:#6B7FA3;text-transform:uppercase">Share %</div><div style="font-size:13px;color:#F0C96B;font-weight:600">{sm["share_percentage"] or 0:.1f}%</div>',unsafe_allow_html=True)
+                    with m2: st.markdown(f'<div style="font-size:9px;color:#6B7FA3;text-transform:uppercase">Monthly Salary/Draw</div><div style="font-size:13px;color:#10B981;font-weight:600">ETB {sm["monthly_salary"] or 0:,.2f}</div>',unsafe_allow_html=True)
+                    with m3: st.markdown(f'<div style="font-size:9px;color:#6B7FA3;text-transform:uppercase">Contact</div><div style="font-size:13px;color:#E8EEF7">{sm["contact"] or "—"}</div>',unsafe_allow_html=True)
+                    if st.button(f"Remove {sm['full_name']}",key=f"sm_del_{sm['id']}",use_container_width=True):
+                        conn=get_conn(); conn.execute("UPDATE share_members SET is_active=0 WHERE id=?",(sm['id'],)); conn.commit(); conn.close()
+                        st.warning(f"{sm['full_name']} removed from active share members."); st.rerun()
+        else:
+            st.info("No share members added yet.")
+
+        with st.expander("➕ Add Share Member"):
+            with st.form("add_share_member_form",clear_on_submit=True):
+                sm1,sm2=st.columns(2)
+                with sm1: sm_name=st.text_input("Full Name")
+                with sm2: sm_title=st.text_input("Authority / Title",placeholder="e.g. Chairman, Managing Partner")
+                sm3,sm4,sm5=st.columns(3)
+                with sm3: sm_pct=st.number_input("Share Percentage (%)",min_value=0.0,max_value=100.0,step=0.5)
+                with sm4: sm_sal=st.number_input("Monthly Salary/Draw (ETB)",min_value=0.0,step=100.0)
+                with sm5: sm_contact=st.text_input("Contact",placeholder="Phone or email")
+                if st.form_submit_button("Add Share Member",use_container_width=True):
+                    if not sm_name.strip():
+                        st.error("Full Name is required.")
+                    else:
+                        conn=get_conn()
+                        conn.execute("""INSERT INTO share_members(full_name,authority_title,share_percentage,
+                            monthly_salary,contact,is_active,created_by,created_at)VALUES(?,?,?,?,?,1,?,?)""",
+                            (sm_name.strip(),sm_title,sm_pct,sm_sal,sm_contact,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                        conn.commit(); conn.close()
+                        st.success(f"{sm_name} added as a share member."); st.rerun()
 
 
     # ════════════════════════════════════════════════════════
@@ -3919,52 +3932,7 @@ with main_block:
             st.stop()
         lf1,lf2,lf3,lf4=st.tabs(["Leave Records","Fine Letters","Absent Records","Pending Dept Head Approval"])
         with lf1:
-            st.markdown('<div class="fs">Submit New Leave</div>',unsafe_allow_html=True)
-            st.markdown('<div style="font-size:11px;color:#F59E0B;margin-bottom:8px">All new leave now routes through HR review, then HR Manager approval, before it becomes final — it can no longer be saved as directly Approved from here.</div>',unsafe_allow_html=True)
-            with st.form("lf"):
-                lc1,lc2=st.columns(2)
-                with lc1: l_emp=st.selectbox("Employee",list(elo.keys()))
-                with lc2:
-                    ltypes=["Sick Leave","Annual Leave","Maternity Leave","Paternity Leave","Mourning Leave","Unpaid Leave","Emergency Leave","Study Leave"]
-                    l_type=st.selectbox("Leave Type",ltypes)
-                lc4,lc5=st.columns(2)
-                with lc4: l_start=st.date_input("Start",value=date.today())
-                with lc5: l_end=st.date_input("End",value=date.today())
-                l_by = st.session_state.uid
-                st.markdown(f'<div style="font-size:11px;color:#6B7FA3;margin:-4px 0 8px">Submitted by: <b style="color:#10B981">{st.session_state.role}: {st.session_state.full_name or st.session_state.uid}</b></div>',unsafe_allow_html=True)
-                l_notes=st.text_area("Notes",placeholder="Reason...")
-                l_doc=st.file_uploader("Attach Supporting Document (medical certificate, leave application, etc. — optional)",type=["pdf","jpg","jpeg","png"],key="leave_doc_upload")
-                if st.form_submit_button("Submit for HR Review",use_container_width=True):
-                    l_eid=elo[l_emp]
-                    conn=get_conn(); cur=conn.cursor()
-                    cur.execute("""SELECT COUNT(*) FROM leave_records WHERE emp_id=? AND status != 'Cancelled'
-                        AND start_date<=? AND end_date>=?""",(l_eid,str(l_end),str(l_start)))
-                    overlap_count=cur.fetchone()[0]
-                    cur.execute("""SELECT COUNT(*) FROM daily_status_records WHERE emp_id=? AND start_date<=? AND end_date>=?
-                        AND workflow_stage NOT IN ('Rejected by HR','Rejected by HR Manager','Returned for Correction')""",(l_eid,str(l_end),str(l_start)))
-                    overlap_count+=cur.fetchone()[0]
-                    if overlap_count>0:
-                        conn.close()
-                        st.error(f"{l_emp} already has a leave/status record overlapping {l_start} to {l_end}.")
-                        st.stop()
-                    cur.execute("SELECT annual_leave_entitlement FROM employees WHERE emp_id=?",(l_eid,))
-                    sr=cur.fetchone()
-                    entitlement=int(sr[0]) if sr and sr[0] else 20
-                    days=max((l_end-l_start).days+1,0)
-                    if l_type=="Annual Leave":
-                        used_so_far,remaining=get_annual_leave_balance(l_eid,l_start.year,entitlement)
-                        if used_so_far+days>entitlement:
-                            conn.close()
-                            st.error(f"{l_emp} has already used {used_so_far} of {entitlement} annual leave days for {l_start.year}. This request of {days} day(s) would exceed the remaining {remaining} day(s). Adjust the dates or increase their entitlement in Employee Profile → History.")
-                            st.stop()
-                    ldoc_name=l_doc.name if l_doc else None
-                    ldoc_data=l_doc.getvalue() if l_doc else None
-                    conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
-                        reason,doc_name,doc_data,supervisor_id,submitted_at,workflow_stage)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,'Pending HR Review')""",
-                        (l_eid,l_type,l_type,str(l_start),str(l_end),days,l_notes,ldoc_name,ldoc_data,l_by,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-                    conn.commit(); conn.close()
-                    st.success(f"{l_type}: {days} days submitted for HR review."); st.rerun()
+            st.markdown('<div class="card card-gold"><div style="font-size:12px;color:#C8D8F0;line-height:1.7">Only the <b style="color:#F0C96B">Supervisor</b> fills out new leave requests, from <b style="color:#F0C96B">Supervisor Console</b>. HR\'s role here is review and approval only — manage, cancel or compensate existing records below, and use HR Review / HR Manager Approval to approve or reject what Supervisors have submitted.</div></div>',unsafe_allow_html=True)
 
             st.markdown("<hr>",unsafe_allow_html=True)
             st.markdown('<div class="fs">Manage Existing Leave Records</div>',unsafe_allow_html=True)
@@ -4044,34 +4012,7 @@ with main_block:
                 st.dataframe(lv,use_container_width=True,hide_index=True)
 
         with lf2:
-            st.markdown('<div class="fs">Issue New Fine Letter</div>',unsafe_allow_html=True)
-            with st.form("ff"):
-                fc1,fc2,fc3,fc4=st.columns(4)
-                with fc1: f_emp=st.selectbox("Employee",list(elo.keys()))
-                with fc2: fine_month=st.selectbox("Fine Month",[f"{datetime.now().year}-{m:02d}" for m in range(1,13)],index=datetime.now().month-1)
-                with fc3: f_date=st.date_input("Issue Date",value=date.today())
-                with fc4: f_days=st.number_input("Fine Days",min_value=0,max_value=30,step=1)
-                fc5,fc6=st.columns(2)
-                with fc5:
-                    ftypes=["Disciplinary","Misconduct","Late Arrival","Unauthorized Absence","Policy Violation","Performance","Other"]
-                    f_type=st.selectbox("Fine Type",ftypes)
-                with fc6: f_reason=st.text_input("Reason",placeholder="Brief description")
-                f_details=st.text_area("Full Details",placeholder="Detailed explanation...")
-                st.markdown('<div style="font-size:10px;color:#38BDF8;margin-bottom:5px">Attach scanned fine letter — PDF or JPG</div>',unsafe_allow_html=True)
-                f_letter=st.file_uploader("Upload Signed Fine Letter",type=["pdf","jpg","jpeg","png"])
-                if st.form_submit_button("Issue Fine Letter",use_container_width=True):
-                    f_eid=elo[f_emp]
-                    conn=get_conn(); cur=conn.cursor()
-                    cur.execute("SELECT basic_salary FROM employees WHERE emp_id=?",(f_eid,))
-                    sr=cur.fetchone(); dr=float(sr[0])/26 if sr and sr[0] else 0
-                    fine_amt=round(dr*f_days,2)
-                    full_reason=f"{f_type}: {f_reason}\n{f_details}".strip()
-                    ln=f_letter.name if f_letter else None
-                    ld=sqlite3.Binary(f_letter.read()) if f_letter else None
-                    conn.execute("INSERT INTO fine_letters(emp_id,month,issue_date,fine_reason,fine_type,fine_days,fine_amount,letter_name,letter_data,applied_to_payroll,record_status,created_at)VALUES(?,?,?,?,?,?,?,?,?,'No','Active',?)",
-                        (f_eid,fine_month,str(f_date),full_reason,f_type,f_days,fine_amt,ln,ld,datetime.now().strftime("%Y-%m-%d")))
-                    conn.commit(); conn.close()
-                    st.success(f"Fine issued: {f_days} days = ETB {fine_amt:,.2f} — auto-deducts from {fine_month} payroll"); st.rerun()
+            st.markdown('<div class="card card-gold"><div style="font-size:12px;color:#C8D8F0;line-height:1.7">Only the <b style="color:#F0C96B">Supervisor</b> issues new fine letters, from <b style="color:#F0C96B">Supervisor Console</b> (routed to Department Head/HR for approval). HR\'s role here is to manage what has already been issued — cancel a mistaken fine or record compensation days worked off.</div></div>',unsafe_allow_html=True)
 
             st.markdown("<hr>",unsafe_allow_html=True)
             st.markdown('<div class="fs">Manage Fines — Cancel or Compensate</div>',unsafe_allow_html=True)
@@ -4153,36 +4094,7 @@ with main_block:
                                     st.success("Fine letter document deleted."); st.rerun()
                 st.dataframe(af.drop(columns=["id","letter_name"]),use_container_width=True,hide_index=True)
         with lf3:
-            st.markdown('<div class="fs">Record New Absence</div>',unsafe_allow_html=True)
-            st.markdown('<div style="font-size:11px;color:#F59E0B;margin-bottom:8px">Absences now route through HR review and HR Manager approval before they count against pay.</div>',unsafe_allow_html=True)
-            with st.form("abf"):
-                ab1,ab2,ab3=st.columns(3)
-                with ab1: ab_emp=st.selectbox("Employee",list(elo.keys()))
-                with ab2: ab_date=st.date_input("Absent Date",value=date.today())
-                with ab3: ab_ex=st.selectbox("Type",["Unexcused (Deducted)","Excused (Not Deducted)"])
-                ab_reason=st.text_input("Reason",placeholder="Reason for absence...")
-                if st.form_submit_button("Submit for HR Review",use_container_width=True):
-                    ab_eid_chosen=elo[ab_emp]
-                    conn=get_conn(); cur=conn.cursor()
-                    cur.execute("""SELECT COUNT(*) FROM daily_status_records WHERE emp_id=? AND start_date<=? AND end_date>=?
-                        AND workflow_stage NOT IN ('Rejected by HR','Rejected by HR Manager','Returned for Correction')""",(ab_eid_chosen,str(ab_date),str(ab_date)))
-                    dup_count=cur.fetchone()[0]
-                    cur.execute("""SELECT leave_type FROM leave_records WHERE emp_id=? AND status='Approved'
-                        AND start_date<=? AND end_date>=?""",(ab_eid_chosen,str(ab_date),str(ab_date)))
-                    leave_conflict=cur.fetchone()
-                    if dup_count>0:
-                        conn.close()
-                        st.error(f"{ab_emp} already has a submitted status record for {ab_date}. The system blocks duplicate entries automatically.")
-                    elif leave_conflict:
-                        conn.close()
-                        st.error(f"{ab_emp} is on approved {leave_conflict[0]} on {ab_date}. An employee already on approved leave cannot also be marked absent for the same date.")
-                    else:
-                        conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
-                            reason,supervisor_id,submitted_at,workflow_stage)
-                            VALUES(?,'Absent',?,?,?,1,?,?,?,'Pending HR Review')""",
-                            (ab_eid_chosen,"Excused" if "Excused" in ab_ex else "Unexcused",str(ab_date),str(ab_date),
-                             ab_reason,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-                        conn.commit(); conn.close(); st.success(f"Absence for {ab_date} submitted for HR review."); st.rerun()
+            st.markdown('<div class="card card-gold"><div style="font-size:12px;color:#C8D8F0;line-height:1.7">Only the <b style="color:#F0C96B">Supervisor</b> records a new absence, from <b style="color:#F0C96B">Supervisor Console</b> (routed to HR Review then Manager Review before it counts against pay). HR\'s role here is to manage what has already come through — cancel a mistaken entry or record compensation.</div></div>',unsafe_allow_html=True)
 
             st.markdown("<hr>",unsafe_allow_html=True)
             st.markdown('<div class="fs">Manage Absences — Cancel or Compensate</div>',unsafe_allow_html=True)
@@ -4410,6 +4322,9 @@ with main_block:
         st.markdown("<hr>",unsafe_allow_html=True)
 
         if st.session_state.vacation_subview=="request":
+            if st.session_state.role not in ("Supervisor","Manager"):
+                st.info("Only the Supervisor fills out a vacation request (from Supervisor Console). HR's role here is Vacation Approvals only.")
+                st.stop()
             conn=get_conn()
             vac_emps=pg_read_sql("SELECT emp_id,full_name,division,annual_leave_entitlement FROM employees WHERE current_status != 'Terminated' ORDER BY full_name",conn)
             conn.close()
