@@ -561,6 +561,39 @@ def init_db():
         UNIQUE(username,attendance_date))""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_staffatt_user ON staff_attendance(username)")
 
+    # ── JOB POSITIONS (manually created — same pattern as Divisions/Cost
+    # Centers). Each position maps to exactly one Salary Category. This is
+    # HOW payroll auto-connects to a hire: pick Division, Cost Center and
+    # Position on the employee record, and the Position's mapped Category
+    # (set in Payroll → Salary Categories) is what drives their pay —
+    # no manual per-employee salary category entry needed. ──
+    c.execute("""CREATE TABLE IF NOT EXISTS job_positions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        category TEXT,
+        is_active INTEGER DEFAULT 1,
+        created_by TEXT,created_at TEXT)""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_jobpos_active ON job_positions(is_active)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_jobpos_category ON job_positions(category)")
+    # Seed the known Annex III positions, pre-mapped to their categories
+    # (matching the position lists already seeded into salary_categories) —
+    # the Manager can remap any of these later in Salary Categories.
+    now_jp=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    JOB_POSITION_SEED = [
+        ("BCH","A"),("Cleaner","A"),("FSA","A"),("Laborer","A"),("Gardner","A"),
+        ("Catering Helper","A"),("Waitress","A"),
+        ("Security Guard (Ticket Office)","B"),
+        ("Driver","C"),("Tire Repair Man","C"),("Tailor","C"),
+        ("Carpenter","D"),("Mason","D"),("Welder","D"),("Painter","D"),
+        ("Cook","E"),
+    ]
+    for jp_name,jp_cat in JOB_POSITION_SEED:
+        try:
+            c.execute("""INSERT INTO job_positions(name,category,is_active,created_by,created_at)
+                VALUES(?,?,1,'system',?) ON CONFLICT(name) DO NOTHING""",(jp_name,jp_cat,now_jp))
+        except: pass
+    conn.commit()
+
     # ── SALARY CATEGORIES (Annex III master rate table) ──
     # One row per Category (A, B, C, D, E...). This is the single source
     # of truth for Basic Salary, Transport, Meal, Medical Insurance and
@@ -716,6 +749,30 @@ def get_category_rate(category):
     match=df[df['category']==category]
     if len(match)==0: return None
     return match.iloc[0].to_dict()
+
+@st.cache_data(ttl=20)
+def get_job_positions(active_only=True):
+    """Master Position list — manually created, same pattern as Divisions
+    and Cost Centers. Each position optionally maps to a Salary Category."""
+    conn=get_conn()
+    if active_only:
+        df=pg_read_sql("SELECT * FROM job_positions WHERE is_active=1 ORDER BY created_at DESC",conn)
+    else:
+        df=pg_read_sql("SELECT * FROM job_positions ORDER BY created_at DESC",conn)
+    conn.close()
+    return df
+
+def get_position_category(position_name):
+    """Looks up which Salary Category a Position is mapped to — this is
+    the automatic connection: pick a Position on the employee record, and
+    payroll follows this mapping straight to the right Category rate,
+    with no manual per-employee category entry."""
+    if not position_name: return None
+    df=get_job_positions(active_only=False)
+    match=df[df['name']==position_name]
+    if len(match)==0: return None
+    cat=match.iloc[0]['category']
+    return cat if cat else None
 
 @st.cache_data(ttl=20)
 def get_cost_centers(division=None):
@@ -2097,28 +2154,46 @@ with main_block:
                                 st.success("Saved"); st.rerun()
             with t2:
                 div_list_add=get_division_list()
+                jp_list_add=get_job_positions()
                 if not div_list_add:
                     st.warning("No divisions have been created yet. Go to Cost Centers → Divisions to create the first one before adding employees.")
+                if len(jp_list_add)==0:
+                    st.warning("No positions have been created yet. Go to Cost Centers → Job Positions to create some before adding employees.")
                 with st.form("af2"):
                     a1,a2,a3,a4=st.columns(4)
                     with a1: aid=st.text_input("Employee ID")
                     with a2: anam=st.text_input("Full Name")
                     with a3: apho=st.text_input("Phone (Contact 01)")
-                    with a4: asal=st.number_input("Basic Salary",min_value=0.0,step=100.0)
-                    a5,a6=st.columns(2)
-                    with a5: adiv=st.selectbox("Division",div_list_add) if div_list_add else None
+                    with a4: asal=st.number_input("Basic Salary (leave 0 to use the Position's Category rate)",min_value=0.0,step=100.0)
+                    a5,a6,a7=st.columns(3)
+                    with a5: adiv=st.selectbox("Division *",div_list_add) if div_list_add else None
                     with a6:
                         acc_list=get_cost_centers(adiv) if adiv else pd.DataFrame()
                         acc_opts=["Unassigned"]+acc_list['code'].tolist() if len(acc_list)>0 else ["Unassigned"]
                         acc=st.selectbox("Cost Center",acc_opts)
+                    with a7:
+                        apos=st.selectbox("Position *",jp_list_add['name'].tolist()) if len(jp_list_add)>0 else None
+                    if apos:
+                        auto_cat_preview=get_position_category(apos)
+                        if auto_cat_preview:
+                            st.markdown(f'<div style="font-size:11px;color:#34D399;margin-top:-8px;margin-bottom:8px">Position "{apos}" is mapped to Salary Category <b>{auto_cat_preview}</b> — pay will auto-connect to that Category\'s rate.</div>',unsafe_allow_html=True)
+                        else:
+                            st.markdown(f'<div style="font-size:11px;color:#F59E0B;margin-top:-8px;margin-bottom:8px">Position "{apos}" isn\'t mapped to a Salary Category yet — set one in Payroll → Salary Categories, or enter Basic Salary manually above.</div>',unsafe_allow_html=True)
                     if st.form_submit_button("Add",use_container_width=True):
                         if not(aid and anam): st.error("ID and Name required.")
                         elif not adiv: st.error("Create a division first (Cost Centers → Divisions).")
+                        elif not apos: st.error("Create a position first (Cost Centers → Job Positions).")
                         else:
+                            auto_cat=get_position_category(apos)
+                            final_salary=asal
+                            if final_salary==0 and auto_cat:
+                                cat_rate_new=get_category_rate(auto_cat)
+                                if cat_rate_new: final_salary=float(cat_rate_new.get('basic_salary') or 0)
                             conn=get_conn()
                             try:
-                                conn.execute("INSERT INTO employees(emp_id,full_name,division,cost_center,contact,basic_salary,current_status,registration_date)VALUES(?,?,?,?,?,?,'Active Deployment',?)",
-                                    (aid,anam,adiv,None if acc=="Unassigned" else acc,apho,asal,datetime.now().strftime("%Y-%m-%d")))
+                                conn.execute("""INSERT INTO employees(emp_id,full_name,division,cost_center,job_title,category,
+                                    contact,basic_salary,current_status,registration_date)VALUES(?,?,?,?,?,?,?,?,'Active Deployment',?)""",
+                                    (aid,anam,adiv,None if acc=="Unassigned" else acc,apos,auto_cat,apho,final_salary,datetime.now().strftime("%Y-%m-%d")))
                                 conn.commit()
                                 st.cache_data.clear()
                                 st.success(f"Employee {aid} added.")
@@ -2405,11 +2480,22 @@ with main_block:
                     with ed4: eins=st.text_input("Institution",value=r.get("institution_name","") or "")
                     st.markdown('<div class="fs">Employment & Division — Position / Category</div>',unsafe_allow_html=True)
                     em0a,em0b=st.columns(2)
-                    with em0a: ejob=st.text_input("Position (Job Title)",value=r.get("job_title","") or "",help="e.g. Cleaner, Guard, Waiter")
+                    jp_list_edit=get_job_positions()
+                    jp_names_edit=jp_list_edit['name'].tolist() if len(jp_list_edit)>0 else []
+                    cur_job=r.get("job_title") or ""
+                    with em0a:
+                        if jp_names_edit:
+                            pos_opts_edit = jp_names_edit if cur_job in jp_names_edit else ([cur_job]+jp_names_edit if cur_job else jp_names_edit)
+                            ejob=st.selectbox("Position",pos_opts_edit,index=pos_opts_edit.index(cur_job) if cur_job in pos_opts_edit else 0,help="Create new positions in Cost Centers → Job Positions")
+                        else:
+                            st.warning("No positions created yet (Cost Centers → Job Positions).")
+                            ejob=st.text_input("Position (Job Title)",value=cur_job,help="Fallback free-text until positions are created")
                     with em0b:
-                        cat_opts=["A","B","C","D","Other"]
-                        cur_cat=r.get("category") or "A"
-                        ecat=st.selectbox("Category",cat_opts,index=cat_opts.index(cur_cat) if cur_cat in cat_opts else 0,help="Salary/skill grade used for Annex III payroll")
+                        ecat = get_position_category(ejob)
+                        if ecat:
+                            st.markdown(f'<div style="font-size:9px;color:#6B7FA3;text-transform:uppercase;margin-bottom:2px">Category (auto from Position)</div><div style="font-size:16px;color:#10B981;font-weight:700;padding-top:6px">{ecat}</div>',unsafe_allow_html=True)
+                        else:
+                            st.markdown(f'<div style="font-size:9px;color:#6B7FA3;text-transform:uppercase;margin-bottom:2px">Category (auto from Position)</div><div style="font-size:12px;color:#F59E0B;padding-top:8px">Not mapped — set in Payroll → Salary Categories</div>',unsafe_allow_html=True)
                     em1,em2b,em3=st.columns(3)
                     with em1: pass
                     with em2b:
@@ -3769,6 +3855,25 @@ with main_block:
                 with sc7: sc_paidleave=st.number_input("Paid Leave",min_value=0.0,value=float(pre.get("paid_leave") or 0),step=10.0,key="sc_paidleave_in")
                 with sc8: sc_overhead=st.number_input("Overhead and Profit Margin per person",min_value=0.0,value=float(pre.get("overhead_profit") or 0),step=50.0,key="sc_overhead_in")
 
+                # ── Position mapping — tick every Position that belongs to this
+                # Category. This is the actual auto-connect: an employee hired
+                # into a ticked Position picks up this Category's rate
+                # automatically, with no manual per-employee category entry. ──
+                st.markdown('<div class="fs" style="margin-top:10px">Positions in This Category</div>',unsafe_allow_html=True)
+                st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:6px">Tick every Position that should use this Category\'s rate. A Position can only belong to one Category — ticking it here moves it out of any other Category it was in.</div>',unsafe_allow_html=True)
+                jp_all_sc=get_job_positions(active_only=False)
+                sc_cat_code_current=sc_cat.strip().upper()
+                position_ticks={}
+                if len(jp_all_sc)==0:
+                    st.info("No positions created yet — add them in Cost Centers → Job Positions.")
+                else:
+                    jp_cols_ui=st.columns(3)
+                    for i,(_,jprow) in enumerate(jp_all_sc.iterrows()):
+                        with jp_cols_ui[i%3]:
+                            already_here = (jprow['category'] or "") == sc_cat_code_current and sc_cat_code_current!=""
+                            label = jprow['name'] + (f"  (currently: {jprow['category']})" if jprow['category'] and not already_here else "")
+                            position_ticks[jprow['name']] = st.checkbox(label,value=bool(already_here),key=f"sc_pos_tick_{jprow['name']}")
+
                 # ── Live Annex III calculation preview ──
                 vat_pct_cat=float(get_setting("policy_vat_percent","15"))
                 transport_exempt=float(get_setting("policy_transport_tax_exemption","600"))
@@ -3814,9 +3919,19 @@ with main_block:
                              st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                              sc_examples,sc_basic,sc_transport,sc_meal,sc_medical,sc_paidleave,sc_overhead,
                              st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                        # Apply position mapping: ticked positions move into this
+                        # Category; positions that WERE this Category but got
+                        # unticked fall back to unmapped.
+                        moved_in=0
+                        for pos_name,ticked in position_ticks.items():
+                            if ticked:
+                                conn.execute("UPDATE job_positions SET category=? WHERE name=?",(sc_cat_code_current,pos_name))
+                                moved_in+=1
+                            else:
+                                conn.execute("UPDATE job_positions SET category=NULL WHERE name=? AND category=?",(pos_name,sc_cat_code_current))
                         conn.commit(); conn.close()
-                        get_salary_categories.clear()
-                        st.success(f"Category {sc_cat.strip().upper()} rate saved.")
+                        get_salary_categories.clear(); get_job_positions.clear()
+                        st.success(f"Category {sc_cat_code_current} rate saved — {moved_in} position(s) mapped to it.")
                         st.rerun()
 
                 if existing_cats:
@@ -4922,7 +5037,7 @@ with main_block:
     # ════════════════════════════════════════════════════════
     elif V=="Cost Centers":
         st.markdown('<div class="ey">Financial & Organizational Structure</div>',unsafe_allow_html=True)
-        st.markdown('<div class="tl">Divisions & Cost Centers</div>',unsafe_allow_html=True)
+        st.markdown('<div class="tl">Divisions, Cost Centers & Job Positions</div>',unsafe_allow_html=True)
 
         oc1,oc2=st.columns(2)
         with oc1: total_div_count=len(get_division_list())
@@ -4930,12 +5045,14 @@ with main_block:
         cc_all=pg_read_sql("SELECT * FROM cost_centers ORDER BY created_at DESC",conn)
         div_all=pg_read_sql("SELECT * FROM divisions ORDER BY created_at DESC",conn)
         conn.close()
-        st.markdown(f"""<div class="mg" style="grid-template-columns:repeat(2,1fr)">
+        jp_all=get_job_positions(active_only=False)
+        st.markdown(f"""<div class="mg" style="grid-template-columns:repeat(3,1fr)">
           <div class="mb mg-teal"><div class="ml ml-teal">Divisions</div><div class="mv">{total_div_count}</div></div>
           <div class="mb mg-gold"><div class="ml ml-gold">Cost Centers</div><div class="mv">{len(cc_all)}</div></div>
+          <div class="mb mg-purple"><div class="ml ml-purple">Job Positions</div><div class="mv">{len(jp_all)}</div></div>
         </div>""",unsafe_allow_html=True)
 
-        cc_div_tab, cc_cc_tab = st.tabs(["Divisions","Cost Centers"])
+        cc_div_tab, cc_cc_tab, cc_jp_tab = st.tabs(["Divisions","Cost Centers","Job Positions"])
 
         # ── DIVISIONS TAB ──
         with cc_div_tab:
@@ -5107,6 +5224,78 @@ with main_block:
             cc_buf=io.BytesIO()
             with pd.ExcelWriter(cc_buf,engine="xlsxwriter") as w: cc_all.to_excel(w,index=False,sheet_name="CostCenters")
             st.download_button("Export Cost Center List",cc_buf.getvalue(),file_name=f"CostCenters_{datetime.now().strftime('%Y%m%d')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        # ── JOB POSITIONS TAB ──
+        with cc_jp_tab:
+            st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">Positions are created manually here, same as Divisions and Cost Centers. Each Position optionally maps to a <b style="color:#F0C96B">Salary Category</b> — that mapping is set in <b style="color:#F0C96B">Payroll → Salary Categories</b>, not here. Once mapped, hiring an employee into a Position automatically connects them to that Category\'s pay rate — no manual salary entry needed.</div>',unsafe_allow_html=True)
+
+            if st.session_state.role=="Manager":
+                jpt1,jpt2=st.tabs(["Create Position","Manage Positions"])
+                with jpt1:
+                    with st.form("job_position_form",clear_on_submit=True):
+                        jp_name=st.text_input("Position Name *",placeholder="e.g. Cleaner")
+                        jp_active=st.selectbox("Status",["Active","Inactive"])
+                        if st.form_submit_button("Create Position",use_container_width=True):
+                            if not jp_name.strip():
+                                st.error("Position name required.")
+                            else:
+                                conn=get_conn()
+                                try:
+                                    conn.execute("INSERT INTO job_positions(name,category,is_active,created_by,created_at)VALUES(?,NULL,?,?,?)",
+                                        (jp_name.strip(),1 if jp_active=="Active" else 0,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                                    conn.commit()
+                                    get_job_positions.clear()
+                                    st.success(f"Position '{jp_name}' created — map it to a Salary Category in Payroll → Salary Categories, then it shows first in the list below.")
+                                    st.rerun()
+                                except sqlite3.IntegrityError:
+                                    st.error(f"Position '{jp_name}' already exists.")
+                                finally: conn.close()
+                with jpt2:
+                    if len(jp_all)>0:
+                        jp_opts={r['name']:r['name'] for _,r in jp_all.iterrows()}
+                        sel_jp=st.selectbox("Select Position",list(jp_opts.keys()))
+                        jpc1,jpc2,jpc3=st.columns(3)
+                        with jpc1:
+                            if st.button("Activate",use_container_width=True,key="jp_activate"):
+                                conn=get_conn(); conn.execute("UPDATE job_positions SET is_active=1 WHERE name=?",(sel_jp,)); conn.commit(); conn.close()
+                                get_job_positions.clear(); st.success("Activated."); st.rerun()
+                        with jpc2:
+                            if st.button("Deactivate",use_container_width=True,key="jp_deactivate"):
+                                conn=get_conn(); conn.execute("UPDATE job_positions SET is_active=0 WHERE name=?",(sel_jp,)); conn.commit(); conn.close()
+                                get_job_positions.clear(); st.warning("Deactivated."); st.rerun()
+                        with jpc3:
+                            if st.button("Delete",use_container_width=True,key="jp_delete"):
+                                conn=get_conn(); cur=conn.cursor()
+                                cur.execute("SELECT * FROM job_positions WHERE name=?",(sel_jp,))
+                                jp_cols=[d[0] for d in cur.description]; jp_row=cur.fetchone()
+                                jp_dict=dict(zip(jp_cols,jp_row)) if jp_row else {}
+                                conn.execute("DELETE FROM job_positions WHERE name=?",(sel_jp,)); conn.commit(); conn.close()
+                                soft_delete("Job Position", sel_jp, f"Position — {sel_jp}", jp_dict, st.session_state.uid)
+                                get_job_positions.clear(); st.error("Moved to Recycle Bin."); st.rerun()
+                    else:
+                        st.info("No positions yet. Create one in the first tab.")
+                st.markdown("<hr>",unsafe_allow_html=True)
+
+            st.markdown(f'<div class="card"><span style="color:#D4A847;font-weight:600"> Total Positions:</span> <b style="color:#E8EEF7">{len(jp_all)}</b> <span style="color:#6B7FA3;font-size:11px">— newest first</span></div>',unsafe_allow_html=True)
+            if len(jp_all)>0:
+                for _,jp in jp_all.iterrows():
+                    status_label="Active" if jp['is_active']==1 else "Inactive"
+                    cat_label=jp['category'] if jp['category'] else "Unmapped"
+                    cat_color="#10B981" if jp['category'] else "#F59E0B"
+                    st.markdown(f"""<div class="card" style="padding:12px 16px;margin-bottom:8px">
+                      <div style="display:flex;justify-content:space-between;align-items:center">
+                        <div>
+                          <span style="font-family:'Cinzel',serif;color:#F0C96B;font-weight:700;font-size:14px">{jp['name']}</span>
+                          <span style="font-size:10px;color:#6B7FA3;margin-left:8px">{status_label}</span>
+                        </div>
+                        <div style="text-align:right"><span class="cc-tag" style="background:rgba(16,185,129,0.12);color:{cat_color};border-color:rgba(16,185,129,0.3)">Category: {cat_label}</span></div>
+                      </div>
+                    </div>""",unsafe_allow_html=True)
+            else:
+                st.info("No positions created yet.")
+            jp_buf=io.BytesIO()
+            with pd.ExcelWriter(jp_buf,engine="xlsxwriter") as w: jp_all.to_excel(w,index=False,sheet_name="Positions")
+            st.download_button("Export Positions List",jp_buf.getvalue(),file_name=f"Positions_{datetime.now().strftime('%Y%m%d')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
     # ════════════════════════════════════════════════════════
@@ -5575,9 +5764,14 @@ if not st.session_state.get("role"):
       font-family:'Cinzel',serif;font-weight:700;font-size:13px;letter-spacing:.15em;margin-bottom:16px}
     .public-ribbon .ribbon-sq{width:20px;height:20px;background:#0D1526;margin:5px 0;border-radius:2px}
     [data-testid="stAppViewContainer"] .main .block-container{padding-left:52px !important}
-    </style>
-    <div class="public-ribbon">
-      <div class="ribbon-label">OFFICE</div>
-      <div class="ribbon-sq"></div><div class="ribbon-sq"></div><div class="ribbon-sq"></div>
-      <div class="ribbon-sq"></div><div class="ribbon-sq"></div>
-    </div>""",unsafe_allow_html=True)
+    </style>""",unsafe_allow_html=True)
+    # Rendered as its OWN markdown call, with every line flush-left (no
+    # leading indentation) — CommonMark treats 4+ leading spaces on a new
+    # block as an indented code block, which is exactly why this div was
+    # showing up as literal text instead of being rendered as HTML.
+    st.markdown(
+"""<div class="public-ribbon">
+<div class="ribbon-label">OFFICE</div>
+<div class="ribbon-sq"></div><div class="ribbon-sq"></div><div class="ribbon-sq"></div>
+<div class="ribbon-sq"></div><div class="ribbon-sq"></div>
+</div>""",unsafe_allow_html=True)
