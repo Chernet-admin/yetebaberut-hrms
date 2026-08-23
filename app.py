@@ -1527,7 +1527,30 @@ section[data-testid="stSidebar"] div.stButton button:hover{
 # built-in Streamlit behavior, not something that can silently break. ──
 if st.session_state.role:
     with st.sidebar:
-        st.markdown(f'<div class="ygsp-sidebar-title" style="color:#F0C96B;font-family:\'Cinzel\',serif;font-size:13px;font-weight:700">Main Menu</div>',unsafe_allow_html=True)
+        st.markdown(f'<div class="ygsp-sidebar-title" id="ygsp-hamburger-title" style="color:#F0C96B;font-family:\'Cinzel\',serif;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:8px"><span style="font-size:16px;line-height:1">☰</span> Main Menu</div>',unsafe_allow_html=True)
+        components.html("""
+        <script>
+        (function(){
+          function wireHamburger(){
+            try{
+              var doc = window.parent.document;
+              var title = doc.getElementById('ygsp-hamburger-title');
+              if(title && !title.dataset.wired){
+                title.dataset.wired='1';
+                title.addEventListener('click', function(){
+                  var btn = doc.querySelector('[data-testid="stSidebarCollapseButton"] button')
+                         || doc.querySelector('[data-testid="stSidebarCollapsedControl"] button')
+                         || doc.querySelector('[data-testid="stSidebarCollapsedControl"]');
+                  if(btn) btn.click();
+                });
+              }
+            }catch(e){}
+          }
+          wireHamburger();
+          setInterval(wireHamburger, 500);
+        })();
+        </script>
+        """, height=0)
         for group_label, group_views in NAV_GROUPS:
             visible_in_group = [v for v in group_views if v in VIEWS]
             if not visible_in_group: continue
@@ -1768,6 +1791,8 @@ with main_block:
               <div class="mb mg-gold"><div class="ml ml-gold">Total in Scope</div><div class="mv">{total_in_scope}</div></div>
             </div>""",unsafe_allow_html=True)
             st.markdown("<hr>",unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="public-welcome">WELCOME</div>',unsafe_allow_html=True)
 
         c1,c2,c3=st.columns(3)
         for col,ic,ttl,col_hex,txt in [
@@ -5443,3 +5468,32 @@ with main_block:
                 st.cache_data.clear()
                 st.success("All employee records deleted. You can now add real employees via Applicant Intake.")
                 st.rerun()
+
+# ════════════════════════════════════════════════════════
+# PUBLIC (LOGGED-OUT) THEME — light cyan/gold palette for the
+# unauthenticated landing page only. Injected at the very end of the
+# script run so it is always the LAST <style> block in the page and
+# therefore wins over every other CSS block above (several of which set
+# .stApp / sidebar colors unconditionally). Logged-in users never see
+# this since it's gated on there being no active session.
+# ════════════════════════════════════════════════════════
+if not st.session_state.get("role"):
+    st.markdown("""<style>
+    .stApp{background:linear-gradient(180deg,#EAF6FC,#DDF1FA) !important;color:#1B2A3A !important}
+    .yh{background:#FFFFFF !important;border:1px solid rgba(212,168,71,0.4) !important;
+      border-bottom:1px solid rgba(212,168,71,0.4) !important;box-shadow:0 2px 10px rgba(56,189,248,0.08)}
+    .hb{color:#D4A847 !important}
+    .ht{color:#5B7A99 !important}
+    .cs{background:#FFFFFF !important;border:1px solid rgba(56,189,248,0.25) !important}
+    .ci{color:#3B5673 !important;border-right:1px solid rgba(56,189,248,0.15) !important}
+    .card{background:#FFFFFF !important;border:1px solid rgba(56,189,248,0.2) !important;
+      box-shadow:0 2px 10px rgba(56,189,248,0.06)}
+    .card *{color:#3B5673 !important}
+    .public-welcome{font-family:'Cinzel',serif;font-size:44px;font-weight:700;color:#16A085 !important;
+      text-align:center;margin:26px 0 18px;letter-spacing:.04em}
+    div.stButton>button{background:linear-gradient(135deg,#C7D840,#A8C93A) !important;color:#1B2A3A !important}
+    section[data-testid="stSidebar"]{background:#FFFFFF !important}
+    div[data-testid="stAlert"]{background:#FFFFFF !important;color:#1B2A3A !important;
+      border:1px solid rgba(56,189,248,0.3) !important}
+    div[data-testid="stAlert"] *{color:#1B2A3A !important}
+    </style>""",unsafe_allow_html=True)
