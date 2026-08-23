@@ -19,6 +19,15 @@ import psycopg2.extensions
 
 st.set_page_config(page_title="Yetebaberut GSP — HRMS",page_icon="🏢",layout="wide",initial_sidebar_state="expanded")
 
+# ════════════════════════════════════════════════════════
+# COMPANY LOGO — base64-encoded so the whole app stays a single file with
+# no separate static-asset path to manage on Railway. Empty by default;
+# paste a base64 PNG/JPG string here (no "data:image/..." prefix, just
+# the raw base64 payload) to have the real circular seal logo render in
+# the header and sidebar instead of the text-only fallback badge.
+# ════════════════════════════════════════════════════════
+COMPANY_LOGO_B64 = ""  # <- paste base64 logo image data here
+
 # ══════════════════════════════════════════════════════════════════
 # POSTGRES COMPATIBILITY SHIM
 # The rest of this app was written against sqlite3's interface
@@ -1292,10 +1301,17 @@ with sticky_header:
     h1,h2=st.columns([3.5,1])
     with h1:
         welcome_text = f"Welcome, {st.session_state.full_name}" if st.session_state.role else "Welcome"
-        st.markdown(f"""<div class="yh">
+        if COMPANY_LOGO_B64:
+            logo_html = f'<img src="data:image/png;base64,{COMPANY_LOGO_B64}" style="width:52px;height:52px;border-radius:50%;object-fit:cover;flex-shrink:0"/>'
+        else:
+            logo_html = '<div style="width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,#D4A847,#F0C96B);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-family:\'Cinzel\',serif;font-weight:700;color:#0D1526;font-size:18px">YG</div>'
+        st.markdown(f"""<div class="yh" style="display:flex;align-items:center;gap:14px">
+          {logo_html}
+          <div>
           <div style="font-size:11px;color:#10B981;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px">{welcome_text}</div>
           <div class="hb">YETEBABERUT · GENERAL SERVICE PROVIDER</div>
           <div class="ht">Human Resource Management System | Addis Ababa, Ethiopia | Est. 2015</div>
+          </div>
         </div>""",unsafe_allow_html=True)
     with h2:
         if not st.session_state.role:
@@ -1360,8 +1376,8 @@ with sticky_header:
     st.markdown("""<div class="cs">
       <div class="ci"> Addis Ababa, Ethiopia</div>
       <div class="ci"> yetebaberutgsp2018@gmail.com</div>
-      <div class="ci"> +251 91 184 8179 / +251 92 016 2327</div>
-      <div class="ci"> +251 91 055 6909 / 018-68-87-70</div>
+      <div class="ci"> +251 929 919333 / +251 929 939033</div>
+      <div class="ci"> Telegram:- +251 929 919333</div>
     </div>""",unsafe_allow_html=True)
     st.markdown("<hr style='margin:6px 0 !important'>",unsafe_allow_html=True)
 
@@ -4876,8 +4892,8 @@ with main_block:
         oc1,oc2=st.columns(2)
         with oc1: total_div_count=len(get_division_list())
         conn=get_conn()
-        cc_all=pg_read_sql("SELECT * FROM cost_centers ORDER BY division,code",conn)
-        div_all=pg_read_sql("SELECT * FROM divisions ORDER BY name",conn)
+        cc_all=pg_read_sql("SELECT * FROM cost_centers ORDER BY created_at DESC",conn)
+        div_all=pg_read_sql("SELECT * FROM divisions ORDER BY created_at DESC",conn)
         conn.close()
         st.markdown(f"""<div class="mg" style="grid-template-columns:repeat(2,1fr)">
           <div class="mb mg-teal"><div class="ml ml-teal">Divisions</div><div class="mv">{total_div_count}</div></div>
@@ -4888,25 +4904,7 @@ with main_block:
 
         # ── DIVISIONS TAB ──
         with cc_div_tab:
-            st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">Divisions are created manually here — there is no built-in default list. Every division dropdown in the system (Applicant Intake, Employee Directory, Employee Profile, Payroll, Supervisor assignment) reads from this list.</div>',unsafe_allow_html=True)
-            if len(div_all)>0:
-                for _,dv in div_all.iterrows():
-                    status_label="Active" if dv['is_active']==1 else "Inactive"
-                    st.markdown(f"""<div class="card" style="padding:12px 16px;margin-bottom:8px">
-                      <div style="display:flex;justify-content:space-between;align-items:center">
-                        <div>
-                          <span style="font-family:'Cinzel',serif;color:#F0C96B;font-weight:700;font-size:14px">{dv['name']}</span>
-                          <span style="color:#94A8C8;font-size:12px;margin-left:8px">{dv['description'] or ''}</span>
-                        </div>
-                        <div style="text-align:right"><div style="font-size:10px;color:#6B7FA3">{status_label}</div></div>
-                      </div>
-                    </div>""",unsafe_allow_html=True)
-            else:
-                st.info("No divisions created yet — add the first one below.")
-
-            legacy_only=[d for d in get_division_list() if d not in div_all['name'].tolist()] if len(div_all)>0 else get_division_list()
-            if legacy_only:
-                st.markdown(f'<div style="font-size:11px;color:#F59E0B;margin:8px 0">Legacy division name(s) found on existing employee records but not yet registered here: <b>{", ".join(legacy_only)}</b>. They still work in dropdowns, but consider adding them below to keep everything in one place.</div>',unsafe_allow_html=True)
+            st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">Divisions are created manually here — there is no built-in default list. Every division dropdown in the system (Applicant Intake, Employee Directory, Employee Profile, Payroll, Supervisor assignment) reads from this list. Newest division shows first.</div>',unsafe_allow_html=True)
 
             if st.session_state.role=="Manager":
                 dt1,dt2=st.tabs(["Create Division","Manage Divisions"])
@@ -4924,7 +4922,8 @@ with main_block:
                                         (dv_name.strip(),dv_desc,1 if dv_active=="Active" else 0,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                                     conn.commit()
                                     get_division_list.clear()
-                                    st.success(f"Division '{dv_name}' created.")
+                                    st.success(f"Division '{dv_name}' created — it now appears first in the list below.")
+                                    st.rerun()
                                 except sqlite3.IntegrityError:
                                     st.error(f"Division '{dv_name}' already exists.")
                                 finally: conn.close()
@@ -4952,33 +4951,49 @@ with main_block:
                                 get_division_list.clear(); st.error("Moved to Recycle Bin."); st.rerun()
                     else:
                         st.info("No divisions yet. Create one in the first tab.")
+                st.markdown("<hr>",unsafe_allow_html=True)
+
+            if len(div_all)>0:
+                for _,dv in div_all.iterrows():
+                    status_label="Active" if dv['is_active']==1 else "Inactive"
+                    dv_cc_here=cc_all[cc_all['division']==dv['name']] if len(cc_all)>0 else cc_all
+                    dvcol1,dvcol2=st.columns([4,1])
+                    with dvcol1:
+                        st.markdown(f"""<div class="card" style="padding:12px 16px;margin-bottom:4px">
+                          <div style="display:flex;justify-content:space-between;align-items:center">
+                            <div>
+                              <span style="font-family:'Cinzel',serif;color:#F0C96B;font-weight:700;font-size:14px">{dv['name']}</span>
+                              <span style="color:#94A8C8;font-size:12px;margin-left:8px">{dv['description'] or ''}</span>
+                            </div>
+                            <div style="text-align:right"><div style="font-size:10px;color:#6B7FA3">{status_label}</div></div>
+                          </div>
+                        </div>""",unsafe_allow_html=True)
+                    with dvcol2:
+                        show_key=f"show_cc_div_{dv['name']}"
+                        if st.button(f"View Cost Centers ({len(dv_cc_here)})",key=f"btn_{show_key}",use_container_width=True):
+                            st.session_state[show_key]=not st.session_state.get(show_key,False)
+                    if st.session_state.get(f"show_cc_div_{dv['name']}",False):
+                        if len(dv_cc_here)==0:
+                            st.info(f"No cost centers under {dv['name']} yet.")
+                        else:
+                            st.dataframe(dv_cc_here[['code','name','budget','is_active']].rename(
+                                columns={"code":"Code","name":"Name","budget":"Budget","is_active":"Active"}),
+                                use_container_width=True,hide_index=True)
+                    st.markdown('<div style="margin-bottom:6px"></div>',unsafe_allow_html=True)
+            else:
+                st.info("No divisions created yet — add the first one above.")
+
+            legacy_only=[d for d in get_division_list() if d not in div_all['name'].tolist()] if len(div_all)>0 else get_division_list()
+            if legacy_only:
+                st.markdown(f'<div style="font-size:11px;color:#F59E0B;margin:8px 0">Legacy division name(s) found on existing employee records but not yet registered here: <b>{", ".join(legacy_only)}</b>. They still work in dropdowns, but consider adding them above to keep everything in one place.</div>',unsafe_allow_html=True)
+
             div_buf=io.BytesIO()
             with pd.ExcelWriter(div_buf,engine="xlsxwriter") as w:
                 (div_all if len(div_all)>0 else pd.DataFrame(columns=["name","description","is_active"])).to_excel(w,index=False,sheet_name="Divisions")
             st.download_button("Export Division List",div_buf.getvalue(),file_name=f"Divisions_{datetime.now().strftime('%Y%m%d')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        # ── COST CENTERS TAB (unchanged behavior, now nested here) ──
+        # ── COST CENTERS TAB — Create/Manage first, then newest-first list ──
         with cc_cc_tab:
-            st.markdown(f'<div class="card"><span style="color:#D4A847;font-weight:600"> Total Cost Centers:</span> <b style="color:#E8EEF7">{len(cc_all)}</b></div>',unsafe_allow_html=True)
-            if len(cc_all)>0:
-                for div in cc_all['division'].unique():
-                    div_ccs=cc_all[cc_all['division']==div]
-                    st.markdown(f'<div class="fs">{div} Division</div>',unsafe_allow_html=True)
-                    for _,ccr in div_ccs.iterrows():
-                        status_label="Active" if ccr['is_active']==1 else "Inactive"
-                        st.markdown(f"""<div class="card" style="padding:12px 16px;margin-bottom:8px">
-                          <div style="display:flex;justify-content:space-between;align-items:center">
-                            <div>
-                              <span style="font-family:'Cinzel',serif;color:#F0C96B;font-weight:700;font-size:14px">{ccr['code']}</span>
-                              <span style="color:#94A8C8;font-size:12px;margin-left:8px">{ccr['name']}</span>
-                            </div>
-                            <div style="text-align:right">
-                              <div style="color:#10B981;font-size:13px;font-weight:600">ETB {ccr['budget']:,.2f}</div>
-                              <div style="font-size:10px;color:#6B7FA3">{status_label}</div>
-                            </div>
-                          </div>
-                        </div>""",unsafe_allow_html=True)
-            st.markdown("<hr>",unsafe_allow_html=True)
             if st.session_state.role=="Manager":
                 t1,t2=st.tabs(["Create Cost Center","Manage Cost Centers"])
                 with t1:
@@ -5496,4 +5511,17 @@ if not st.session_state.get("role"):
     div[data-testid="stAlert"]{background:#FFFFFF !important;color:#1B2A3A !important;
       border:1px solid rgba(56,189,248,0.3) !important}
     div[data-testid="stAlert"] *{color:#1B2A3A !important}
-    </style>""",unsafe_allow_html=True)
+    /* Outer frame + left ribbon, matching the client reference layout */
+    .stApp{border:10px solid #4FC3E8 !important;box-sizing:border-box !important}
+    .public-ribbon{position:fixed;left:10px;top:10px;bottom:10px;width:34px;background:#4FC3E8;
+      z-index:9999;display:flex;flex-direction:column;align-items:center;padding:14px 0}
+    .public-ribbon .ribbon-label{writing-mode:vertical-rl;transform:rotate(180deg);color:#F0C96B;
+      font-family:'Cinzel',serif;font-weight:700;font-size:13px;letter-spacing:.15em;margin-bottom:16px}
+    .public-ribbon .ribbon-sq{width:20px;height:20px;background:#0D1526;margin:5px 0;border-radius:2px}
+    [data-testid="stAppViewContainer"] .main .block-container{padding-left:52px !important}
+    </style>
+    <div class="public-ribbon">
+      <div class="ribbon-label">OFFICE</div>
+      <div class="ribbon-sq"></div><div class="ribbon-sq"></div><div class="ribbon-sq"></div>
+      <div class="ribbon-sq"></div><div class="ribbon-sq"></div>
+    </div>""",unsafe_allow_html=True)
