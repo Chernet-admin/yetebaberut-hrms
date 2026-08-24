@@ -3872,7 +3872,12 @@ with main_block:
                         with jp_cols_ui[i%3]:
                             already_here = (jprow['category'] or "") == sc_cat_code_current and sc_cat_code_current!=""
                             label = jprow['name'] + (f"  (currently: {jprow['category']})" if jprow['category'] and not already_here else "")
-                            position_ticks[jprow['name']] = st.checkbox(label,value=bool(already_here),key=f"sc_pos_tick_{jprow['name']}")
+                            # Key includes cat_pick (the category picker's own selection,
+                            # stable across reruns) so each category gets an independent
+                            # checkbox state — without this, Streamlit reuses whatever
+                            # checked/unchecked state was left from the LAST category you
+                            # viewed and silently ignores the value= default on rerun.
+                            position_ticks[jprow['name']] = st.checkbox(label,value=bool(already_here),key=f"sc_pos_tick_{cat_pick}_{jprow['name']}")
 
                 # ── Live Annex III calculation preview ──
                 vat_pct_cat=float(get_setting("policy_vat_percent","15"))
@@ -5764,6 +5769,7 @@ if not st.session_state.get("role"):
       font-family:'Cinzel',serif;font-weight:700;font-size:13px;letter-spacing:.15em;margin-bottom:16px}
     .public-ribbon .ribbon-sq{width:20px;height:20px;background:#0D1526;margin:5px 0;border-radius:2px}
     [data-testid="stAppViewContainer"] .main .block-container{padding-left:52px !important}
+    .st-key-sticky_header{left:52px !important;width:calc(100% - 52px) !important}
     </style>""",unsafe_allow_html=True)
     # Rendered as its OWN markdown call, with every line flush-left (no
     # leading indentation) — CommonMark treats 4+ leading spaces on a new
