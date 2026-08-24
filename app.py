@@ -3830,113 +3830,123 @@ with main_block:
                 st.info("No salary categories configured yet.")
 
             if st.session_state.role=="Manager":
-                st.markdown("<hr>",unsafe_allow_html=True)
-                st.markdown('<div class="fs">Add / Update a Category Rate</div>',unsafe_allow_html=True)
-                st.markdown('<div style="font-size:11px;color:#F59E0B;margin-bottom:8px">Categories A–E are pre-loaded with their position lists. Pick one (or type a new code), fill in the rates, and the full Annex III calculation updates live below as you type. After saving, use "Apply to Prepared Payroll" further down to push the new rate into payroll already prepared but not yet given final General Manager approval.</div>',unsafe_allow_html=True)
-
                 existing_cats=cat_df['category'].tolist() if len(cat_df)>0 else []
-                cat_pick_opts=["+ New Category"]+existing_cats
-                cat_pick=st.selectbox("Category to edit",cat_pick_opts,key="sc_cat_pick")
-                if cat_pick=="+ New Category":
-                    pre={"category":"","position_examples":"","basic_salary":0.0,"transport_allowance":0.0,
-                        "meal_allowance":0.0,"medical_insurance":0.0,"paid_leave":0.0,"overhead_profit":0.0}
-                else:
-                    pre=cat_df[cat_df['category']==cat_pick].iloc[0].to_dict()
-
-                sc1,sc2=st.columns(2)
-                with sc1: sc_cat=st.text_input("Category (e.g. A, B, C, D, E)",value=pre.get("category") or "",placeholder="A",key="sc_cat_code")
-                with sc2: sc_examples=st.text_input("Position Examples",value=pre.get("position_examples") or "",placeholder="Cleaner, Laborer, Gardner, Waitress...",key="sc_positions")
-                sc3,sc4,sc5,sc6=st.columns(4)
-                with sc3: sc_basic=st.number_input("Basic Salary Per Head",min_value=0.0,value=float(pre.get("basic_salary") or 0),step=50.0,key="sc_basic_in")
-                with sc4: sc_transport=st.number_input("Transport Allowance",min_value=0.0,value=float(pre.get("transport_allowance") or 0),step=50.0,key="sc_transport_in")
-                with sc5: sc_meal=st.number_input("Meal Allowance",min_value=0.0,value=float(pre.get("meal_allowance") or 0),step=50.0,help="e.g. 30 birr/day × 26 days",key="sc_meal_in")
-                with sc6: sc_medical=st.number_input("Medical Insurance",min_value=0.0,value=float(pre.get("medical_insurance") or 0),step=50.0,key="sc_medical_in")
-                sc7,sc8=st.columns(2)
-                with sc7: sc_paidleave=st.number_input("Paid Leave",min_value=0.0,value=float(pre.get("paid_leave") or 0),step=10.0,key="sc_paidleave_in")
-                with sc8: sc_overhead=st.number_input("Overhead and Profit Margin per person",min_value=0.0,value=float(pre.get("overhead_profit") or 0),step=50.0,key="sc_overhead_in")
-
-                # ── Position mapping — tick every Position that belongs to this
-                # Category. This is the actual auto-connect: an employee hired
-                # into a ticked Position picks up this Category's rate
-                # automatically, with no manual per-employee category entry. ──
-                st.markdown('<div class="fs" style="margin-top:10px">Positions in This Category</div>',unsafe_allow_html=True)
-                st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:6px">Tick every Position that should use this Category\'s rate. A Position can only belong to one Category — ticking it here moves it out of any other Category it was in.</div>',unsafe_allow_html=True)
                 jp_all_sc=get_job_positions(active_only=False)
-                sc_cat_code_current=sc_cat.strip().upper()
-                position_ticks={}
+
+                # ═══════════════════════════════════════════
+                # STEP 1 — Create a Category and tick its Positions
+                # ═══════════════════════════════════════════
+                st.markdown("<hr>",unsafe_allow_html=True)
+                st.markdown('<div class="fs">Step 1 — Create Category & Assign Positions</div>',unsafe_allow_html=True)
+                st.markdown('<div style="font-size:11px;color:#F59E0B;margin-bottom:8px">Name the Category, tick every Position that belongs to it, then Save. This step only creates the group — salary figures are filled in Step 2 below, for an existing Category.</div>',unsafe_allow_html=True)
+
+                s1_1,s1_2=st.columns(2)
+                with s1_1: s1_cat=st.text_input("Category (e.g. A, B, C, D, E)",placeholder="A",key="s1_cat_code")
+                with s1_2: s1_examples=st.text_input("Position Examples (optional label)",placeholder="Cleaner, Laborer, Gardner, Waitress...",key="s1_examples")
+                s1_cat_code=s1_cat.strip().upper()
+
+                st.markdown('<div style="font-size:12px;color:#94A8C8;margin:8px 0 4px">Tick every Position for this Category:</div>',unsafe_allow_html=True)
+                s1_ticks={}
                 if len(jp_all_sc)==0:
                     st.info("No positions created yet — add them in Cost Centers → Job Positions.")
                 else:
-                    jp_cols_ui=st.columns(3)
+                    s1_cols=st.columns(3)
                     for i,(_,jprow) in enumerate(jp_all_sc.iterrows()):
-                        with jp_cols_ui[i%3]:
-                            already_here = (jprow['category'] or "") == sc_cat_code_current and sc_cat_code_current!=""
+                        with s1_cols[i%3]:
+                            already_here = (jprow['category'] or "") == s1_cat_code and s1_cat_code!=""
                             label = jprow['name'] + (f"  (currently: {jprow['category']})" if jprow['category'] and not already_here else "")
-                            # Key includes cat_pick (the category picker's own selection,
-                            # stable across reruns) so each category gets an independent
-                            # checkbox state — without this, Streamlit reuses whatever
-                            # checked/unchecked state was left from the LAST category you
-                            # viewed and silently ignores the value= default on rerun.
-                            position_ticks[jprow['name']] = st.checkbox(label,value=bool(already_here),key=f"sc_pos_tick_{cat_pick}_{jprow['name']}")
+                            # Keyed by the typed category code so a fresh code always
+                            # starts unticked, and re-typing an existing code shows
+                            # its real current mapping — not leftover state from
+                            # whatever code was in the box a moment ago.
+                            s1_ticks[jprow['name']] = st.checkbox(label,value=bool(already_here),key=f"s1_tick_{s1_cat_code}_{jprow['name']}")
 
-                # ── Live Annex III calculation preview ──
-                vat_pct_cat=float(get_setting("policy_vat_percent","15"))
-                transport_exempt=float(get_setting("policy_transport_tax_exemption","600"))
-                sc_pension_er=round(sc_basic*0.11,2)
-                sc_pension_emp=round(sc_basic*0.07,2)
-                sc_gross_earning=round(sc_basic+sc_transport+sc_meal+sc_medical+sc_pension_er+sc_paidleave+sc_overhead,2)
-                sc_vat=round(sc_gross_earning*(vat_pct_cat/100.0),2)
-                sc_total_paid=round(sc_gross_earning+sc_vat,2)
-                sc_taxable=max(round(sc_basic+sc_transport-transport_exempt,2),0)
-                sc_income_tax=round(eth_tax(sc_taxable),2)
-                sc_net_pay=round(sc_basic+sc_transport-sc_income_tax-sc_pension_emp,2)
-
-                st.markdown(f"""<div class="ps" style="border-color:rgba(56,189,248,0.3);background:linear-gradient(135deg,#0D1526,#0A1A2A)">
-                  <div style="font-family:'Cinzel',serif;font-size:12px;color:#38BDF8;margin-bottom:10px;letter-spacing:.05em">LIVE PREVIEW — CATEGORY {sc_cat.strip().upper() or '—'}</div>
-                  <div class="pr"><span class="pl">Basic Salary</span><span class="pv">ETB {sc_basic:,.2f}</span></div>
-                  <div class="pr"><span class="pl">+ Transport Allowance</span><span class="pv">ETB {sc_transport:,.2f}</span></div>
-                  <div class="pr"><span class="pl">+ Meal Allowance</span><span class="pv">ETB {sc_meal:,.2f}</span></div>
-                  <div class="pr"><span class="pl">+ Medical Insurance</span><span class="pv">ETB {sc_medical:,.2f}</span></div>
-                  <div class="pr"><span class="pl">+ Employer Pension (11%)</span><span class="pv">ETB {sc_pension_er:,.2f}</span></div>
-                  <div class="pr"><span class="pl">+ Paid Leave</span><span class="pv">ETB {sc_paidleave:,.2f}</span></div>
-                  <div class="pr"><span class="pl">+ Overhead / Profit</span><span class="pv">ETB {sc_overhead:,.2f}</span></div>
-                  <div class="pr" style="border-top:1px solid rgba(56,189,248,0.3);margin-top:4px;padding-top:8px"><span class="pl" style="font-weight:600">= GROSS EARNING</span><span class="pv" style="color:#38BDF8;font-weight:600">ETB {sc_gross_earning:,.2f}</span></div>
-                  <div class="pr"><span class="pl">+ VAT ({vat_pct_cat:.0f}%)</span><span class="pv">ETB {sc_vat:,.2f}</span></div>
-                  <div class="pr" style="border-top:1px solid rgba(56,189,248,0.3);margin-top:4px;padding-top:8px"><span class="pl" style="font-size:13px;font-weight:600;color:#E8EEF7">= TOTAL PAID PER MM</span><span class="pv" style="color:#7DD3FC;font-weight:700">ETB {sc_total_paid:,.2f}</span></div>
-                  <div class="pr" style="margin-top:10px"><span class="pl">Taxable Amount (Basic+Transport − ETB {transport_exempt:,.0f} exemption)</span><span class="pv">ETB {sc_taxable:,.2f}</span></div>
-                  <div class="pr"><span class="pl">− Employee Pension (7%)</span><span class="pd">- ETB {sc_pension_emp:,.2f}</span></div>
-                  <div class="pr"><span class="pl">− Income Tax</span><span class="pd">- ETB {sc_income_tax:,.2f}</span></div>
-                  <div class="pr" style="border-top:1px solid rgba(16,185,129,0.3);margin-top:6px;padding-top:10px"><span class="pl" style="font-size:14px;font-weight:600;color:#E8EEF7">= NET PAY</span><span class="pn">ETB {sc_net_pay:,.2f}</span></div>
-                </div>""",unsafe_allow_html=True)
-                st.caption("Income Tax and the transport exemption use the standard PAYE brackets already built into the payroll engine — this preview shows what an employee in this Category would net, before any individual overrides at Process Payroll time.")
-
-                if st.button("Save Category Rate",use_container_width=True,key="sc_save_btn"):
-                    if not sc_cat.strip():
+                if st.button("Create / Update Category & Positions",use_container_width=True,key="s1_save_btn"):
+                    if not s1_cat_code:
                         st.error("Category is required.")
                     else:
                         conn=get_conn()
-                        conn.execute("""INSERT INTO salary_categories(category,position_examples,basic_salary,
-                            transport_allowance,meal_allowance,medical_insurance,paid_leave,overhead_profit,updated_by,updated_at)
-                            VALUES(?,?,?,?,?,?,?,?,?,?)
-                            ON CONFLICT(category) DO UPDATE SET position_examples=?,basic_salary=?,
-                            transport_allowance=?,meal_allowance=?,medical_insurance=?,paid_leave=?,overhead_profit=?,updated_by=?,updated_at=?""",
-                            (sc_cat.strip().upper(),sc_examples,sc_basic,sc_transport,sc_meal,sc_medical,sc_paidleave,sc_overhead,
-                             st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                             sc_examples,sc_basic,sc_transport,sc_meal,sc_medical,sc_paidleave,sc_overhead,
-                             st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-                        # Apply position mapping: ticked positions move into this
-                        # Category; positions that WERE this Category but got
-                        # unticked fall back to unmapped.
+                        if s1_cat_code in existing_cats:
+                            conn.execute("UPDATE salary_categories SET position_examples=?,updated_by=?,updated_at=? WHERE category=?",
+                                (s1_examples,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),s1_cat_code))
+                        else:
+                            conn.execute("""INSERT INTO salary_categories(category,position_examples,basic_salary,
+                                transport_allowance,meal_allowance,medical_insurance,paid_leave,overhead_profit,updated_by,updated_at)
+                                VALUES(?,?,0,0,0,0,0,0,?,?)""",
+                                (s1_cat_code,s1_examples,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                         moved_in=0
-                        for pos_name,ticked in position_ticks.items():
+                        for pos_name,ticked in s1_ticks.items():
                             if ticked:
-                                conn.execute("UPDATE job_positions SET category=? WHERE name=?",(sc_cat_code_current,pos_name))
+                                conn.execute("UPDATE job_positions SET category=? WHERE name=?",(s1_cat_code,pos_name))
                                 moved_in+=1
                             else:
-                                conn.execute("UPDATE job_positions SET category=NULL WHERE name=? AND category=?",(pos_name,sc_cat_code_current))
+                                conn.execute("UPDATE job_positions SET category=NULL WHERE name=? AND category=?",(pos_name,s1_cat_code))
                         conn.commit(); conn.close()
                         get_salary_categories.clear(); get_job_positions.clear()
-                        st.success(f"Category {sc_cat_code_current} rate saved — {moved_in} position(s) mapped to it.")
+                        st.success(f"Category {s1_cat_code} created/updated — {moved_in} position(s) assigned. Now go to Step 2 below to fill in its salary status.")
+                        st.rerun()
+
+                # ═══════════════════════════════════════════
+                # STEP 2 — Fill in the salary status for an existing Category
+                # ═══════════════════════════════════════════
+                st.markdown("<hr>",unsafe_allow_html=True)
+                st.markdown('<div class="fs">Step 2 — Set Salary Status for a Category</div>',unsafe_allow_html=True)
+                if not existing_cats:
+                    st.info("Create a Category in Step 1 first.")
+                else:
+                    cat_pick=st.selectbox("Category",existing_cats,key="sc_cat_pick")
+                    pre=cat_df[cat_df['category']==cat_pick].iloc[0].to_dict()
+
+                    sc3,sc4,sc5,sc6=st.columns(4)
+                    with sc3: sc_basic=st.number_input("Basic Salary Per Head",min_value=0.0,value=float(pre.get("basic_salary") or 0),step=50.0,key="sc_basic_in")
+                    with sc4: sc_transport=st.number_input("Transport Allowance",min_value=0.0,value=float(pre.get("transport_allowance") or 0),step=50.0,key="sc_transport_in")
+                    with sc5: sc_meal=st.number_input("Meal Allowance",min_value=0.0,value=float(pre.get("meal_allowance") or 0),step=50.0,help="e.g. 30 birr/day × 26 days",key="sc_meal_in")
+                    with sc6: sc_medical=st.number_input("Medical Insurance",min_value=0.0,value=float(pre.get("medical_insurance") or 0),step=50.0,key="sc_medical_in")
+                    sc7,sc8=st.columns(2)
+                    with sc7: sc_paidleave=st.number_input("Paid Leave",min_value=0.0,value=float(pre.get("paid_leave") or 0),step=10.0,key="sc_paidleave_in")
+                    with sc8: sc_overhead=st.number_input("Overhead and Profit Margin per person",min_value=0.0,value=float(pre.get("overhead_profit") or 0),step=50.0,key="sc_overhead_in")
+
+                    # ── Live Annex III calculation preview ──
+                    vat_pct_cat=float(get_setting("policy_vat_percent","15"))
+                    transport_exempt=float(get_setting("policy_transport_tax_exemption","600"))
+                    sc_pension_er=round(sc_basic*0.11,2)
+                    sc_pension_emp=round(sc_basic*0.07,2)
+                    sc_gross_earning=round(sc_basic+sc_transport+sc_meal+sc_medical+sc_pension_er+sc_paidleave+sc_overhead,2)
+                    sc_vat=round(sc_gross_earning*(vat_pct_cat/100.0),2)
+                    sc_total_paid=round(sc_gross_earning+sc_vat,2)
+                    sc_taxable=max(round(sc_basic+sc_transport-transport_exempt,2),0)
+                    sc_income_tax=round(eth_tax(sc_taxable),2)
+                    sc_net_pay=round(sc_basic+sc_transport-sc_income_tax-sc_pension_emp,2)
+
+                    st.markdown(f"""<div class="ps" style="border-color:rgba(56,189,248,0.3);background:linear-gradient(135deg,#0D1526,#0A1A2A)">
+                      <div style="font-family:'Cinzel',serif;font-size:12px;color:#38BDF8;margin-bottom:10px;letter-spacing:.05em">LIVE PREVIEW — CATEGORY {cat_pick}</div>
+                      <div class="pr"><span class="pl">Basic Salary</span><span class="pv">ETB {sc_basic:,.2f}</span></div>
+                      <div class="pr"><span class="pl">+ Transport Allowance</span><span class="pv">ETB {sc_transport:,.2f}</span></div>
+                      <div class="pr"><span class="pl">+ Meal Allowance</span><span class="pv">ETB {sc_meal:,.2f}</span></div>
+                      <div class="pr"><span class="pl">+ Medical Insurance</span><span class="pv">ETB {sc_medical:,.2f}</span></div>
+                      <div class="pr"><span class="pl">+ Employer Pension (11%)</span><span class="pv">ETB {sc_pension_er:,.2f}</span></div>
+                      <div class="pr"><span class="pl">+ Paid Leave</span><span class="pv">ETB {sc_paidleave:,.2f}</span></div>
+                      <div class="pr"><span class="pl">+ Overhead / Profit</span><span class="pv">ETB {sc_overhead:,.2f}</span></div>
+                      <div class="pr" style="border-top:1px solid rgba(56,189,248,0.3);margin-top:4px;padding-top:8px"><span class="pl" style="font-weight:600">= GROSS EARNING</span><span class="pv" style="color:#38BDF8;font-weight:600">ETB {sc_gross_earning:,.2f}</span></div>
+                      <div class="pr"><span class="pl">+ VAT ({vat_pct_cat:.0f}%)</span><span class="pv">ETB {sc_vat:,.2f}</span></div>
+                      <div class="pr" style="border-top:1px solid rgba(56,189,248,0.3);margin-top:4px;padding-top:8px"><span class="pl" style="font-size:13px;font-weight:600;color:#E8EEF7">= TOTAL PAID PER MM</span><span class="pv" style="color:#7DD3FC;font-weight:700">ETB {sc_total_paid:,.2f}</span></div>
+                      <div class="pr" style="margin-top:10px"><span class="pl">Taxable Amount (Basic+Transport − ETB {transport_exempt:,.0f} exemption)</span><span class="pv">ETB {sc_taxable:,.2f}</span></div>
+                      <div class="pr"><span class="pl">− Employee Pension (7%)</span><span class="pd">- ETB {sc_pension_emp:,.2f}</span></div>
+                      <div class="pr"><span class="pl">− Income Tax</span><span class="pd">- ETB {sc_income_tax:,.2f}</span></div>
+                      <div class="pr" style="border-top:1px solid rgba(16,185,129,0.3);margin-top:6px;padding-top:10px"><span class="pl" style="font-size:14px;font-weight:600;color:#E8EEF7">= NET PAY</span><span class="pn">ETB {sc_net_pay:,.2f}</span></div>
+                    </div>""",unsafe_allow_html=True)
+                    st.caption("Income Tax and the transport exemption use the standard PAYE brackets already built into the payroll engine — this preview shows what an employee in this Category would net, before any individual overrides at Process Payroll time.")
+
+                    if st.button(f"Save Salary Status for Category {cat_pick}",use_container_width=True,key="sc_save_btn"):
+                        conn=get_conn()
+                        conn.execute("""UPDATE salary_categories SET basic_salary=?,transport_allowance=?,
+                            meal_allowance=?,medical_insurance=?,paid_leave=?,overhead_profit=?,updated_by=?,updated_at=?
+                            WHERE category=?""",
+                            (sc_basic,sc_transport,sc_meal,sc_medical,sc_paidleave,sc_overhead,
+                             st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),cat_pick))
+                        conn.commit(); conn.close()
+                        get_salary_categories.clear()
+                        st.success(f"Salary status saved for Category {cat_pick}.")
                         st.rerun()
 
                 if existing_cats:
@@ -5761,13 +5771,19 @@ if not st.session_state.get("role"):
     div[data-testid="stAlert"]{background:#FFFFFF !important;color:#1B2A3A !important;
       border:1px solid rgba(56,189,248,0.3) !important}
     div[data-testid="stAlert"] *{color:#1B2A3A !important}
+    /* Streamlit's own native top header bar is dark by default (set
+    unconditionally elsewhere) — force it light here so no black band
+    shows above the white header card in the public view. */
+    header[data-testid="stHeader"]{background:#EAF6FC !important}
     /* Outer frame + left ribbon, matching the client reference layout */
     .stApp{border:10px solid #4FC3E8 !important;box-sizing:border-box !important}
     .public-ribbon{position:fixed;left:10px;top:10px;bottom:10px;width:34px;background:#4FC3E8;
       z-index:9999;display:flex;flex-direction:column;align-items:center;padding:14px 0}
     .public-ribbon .ribbon-label{writing-mode:vertical-rl;transform:rotate(180deg);color:#F0C96B;
-      font-family:'Cinzel',serif;font-weight:700;font-size:13px;letter-spacing:.15em;margin-bottom:16px}
-    .public-ribbon .ribbon-sq{width:20px;height:20px;background:#0D1526;margin:5px 0;border-radius:2px}
+      font-family:'Cinzel',serif;font-weight:700;font-size:13px;letter-spacing:.15em;margin-bottom:10px}
+    .public-ribbon .ribbon-squares{flex:1;display:flex;flex-direction:column;
+      justify-content:space-evenly;align-items:center;width:100%;padding-bottom:6px}
+    .public-ribbon .ribbon-sq{width:20px;height:20px;background:#0D1526;border-radius:2px}
     [data-testid="stAppViewContainer"] .main .block-container{padding-left:52px !important}
     .st-key-sticky_header{left:52px !important;width:calc(100% - 52px) !important}
     </style>""",unsafe_allow_html=True)
@@ -5778,6 +5794,8 @@ if not st.session_state.get("role"):
     st.markdown(
 """<div class="public-ribbon">
 <div class="ribbon-label">OFFICE</div>
+<div class="ribbon-squares">
 <div class="ribbon-sq"></div><div class="ribbon-sq"></div><div class="ribbon-sq"></div>
 <div class="ribbon-sq"></div><div class="ribbon-sq"></div>
+</div>
 </div>""",unsafe_allow_html=True)
