@@ -262,7 +262,7 @@ def init_db():
         # Division → Cost Center → Employee → Position/Category.
         # job_title already stores the Position; category stores the
         # salary/skill grade (e.g. "A", "B", "C") used by Annex III payroll.
-        "category":"TEXT","payment_method":"TEXT DEFAULT 'Bank Transfer'"}
+        "category":"TEXT","payment_method":"TEXT DEFAULT 'Bank Transfer'","is_buffer":"INTEGER DEFAULT 0"}
     for col,typ in migrations.items():
         if col not in ex:
             try: c.execute(f"ALTER TABLE employees ADD COLUMN {col} {typ}"); conn.commit()
@@ -593,6 +593,24 @@ def init_db():
                 VALUES(?,?,1,'system',?) ON CONFLICT(name) DO NOTHING""",(jp_name,jp_cat,now_jp))
         except: pass
     conn.commit()
+
+    # ── BUFFER / SUBSTITUTE COVERAGE ──
+    # When an employee is on Sick/Vacation/Annual/other leave or Absent, a
+    # Supervisor assigns a Buffer (reserve pool) employee to cover their
+    # position for the period, at the same Division/Cost Center.
+    c.execute("""CREATE TABLE IF NOT EXISTS buffer_assignments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        original_emp_id TEXT NOT NULL,
+        buffer_emp_id TEXT NOT NULL,
+        division TEXT,cost_center TEXT,position TEXT,
+        reason TEXT,
+        start_date TEXT,end_date TEXT,
+        status TEXT DEFAULT 'Active',
+        notes TEXT,
+        assigned_by TEXT,assigned_at TEXT)""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_buffer_original ON buffer_assignments(original_emp_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_buffer_buffer ON buffer_assignments(buffer_emp_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_buffer_status ON buffer_assignments(status)")
 
     # ── SALARY CATEGORIES (Annex III master rate table) ──
     # One row per Category (A, B, C, D, E...). This is the single source
@@ -2524,6 +2542,7 @@ with main_block:
                     with em8: ecd=st.text_input("Contract End (YYYY-MM-DD)",value=r.get("contract_end_date","") or "")
                     so2=["Pending Screening","Pre-Employment Process","Active Deployment","On Leave","Terminated"]
                     est=st.selectbox("Status",so2,index=so2.index(r.get("current_status","Pending Screening")) if r.get("current_status") in so2 else 0)
+                    ebuf=st.checkbox("Available as Buffer / Reserve Employee (can cover for absent/on-leave staff)",value=bool(r.get("is_buffer")))
                     enotes=st.text_area("Internal Notes",value=r.get("notes","") or "")
                     if st.form_submit_button("Save All Changes",use_container_width=True):
                         conn=get_conn()
@@ -2534,12 +2553,12 @@ with main_block:
                             guarantor_company_id=?,guarantor_company_name=?,guarantor_letter_number=?,guarantor_date_written=?,
                             tin_number=?,pension_number=?,bank_name=?,bank_account=?,
                             edu_background=?,field_of_graduate=?,graduation_year=?,institution_name=?,job_title=?,category=?,employment_type=?,
-                            division=?,cost_center=?,basic_salary=?,weekly_dayoff=?,start_date=?,contract_end_date=?,current_status=?,notes=? WHERE emp_id=?""",
+                            division=?,cost_center=?,basic_salary=?,weekly_dayoff=?,start_date=?,contract_end_date=?,current_status=?,is_buffer=?,notes=? WHERE emp_id=?""",
                             (en,ec,ec2,ee,enatid,esx,emar,enat,erel,eage,epob,ebt,eres,ecity,esc2,ewo,eha,
                              eecn,eecp,eeccity,eecsc,eecwo,
                              egn,egp,egcity,egsc,egwo,egcid,egcname,egletter,egdate,
                              etin,epen2,ebnk,eacc,
-                             eedu,efld,egry,eins,ejob,ecat,eety,edep,None if eccsel=="Unassigned" else eccsel,esal,ewd,esd,ecd,est,enotes,eid2))
+                             eedu,efld,egry,eins,ejob,ecat,eety,edep,None if eccsel=="Unassigned" else eccsel,esal,ewd,esd,ecd,est,1 if ebuf else 0,enotes,eid2))
                         conn.commit(); conn.close()
                         st.cache_data.clear()
                         st.success("Profile saved!"); st.rerun()
@@ -2722,7 +2741,7 @@ with main_block:
           <div class="mb mg-purple"><div class="ml ml-purple">On Leave</div><div class="mv">{leave_div}</div></div>
         </div>""",unsafe_allow_html=True)
 
-        sup1,sup2,sup3,sup4,sup5,sup6,sup7=st.tabs(["Record Absence","Record Leave","Issue Fine","Vacation","Movement Log","Submit Monthly Sheet","Daily Status (New Workflow)"])
+        sup1,sup2,sup3,sup4,sup5,sup6,sup7,sup8=st.tabs(["Record Absence","Record Leave","Issue Fine","Vacation","Movement Log","Submit Monthly Sheet","Daily Status (New Workflow)","Buffer Coverage"])
 
         elo_sup={f"{r['emp_id']} — {r['full_name']}":r['emp_id'] for _,r in my_emps.iterrows()}
 
@@ -3066,6 +3085,77 @@ with main_block:
                         "hr_reviewed_by":"HR Manager","hr_comments":"HR Manager Comment"
                     }).drop(columns=["id"]),use_container_width=True,hide_index=True)
 
+        with sup8:
+            st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">When an employee in your division is on Sick Leave, Vacation, Annual Leave, or Absent, assign someone from the <b style="color:#F0C96B">Buffer / Reserve pool</b> to cover their position for the period. Mark an employee as buffer-eligible in Employee Profile → Edit.</div>',unsafe_allow_html=True)
+            conn=get_conn()
+            buffer_pool=pg_read_sql("SELECT emp_id,full_name,job_title FROM employees WHERE division=? AND is_buffer=1 AND current_status != 'Terminated'",conn,params=(my_division,))
+            conn.close()
+
+            if len(buffer_pool)==0:
+                st.warning("No Buffer/Reserve employees found in your division yet. Mark someone as buffer-eligible in Employee Profile → Edit first.")
+            elif len(elo_sup)==0:
+                st.info("No employees currently assigned to your division.")
+            else:
+                buf_lo={f"{r['emp_id']} — {r['full_name']}":r['emp_id'] for _,r in buffer_pool.iterrows()}
+                with st.form("assign_buffer_form",clear_on_submit=True):
+                    bf1,bf2=st.columns(2)
+                    with bf1: bf_orig=st.selectbox("Employee Being Covered",list(elo_sup.keys()),key="bf_orig")
+                    with bf2: bf_sub=st.selectbox("Buffer Employee (covering)",list(buf_lo.keys()),key="bf_sub")
+                    bf3,bf4=st.columns(2)
+                    with bf3: bf_reason=st.selectbox("Reason",["Sick Leave","Vacation","Annual Leave","Absent","Emergency Leave","Other"],key="bf_reason")
+                    with bf4: pass
+                    bf5,bf6=st.columns(2)
+                    with bf5: bf_start=st.date_input("Coverage Start",value=date.today(),key="bf_start")
+                    with bf6: bf_end=st.date_input("Coverage End",value=date.today(),key="bf_end")
+                    bf_notes=st.text_area("Notes",placeholder="Optional...",key="bf_notes")
+                    if st.form_submit_button("Assign Buffer Coverage",use_container_width=True):
+                        orig_eid=elo_sup[bf_orig]; sub_eid=buf_lo[bf_sub]
+                        if orig_eid==sub_eid:
+                            st.error("The buffer employee cannot be the same as the employee being covered.")
+                        elif bf_end<bf_start:
+                            st.error("Coverage End must be on or after Coverage Start.")
+                        else:
+                            conn=get_conn(); cur=conn.cursor()
+                            cur.execute("SELECT emp_id FROM employees WHERE emp_id=?",(orig_eid,))
+                            orig_row=pg_read_sql("SELECT cost_center,job_title FROM employees WHERE emp_id=?",conn,params=(orig_eid,))
+                            cc_here=orig_row.iloc[0]['cost_center'] if len(orig_row)>0 else None
+                            pos_here=orig_row.iloc[0]['job_title'] if len(orig_row)>0 else None
+                            conn.execute("""INSERT INTO buffer_assignments(original_emp_id,buffer_emp_id,division,cost_center,
+                                position,reason,start_date,end_date,status,notes,assigned_by,assigned_at)
+                                VALUES(?,?,?,?,?,?,?,?,'Active',?,?,?)""",
+                                (orig_eid,sub_eid,my_division,cc_here,pos_here,bf_reason,str(bf_start),str(bf_end),
+                                 bf_notes,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                            conn.commit(); conn.close()
+                            st.success(f"{bf_sub} assigned to cover {bf_orig} ({bf_reason}) from {bf_start} to {bf_end}."); st.rerun()
+
+            st.markdown("<hr>",unsafe_allow_html=True)
+            st.markdown('<div class="ey">Coverage — Your Division</div>',unsafe_allow_html=True)
+            conn=get_conn()
+            buf_hist=pg_read_sql("""SELECT ba.id,eo.full_name as covered_employee,eb.full_name as buffer_employee,
+                ba.position,ba.reason,ba.start_date,ba.end_date,ba.status
+                FROM buffer_assignments ba
+                LEFT JOIN employees eo ON ba.original_emp_id=eo.emp_id
+                LEFT JOIN employees eb ON ba.buffer_emp_id=eb.emp_id
+                WHERE ba.division=? ORDER BY ba.assigned_at DESC LIMIT 100""",conn,params=(my_division,))
+            conn.close()
+            if len(buf_hist)==0:
+                st.info("No buffer coverage assignments yet.")
+            else:
+                active_buf=buf_hist[buf_hist['status']=='Active']
+                if len(active_buf)>0:
+                    for _,bh in active_buf.iterrows():
+                        bcc1,bcc2=st.columns([4,1])
+                        with bcc1:
+                            st.markdown(f'<div class="card" style="padding:10px 14px;margin-bottom:6px"><b style="color:#F0C96B">{bh["buffer_employee"]}</b> covering <b style="color:#38BDF8">{bh["covered_employee"]}</b> ({bh["position"] or "—"}) — {bh["reason"]}, {bh["start_date"]} to {bh["end_date"]}</div>',unsafe_allow_html=True)
+                        with bcc2:
+                            if st.button("Mark Completed",key=f"bf_complete_{bh['id']}",use_container_width=True):
+                                conn=get_conn(); conn.execute("UPDATE buffer_assignments SET status='Completed' WHERE id=?",(bh['id'],)); conn.commit(); conn.close()
+                                st.success("Marked completed."); st.rerun()
+                st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-top:8px">Full history:</div>',unsafe_allow_html=True)
+                st.dataframe(buf_hist.drop(columns=["id"]).rename(columns={
+                    "covered_employee":"Covered Employee","buffer_employee":"Buffer Employee","position":"Position",
+                    "reason":"Reason","start_date":"Start","end_date":"End","status":"Status"
+                }),use_container_width=True,hide_index=True)
 
     # ════════════════════════════════════════════════════════
     # PAYROLL — with autonomous day-off date calculation
@@ -4510,6 +4600,31 @@ with main_block:
             lr_buf=io.BytesIO()
             with pd.ExcelWriter(lr_buf,engine="xlsxwriter") as w: display_lr.to_excel(w,index=False,sheet_name="Leave Records")
             st.download_button("Export to Excel",lr_buf.getvalue(),file_name=f"LeaveRecords_{lr_from}_to_{lr_to}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+
+        st.markdown("<hr>",unsafe_allow_html=True)
+        st.markdown('<div class="ey">Buffer / Substitute Coverage — All Divisions</div>',unsafe_allow_html=True)
+        st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Who is currently covering for whom while someone is on leave or absent. Assigned by Supervisors in Supervisor Console → Buffer Coverage.</div>',unsafe_allow_html=True)
+        conn=get_conn()
+        buf_all=pg_read_sql("""SELECT ba.id,eo.full_name as covered_employee,eo.division,eo.cost_center,
+            eb.full_name as buffer_employee,ba.position,ba.reason,ba.start_date,ba.end_date,ba.status
+            FROM buffer_assignments ba
+            LEFT JOIN employees eo ON ba.original_emp_id=eo.emp_id
+            LEFT JOIN employees eb ON ba.buffer_emp_id=eb.emp_id
+            ORDER BY ba.assigned_at DESC LIMIT 300""",conn)
+        conn.close()
+        if len(buf_all)==0:
+            st.info("No buffer coverage assignments recorded yet.")
+        else:
+            active_count=len(buf_all[buf_all['status']=='Active'])
+            st.markdown(f'<div class="mg" style="grid-template-columns:1fr"><div class="mb mg-cyan"><div class="ml ml-cyan">Currently Active Coverage</div><div class="mv">{active_count}</div></div></div>',unsafe_allow_html=True)
+            st.dataframe(buf_all.drop(columns=["id"]).rename(columns={
+                "covered_employee":"Covered Employee","division":"Division","cost_center":"Cost Center",
+                "buffer_employee":"Buffer Employee","position":"Position","reason":"Reason",
+                "start_date":"Start","end_date":"End","status":"Status"
+            }),use_container_width=True,hide_index=True)
+            buf_buf=io.BytesIO()
+            with pd.ExcelWriter(buf_buf,engine="xlsxwriter") as w: buf_all.to_excel(w,index=False,sheet_name="BufferCoverage")
+            st.download_button("Export Buffer Coverage",buf_buf.getvalue(),file_name=f"BufferCoverage_{date.today().isoformat()}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
     # ════════════════════════════════════════════════════════
     # VACATION — dedicated request + approval flow
