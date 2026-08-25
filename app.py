@@ -389,7 +389,7 @@ def init_db():
         status TEXT DEFAULT 'Approved',notes TEXT,created_at TEXT)""")
     c.execute("PRAGMA table_info(leave_records)")
     lrc=[col[1] for col in c.fetchall()]
-    for lrcol,lrtyp in {"edited_by":"TEXT","edited_at":"TEXT","cancelled_by":"TEXT","cancelled_at":"TEXT","cancel_reason":"TEXT","doc_name":"TEXT","doc_data":"BLOB"}.items():
+    for lrcol,lrtyp in {"edited_by":"TEXT","edited_at":"TEXT","cancelled_by":"TEXT","cancelled_at":"TEXT","cancel_reason":"TEXT","doc_name":"TEXT","doc_data":"BLOB","buffer_emp_id":"TEXT"}.items():
         if lrcol not in lrc:
             try: c.execute(f"ALTER TABLE leave_records ADD COLUMN {lrcol} {lrtyp}"); conn.commit()
             except: pass
@@ -407,7 +407,7 @@ def init_db():
     c.execute("PRAGMA table_info(absent_records)")
     arc=[col[1] for col in c.fetchall()]
     for arcol,artyp in {"record_status":"TEXT DEFAULT 'Active'","cancelled_by":"TEXT","cancelled_at":"TEXT",
-        "cancel_reason":"TEXT","is_compensated":"INTEGER DEFAULT 0","compensation_date":"TEXT","compensation_notes":"TEXT"}.items():
+        "cancel_reason":"TEXT","is_compensated":"INTEGER DEFAULT 0","compensation_date":"TEXT","compensation_notes":"TEXT","buffer_emp_id":"TEXT"}.items():
         if arcol not in arc:
             try: c.execute(f"ALTER TABLE absent_records ADD COLUMN {arcol} {artyp}"); conn.commit()
             except: pass
@@ -454,9 +454,15 @@ def init_db():
         workflow_stage TEXT DEFAULT 'Pending HR Review',
         gs_reviewed_by TEXT, gs_reviewed_at TEXT, gs_comments TEXT,
         hr_reviewed_by TEXT, hr_reviewed_at TEXT, hr_comments TEXT,
-        linked_leave_id INTEGER, linked_absent_id INTEGER)""")
+        linked_leave_id INTEGER, linked_absent_id INTEGER,
+        buffer_emp_id TEXT)""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_dsr_emp ON daily_status_records(emp_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_dsr_stage ON daily_status_records(workflow_stage)")
+    c.execute("PRAGMA table_info(daily_status_records)")
+    dsr_cols=[col[1] for col in c.fetchall()]
+    if "buffer_emp_id" not in dsr_cols:
+        try: c.execute("ALTER TABLE daily_status_records ADD COLUMN buffer_emp_id TEXT"); conn.commit()
+        except: pass
 
     c.execute("""CREATE TABLE IF NOT EXISTS system_users(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2745,6 +2751,17 @@ with main_block:
 
         elo_sup={f"{r['emp_id']} — {r['full_name']}":r['emp_id'] for _,r in my_emps.iterrows()}
 
+        # Buffer/Reserve pool for this division — reused by every leave/
+        # absence form below so the Supervisor can optionally pick who
+        # covers a leave right when they file it.
+        conn=get_conn()
+        buffer_pool_sup=pg_read_sql("SELECT emp_id,full_name FROM employees WHERE division=? AND is_buffer=1 AND current_status != 'Terminated'",conn,params=(my_division,))
+        conn.close()
+        BUFFER_NONE="— None —"
+        buf_lo_sup={BUFFER_NONE:None}
+        buf_lo_sup.update({f"{r['emp_id']} — {r['full_name']}":r['emp_id'] for _,r in buffer_pool_sup.iterrows()})
+
+
         with sup1:
             st.markdown('<div style="color:#6B7FA3;font-size:12px;margin-bottom:10px">Record an absence for any employee in your division. This now routes through HR review and HR Manager approval before it becomes final — it no longer saves directly.</div>',unsafe_allow_html=True)
             if len(elo_sup)==0:
@@ -2755,9 +2772,11 @@ with main_block:
                     with a1: ab_emp=st.selectbox("Employee",list(elo_sup.keys()))
                     with a2: ab_date=st.date_input("Date",value=date.today())
                     with a3: ab_type=st.selectbox("Type",["Unexcused (Deducted)","Excused (Not Deducted)"])
+                    ab_buffer=st.selectbox("Buffer Employee Covering (optional)",list(buf_lo_sup.keys()),key="ab_buffer_sel")
                     ab_reason=st.text_input("Reason")
                     if st.form_submit_button("Submit for HR Review",use_container_width=True):
                         ab_eid_sup=elo_sup[ab_emp]
+                        ab_buffer_eid=buf_lo_sup[ab_buffer]
                         conn=get_conn(); cur=conn.cursor()
                         cur.execute("""SELECT COUNT(*) FROM daily_status_records WHERE emp_id=? AND start_date<=? AND end_date>=?
                             AND workflow_stage NOT IN ('Rejected by HR','Rejected by HR Manager','Returned for Correction')""",(ab_eid_sup,str(ab_date),str(ab_date)))
@@ -2773,9 +2792,9 @@ with main_block:
                             st.error(f"{ab_emp} is on approved {leave_conflict_sup[0]} on {ab_date}. An employee already on approved leave cannot also be marked absent for the same date.")
                         else:
                             conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
-                                reason,supervisor_id,submitted_at,workflow_stage)
-                                VALUES(?,'Absent',?,?,?,1,?,?,?,'Pending HR Review')""",
-                                (ab_eid_sup,"Excused" if "Excused" in ab_type else "Unexcused",str(ab_date),str(ab_date),ab_reason,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                                reason,supervisor_id,submitted_at,workflow_stage,buffer_emp_id)
+                                VALUES(?,'Absent',?,?,?,1,?,?,?,'Pending HR Review',?)""",
+                                (ab_eid_sup,"Excused" if "Excused" in ab_type else "Unexcused",str(ab_date),str(ab_date),ab_reason,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),ab_buffer_eid))
                             conn.commit(); conn.close()
                             st.success(f"Absence for {ab_date} submitted for HR review."); st.rerun()
                 conn=get_conn()
