@@ -2823,8 +2823,10 @@ with main_block:
                     with l4: l_start=st.date_input("Start",value=date.today(),key="sup_l_start")
                     with l5: l_end=st.date_input("End",value=date.today(),key="sup_l_end")
                     l_notes=st.text_area("Notes")
+                    l_buffer=st.selectbox("Buffer Employee Covering (optional)",list(buf_lo_sup.keys()),key="l_buffer_sel")
                     if st.form_submit_button("Submit for HR Review",use_container_width=True):
                         l_eid=elo_sup[l_emp]
+                        l_buffer_eid=buf_lo_sup[l_buffer]
                         conn=get_conn(); cur=conn.cursor()
                         cur.execute("""SELECT COUNT(*) FROM leave_records WHERE emp_id=? AND status != 'Cancelled'
                             AND start_date<=? AND end_date>=?""",(l_eid,str(l_end),str(l_start)))
@@ -2847,9 +2849,9 @@ with main_block:
                                 st.error(f"{l_emp} has already used {used_so_far_sup} of {entitlement_sup} annual leave days for {l_start.year}. This request of {days} day(s) would exceed the remaining {remaining_sup} day(s).")
                                 st.stop()
                         conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
-                            reason,supervisor_id,submitted_at,workflow_stage)
-                            VALUES(?,?,?,?,?,?,?,?,?,'Pending HR Review')""",
-                            (l_eid,l_type,l_type,str(l_start),str(l_end),days,l_notes,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                            reason,supervisor_id,submitted_at,workflow_stage,buffer_emp_id)
+                            VALUES(?,?,?,?,?,?,?,?,?,'Pending HR Review',?)""",
+                            (l_eid,l_type,l_type,str(l_start),str(l_end),days,l_notes,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),l_buffer_eid))
                         conn.commit(); conn.close()
                         st.success(f"{l_type} submitted for HR review: {days} days"); st.rerun()
                 conn=get_conn()
@@ -2928,6 +2930,7 @@ with main_block:
                 </div>""",unsafe_allow_html=True)
 
                 v_notes_sup=st.text_area("Notes (optional)",key="sup_vac_notes")
+                v_buffer_sup=st.selectbox("Buffer Employee Covering (optional)",list(buf_lo_sup.keys()),key="sup_vac_buffer")
 
                 if v_return_sup<=v_start_sup:
                     st.warning("Return-to-Work Date must be after the Vacation Start Date.")
@@ -2948,10 +2951,10 @@ with main_block:
                             st.error(f"{v_row_sup['full_name']} already has a leave/status record overlapping this period.")
                         else:
                             conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
-                                reason,supervisor_id,submitted_at,workflow_stage)
-                                VALUES(?,'Vacation','Annual Leave',?,?,?,?,?,?,'Pending HR Review')""",
+                                reason,supervisor_id,submitted_at,workflow_stage,buffer_emp_id)
+                                VALUES(?,'Vacation','Annual Leave',?,?,?,?,?,?,'Pending HR Review',?)""",
                                 (v_row_sup['emp_id'],str(v_start_sup),str(v_end_sup),v_days_sup,v_notes_sup,
-                                 st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                                 st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),buf_lo_sup[v_buffer_sup]))
                             conn.commit(); conn.close()
                             st.success(f"Vacation request submitted: {v_days_sup} day(s) for {v_row_sup['full_name']}. Sent to HR for review, then the HR Manager, then Finance."); st.rerun()
 
@@ -3051,6 +3054,7 @@ with main_block:
                         ds_days_preview=max((ds_end-ds_start).days+1,0) if ds_status!="Present" else 0
                         st.markdown(f"<div style='padding-top:28px;font-size:13px;color:#F0C96B'>Days: <b>{ds_days_preview}</b></div>",unsafe_allow_html=True)
                     ds_reason=st.text_area("Reason / Remarks",key="ds_reason")
+                    ds_buffer=st.selectbox("Buffer Employee Covering (optional)",list(buf_lo_sup.keys()),key="ds_buffer_sel")
                     ds_doc=st.file_uploader("Supporting Attachment (optional)",type=["pdf","jpg","jpeg","png"],key="ds_doc")
                     if st.form_submit_button("Submit for HR Review",use_container_width=True):
                         ds_eid=elo_sup[ds_emp]
@@ -3078,11 +3082,11 @@ with main_block:
                                 ds_doc_data=ds_doc.getvalue() if ds_doc else None
                                 ds_days=max((ds_end-ds_start).days+1,0) if ds_status!="Present" else 0
                                 conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
-                                    reason,doc_name,doc_data,supervisor_id,submitted_at,workflow_stage)
-                                    VALUES(?,?,?,?,?,?,?,?,?,?,?,'Pending HR Review')""",
+                                    reason,doc_name,doc_data,supervisor_id,submitted_at,workflow_stage,buffer_emp_id)
+                                    VALUES(?,?,?,?,?,?,?,?,?,?,?,'Pending HR Review',?)""",
                                     (ds_eid,ds_status,ds_status if ds_status not in ("Present","Absent") else None,
                                      str(ds_start),str(ds_end),ds_days,ds_reason,ds_doc_name,ds_doc_data,
-                                     st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                                     st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),buf_lo_sup[ds_buffer]))
                                 conn.commit(); conn.close()
                                 st.success(f"Submitted {ds_status} for {ds_emp} — sent to HR for review.")
 
@@ -3105,76 +3109,56 @@ with main_block:
                     }).drop(columns=["id"]),use_container_width=True,hide_index=True)
 
         with sup8:
-            st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">When an employee in your division is on Sick Leave, Vacation, Annual Leave, or Absent, assign someone from the <b style="color:#F0C96B">Buffer / Reserve pool</b> to cover their position for the period. Mark an employee as buffer-eligible in Employee Profile → Edit.</div>',unsafe_allow_html=True)
+            st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">Buffer/Reserve coverage is now assigned right on the leave form itself — Record Absence, Record Leave, Vacation, and Daily Status all have an optional "Buffer Employee Covering" field. This tab is for the roster and a by-date view of what each buffer employee has covered. Mark someone as buffer-eligible in Employee Profile → Edit.</div>',unsafe_allow_html=True)
+
             conn=get_conn()
-            buffer_pool=pg_read_sql("SELECT emp_id,full_name,job_title FROM employees WHERE division=? AND is_buffer=1 AND current_status != 'Terminated'",conn,params=(my_division,))
+            buffer_pool=pg_read_sql("SELECT emp_id,full_name,job_title,current_status FROM employees WHERE division=? AND is_buffer=1",conn,params=(my_division,))
             conn.close()
 
+            st.markdown('<div class="ey">Buffer Employees — Your Division</div>',unsafe_allow_html=True)
             if len(buffer_pool)==0:
-                st.warning("No Buffer/Reserve employees found in your division yet. Mark someone as buffer-eligible in Employee Profile → Edit first.")
-            elif len(elo_sup)==0:
-                st.info("No employees currently assigned to your division.")
+                st.warning("No Buffer/Reserve employees found in your division yet. Mark someone as buffer-eligible in Employee Profile → Edit.")
             else:
-                buf_lo={f"{r['emp_id']} — {r['full_name']}":r['emp_id'] for _,r in buffer_pool.iterrows()}
-                with st.form("assign_buffer_form",clear_on_submit=True):
-                    bf1,bf2=st.columns(2)
-                    with bf1: bf_orig=st.selectbox("Employee Being Covered",list(elo_sup.keys()),key="bf_orig")
-                    with bf2: bf_sub=st.selectbox("Buffer Employee (covering)",list(buf_lo.keys()),key="bf_sub")
-                    bf3,bf4=st.columns(2)
-                    with bf3: bf_reason=st.selectbox("Reason",["Sick Leave","Vacation","Annual Leave","Absent","Emergency Leave","Other"],key="bf_reason")
-                    with bf4: pass
-                    bf5,bf6=st.columns(2)
-                    with bf5: bf_start=st.date_input("Coverage Start",value=date.today(),key="bf_start")
-                    with bf6: bf_end=st.date_input("Coverage End",value=date.today(),key="bf_end")
-                    bf_notes=st.text_area("Notes",placeholder="Optional...",key="bf_notes")
-                    if st.form_submit_button("Assign Buffer Coverage",use_container_width=True):
-                        orig_eid=elo_sup[bf_orig]; sub_eid=buf_lo[bf_sub]
-                        if orig_eid==sub_eid:
-                            st.error("The buffer employee cannot be the same as the employee being covered.")
-                        elif bf_end<bf_start:
-                            st.error("Coverage End must be on or after Coverage Start.")
-                        else:
-                            conn=get_conn(); cur=conn.cursor()
-                            cur.execute("SELECT emp_id FROM employees WHERE emp_id=?",(orig_eid,))
-                            orig_row=pg_read_sql("SELECT cost_center,job_title FROM employees WHERE emp_id=?",conn,params=(orig_eid,))
-                            cc_here=orig_row.iloc[0]['cost_center'] if len(orig_row)>0 else None
-                            pos_here=orig_row.iloc[0]['job_title'] if len(orig_row)>0 else None
-                            conn.execute("""INSERT INTO buffer_assignments(original_emp_id,buffer_emp_id,division,cost_center,
-                                position,reason,start_date,end_date,status,notes,assigned_by,assigned_at)
-                                VALUES(?,?,?,?,?,?,?,?,'Active',?,?,?)""",
-                                (orig_eid,sub_eid,my_division,cc_here,pos_here,bf_reason,str(bf_start),str(bf_end),
-                                 bf_notes,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-                            conn.commit(); conn.close()
-                            st.success(f"{bf_sub} assigned to cover {bf_orig} ({bf_reason}) from {bf_start} to {bf_end}."); st.rerun()
+                for _,bp in buffer_pool.iterrows():
+                    st.markdown(f"""<div class="card" style="padding:12px 16px;margin-bottom:8px">
+                      <div style="display:flex;justify-content:space-between;align-items:center">
+                        <div>
+                          <span style="font-family:'Cinzel',serif;color:#F0C96B;font-weight:700;font-size:14px">{bp['full_name']}</span>
+                          <span style="color:#94A8C8;font-size:12px;margin-left:8px">{bp['emp_id']} — {bp['job_title'] or 'No position set'}</span>
+                        </div>
+                        <div style="text-align:right"><span class="cc-tag">{bp['current_status']}</span></div>
+                      </div>
+                    </div>""",unsafe_allow_html=True)
 
             st.markdown("<hr>",unsafe_allow_html=True)
-            st.markdown('<div class="ey">Coverage — Your Division</div>',unsafe_allow_html=True)
+            st.markdown('<div class="ey">Buffer Coverage — By Date</div>',unsafe_allow_html=True)
+            st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Every approved leave/absence in your division where a Buffer Employee was named, showing who covered whom and for which dates.</div>',unsafe_allow_html=True)
             conn=get_conn()
-            buf_hist=pg_read_sql("""SELECT ba.id,eo.full_name as covered_employee,eb.full_name as buffer_employee,
-                ba.position,ba.reason,ba.start_date,ba.end_date,ba.status
-                FROM buffer_assignments ba
-                LEFT JOIN employees eo ON ba.original_emp_id=eo.emp_id
-                LEFT JOIN employees eb ON ba.buffer_emp_id=eb.emp_id
-                WHERE ba.division=? ORDER BY ba.assigned_at DESC LIMIT 100""",conn,params=(my_division,))
+            buf_leave=pg_read_sql("""SELECT eb.full_name as buffer_employee,eo.full_name as covered_employee,
+                lr.leave_type as reason,lr.start_date,lr.end_date,'Leave' as record_type
+                FROM leave_records lr
+                JOIN employees eo ON lr.emp_id=eo.emp_id
+                JOIN employees eb ON lr.buffer_emp_id=eb.emp_id
+                WHERE eo.division=? AND lr.status='Approved' AND lr.buffer_emp_id IS NOT NULL""",conn,params=(my_division,))
+            buf_absent=pg_read_sql("""SELECT eb.full_name as buffer_employee,eo.full_name as covered_employee,
+                'Absent' as reason,ar.absent_date as start_date,ar.absent_date as end_date,'Absence' as record_type
+                FROM absent_records ar
+                JOIN employees eo ON ar.emp_id=eo.emp_id
+                JOIN employees eb ON ar.buffer_emp_id=eb.emp_id
+                WHERE eo.division=? AND COALESCE(ar.record_status,'Active')='Active' AND ar.buffer_emp_id IS NOT NULL""",conn,params=(my_division,))
             conn.close()
-            if len(buf_hist)==0:
-                st.info("No buffer coverage assignments yet.")
+            buf_combined=pd.concat([buf_leave,buf_absent],ignore_index=True) if len(buf_leave)>0 or len(buf_absent)>0 else pd.DataFrame()
+            if len(buf_combined)==0:
+                st.info("No approved leave/absence has a buffer employee attached yet — this fills in once HR Manager Approval finalizes a submission that named one.")
             else:
-                active_buf=buf_hist[buf_hist['status']=='Active']
-                if len(active_buf)>0:
-                    for _,bh in active_buf.iterrows():
-                        bcc1,bcc2=st.columns([4,1])
-                        with bcc1:
-                            st.markdown(f'<div class="card" style="padding:10px 14px;margin-bottom:6px"><b style="color:#F0C96B">{bh["buffer_employee"]}</b> covering <b style="color:#38BDF8">{bh["covered_employee"]}</b> ({bh["position"] or "—"}) — {bh["reason"]}, {bh["start_date"]} to {bh["end_date"]}</div>',unsafe_allow_html=True)
-                        with bcc2:
-                            if st.button("Mark Completed",key=f"bf_complete_{bh['id']}",use_container_width=True):
-                                conn=get_conn(); conn.execute("UPDATE buffer_assignments SET status='Completed' WHERE id=?",(bh['id'],)); conn.commit(); conn.close()
-                                st.success("Marked completed."); st.rerun()
-                st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-top:8px">Full history:</div>',unsafe_allow_html=True)
-                st.dataframe(buf_hist.drop(columns=["id"]).rename(columns={
-                    "covered_employee":"Covered Employee","buffer_employee":"Buffer Employee","position":"Position",
-                    "reason":"Reason","start_date":"Start","end_date":"End","status":"Status"
+                buf_combined=buf_combined.sort_values("start_date",ascending=False)
+                st.dataframe(buf_combined.rename(columns={
+                    "buffer_employee":"Buffer Employee","covered_employee":"Covered Employee",
+                    "reason":"Reason","start_date":"Start","end_date":"End","record_type":"Type"
                 }),use_container_width=True,hide_index=True)
+                buf_buf=io.BytesIO()
+                with pd.ExcelWriter(buf_buf,engine="xlsxwriter") as w: buf_combined.to_excel(w,index=False,sheet_name="BufferCoverage")
+                st.download_button("Export Buffer Coverage",buf_buf.getvalue(),file_name=f"BufferCoverage_{my_division}_{date.today().isoformat()}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
     # ════════════════════════════════════════════════════════
     # PAYROLL — with autonomous day-off date calculation
@@ -4775,10 +4759,12 @@ with main_block:
                 conn=get_conn()
                 gs_pending=pg_read_sql("""SELECT dsr.id,dsr.supervisor_id,su.full_name as supervisor_name,
                     dsr.emp_id,e.full_name as emp_name,e.division,e.cost_center,dsr.status,dsr.leave_type,
-                    dsr.start_date,dsr.end_date,dsr.num_days,dsr.reason,dsr.doc_name,dsr.submitted_at
+                    dsr.start_date,dsr.end_date,dsr.num_days,dsr.reason,dsr.doc_name,dsr.submitted_at,
+                    dsr.buffer_emp_id,eb.full_name as buffer_name
                     FROM daily_status_records dsr
                     JOIN employees e ON dsr.emp_id=e.emp_id
                     LEFT JOIN system_users su ON dsr.supervisor_id=su.username
+                    LEFT JOIN employees eb ON dsr.buffer_emp_id=eb.emp_id
                     WHERE dsr.workflow_stage='Pending HR Review'
                     ORDER BY dsr.submitted_at ASC""",conn)
                 conn.close()
@@ -4788,12 +4774,14 @@ with main_block:
                 else:
                     for _,rec in gs_pending.iterrows():
                         with st.expander(f"{rec['emp_id']} — {rec['emp_name']} — {rec['status']} — {rec['start_date']} to {rec['end_date']} ({rec['num_days']} day(s))"):
+                            buffer_line = f"Buffer Covering: <b style=\"color:#38BDF8\">{rec['buffer_name']}</b> ({rec['buffer_emp_id']})<br>" if rec['buffer_emp_id'] else ""
                             st.markdown(f"""<div style="font-size:12px;color:#94A8C8;line-height:1.9">
                               Supervisor: <b style="color:#F0C96B">{rec['supervisor_id']}</b> ({rec['supervisor_name'] or '—'}) &nbsp;|&nbsp;
                               Division: <b style="color:#F0C96B">{rec['division']}</b> &nbsp;|&nbsp;
                               Cost Center: <b style="color:#F0C96B">{rec['cost_center'] or '—'}</b><br>
                               Status: <b style="color:#F0C96B">{rec['status']}</b>{' — '+rec['leave_type'] if rec['leave_type'] else ''} &nbsp;|&nbsp;
                               Submitted: {rec['submitted_at']}<br>
+                              {buffer_line}
                               Reason: {rec['reason'] or '—'}
                             </div>""",unsafe_allow_html=True)
                             if rec['doc_name']:
@@ -4874,9 +4862,11 @@ with main_block:
                 conn=get_conn()
                 hr_pending=pg_read_sql("""SELECT dsr.id,dsr.supervisor_id,dsr.gs_reviewed_by,dsr.gs_comments,
                     dsr.emp_id,e.full_name as emp_name,e.division,e.cost_center,e.annual_leave_entitlement,
-                    dsr.status,dsr.leave_type,dsr.start_date,dsr.end_date,dsr.num_days,dsr.reason,dsr.doc_name,dsr.doc_data,dsr.submitted_at
+                    dsr.status,dsr.leave_type,dsr.start_date,dsr.end_date,dsr.num_days,dsr.reason,dsr.doc_name,dsr.doc_data,dsr.submitted_at,
+                    dsr.buffer_emp_id,eb.full_name as buffer_name
                     FROM daily_status_records dsr
                     JOIN employees e ON dsr.emp_id=e.emp_id
+                    LEFT JOIN employees eb ON dsr.buffer_emp_id=eb.emp_id
                     WHERE dsr.workflow_stage='Pending HR Manager Approval'
                     ORDER BY dsr.submitted_at ASC""",conn)
                 conn.close()
@@ -4886,11 +4876,13 @@ with main_block:
                 else:
                     for _,rec in hr_pending.iterrows():
                         with st.expander(f"{rec['emp_id']} — {rec['emp_name']} — {rec['status']} — {rec['start_date']} to {rec['end_date']} ({rec['num_days']} day(s))"):
+                            buffer_line = f"Buffer Covering: <b style=\"color:#38BDF8\">{rec['buffer_name']}</b> ({rec['buffer_emp_id']})<br>" if rec['buffer_emp_id'] else ""
                             st.markdown(f"""<div style="font-size:12px;color:#94A8C8;line-height:1.9">
                               HR reviewed by: <b style="color:#F0C96B">{rec['gs_reviewed_by']}</b>
                               {' — comment: '+rec['gs_comments'] if rec['gs_comments'] else ''}<br>
                               Division: <b style="color:#F0C96B">{rec['division']}</b> &nbsp;|&nbsp;
                               Cost Center: <b style="color:#F0C96B">{rec['cost_center'] or '—'}</b><br>
+                              {buffer_line}
                               Reason: {rec['reason'] or '—'}
                             </div>""",unsafe_allow_html=True)
 
@@ -4914,17 +4906,17 @@ with main_block:
                                     if rec['status']=="Present":
                                         pass  # nothing further to record
                                     elif rec['status']=="Absent":
-                                        conn.execute("INSERT INTO absent_records(emp_id,absent_date,reason,is_excused,record_status,created_at)VALUES(?,?,?,?,'Active',?)",
-                                            (rec['emp_id'],rec['start_date'],rec['reason'],1 if rec['leave_type']=="Excused" else 0,datetime.now().strftime("%Y-%m-%d")))
+                                        conn.execute("INSERT INTO absent_records(emp_id,absent_date,reason,is_excused,record_status,created_at,buffer_emp_id)VALUES(?,?,?,?,'Active',?,?)",
+                                            (rec['emp_id'],rec['start_date'],rec['reason'],1 if rec['leave_type']=="Excused" else 0,datetime.now().strftime("%Y-%m-%d"),rec['buffer_emp_id']))
                                     else:
                                         cur.execute("SELECT basic_salary FROM employees WHERE emp_id=?",(rec['emp_id'],))
                                         sr=cur.fetchone(); dr=float(sr[0])/26 if sr and sr[0] else 0
                                         conn.execute("""INSERT INTO leave_records(emp_id,leave_type,start_date,end_date,days_taken,
-                                            is_paid,daily_rate,deduction_amount,approved_by,status,notes,created_at,doc_name,doc_data)
-                                            VALUES(?,?,?,?,?,1,?,0,?,'Approved',?,?,?,?)""",
+                                            is_paid,daily_rate,deduction_amount,approved_by,status,notes,created_at,doc_name,doc_data,buffer_emp_id)
+                                            VALUES(?,?,?,?,?,1,?,0,?,'Approved',?,?,?,?,?)""",
                                             (rec['emp_id'],rec['leave_type'] or rec['status'],rec['start_date'],rec['end_date'],rec['num_days'],
                                              round(dr,2),f"Supervisor: {rec['supervisor_id']} → GS: {rec['gs_reviewed_by']} → HR: {st.session_state.uid}",rec['reason'],
-                                             datetime.now().strftime("%Y-%m-%d"),rec['doc_name'],rec['doc_data']))
+                                             datetime.now().strftime("%Y-%m-%d"),rec['doc_name'],rec['doc_data'],rec['buffer_emp_id']))
                                     conn.execute("""UPDATE daily_status_records SET workflow_stage='Approved by HR Manager',
                                         hr_reviewed_by=?,hr_reviewed_at=?,hr_comments=? WHERE id=?""",
                                         (st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),hr_comment,rec['id']))
