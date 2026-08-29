@@ -4715,6 +4715,14 @@ with main_block:
 
                 v_notes=st.text_area("Notes (optional)",key="vac_notes")
 
+                conn=get_conn()
+                buffer_pool_vac=pg_read_sql("SELECT emp_id,full_name FROM employees WHERE division=? AND is_buffer=1 AND current_status != 'Terminated'",conn,params=(v_row['division'],))
+                conn.close()
+                BUFFER_NONE_VAC="— None —"
+                buf_lo_vac={BUFFER_NONE_VAC:None}
+                buf_lo_vac.update({f"{r['emp_id']} — {r['full_name']}":r['emp_id'] for _,r in buffer_pool_vac.iterrows()})
+                v_buffer=st.selectbox("Buffer Employee Covering (optional)",list(buf_lo_vac.keys()),key="vac_buffer_sel")
+
                 if v_return<=v_start:
                     st.warning("Return-to-Work Date must be after the Vacation Start Date.")
                 elif st.button("Save & Send for HR Review",use_container_width=True,key="vac_save_btn"):
@@ -4734,10 +4742,10 @@ with main_block:
                             st.error(f"{v_row['full_name']} already has a leave/status record overlapping this period.")
                         else:
                             conn.execute("""INSERT INTO daily_status_records(emp_id,status,leave_type,start_date,end_date,num_days,
-                                reason,supervisor_id,submitted_at,workflow_stage)
-                                VALUES(?,'Vacation','Annual Leave',?,?,?,?,?,?,'Pending HR Review')""",
+                                reason,supervisor_id,submitted_at,workflow_stage,buffer_emp_id)
+                                VALUES(?,'Vacation','Annual Leave',?,?,?,?,?,?,'Pending HR Review',?)""",
                                 (v_eid,str(v_start),str(v_end),v_days,v_notes,
-                                 st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                                 st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),buf_lo_vac[v_buffer]))
                             conn.commit(); conn.close()
                             st.cache_data.clear()
                             st.success(f"Vacation request saved: {v_days} day(s) for {v_row['full_name']}. Sent to HR for review (HR Review page), then the HR Manager.")
