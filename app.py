@@ -1509,7 +1509,7 @@ components.html("""
 # has no custom nav_access saved, the role default applies.
 # ════════════════════════════════════════════════════════
 ALL_NAV_VIEWS = ["Home","Control Center","Membership","Office Employees","Applicant Intake","Employee Directory","Employee Profile",
-    "Supervisor Console","Payroll","Payroll Approvals","Leave & Discipline","Leave Records","Vacation",
+    "Supervisor Console","Payroll","Payroll Approvals","Leave & Discipline","Leave Records","Buffer Employees","Vacation",
     "HR Review","HR Manager Approval","Demotion","Public Holidays","Cost Centers","Recycle Bin","Administration"]
 
 MANAGER_ONLY_VIEWS = {"Control Center","Membership","Office Employees"}
@@ -1518,14 +1518,14 @@ ROLE_DEFAULT_VIEWS = {
     "Supervisor": ["Home","Supervisor Console","Public Holidays"],
     "Payroll Section": ["Home","Payroll Approvals","Payroll","Employee Directory","Employee Profile","Public Holidays","Cost Centers"],
     "Department Head": ["Home","Vacation","Employee Directory","Employee Profile","Public Holidays"],
-    "HR Staff": ["Home","HR Review","Applicant Intake","Employee Directory","Employee Profile","Leave & Discipline","Leave Records","Vacation","Demotion","Public Holidays"],
+    "HR Staff": ["Home","HR Review","Applicant Intake","Employee Directory","Employee Profile","Leave & Discipline","Leave Records","Buffer Employees","Vacation","Demotion","Public Holidays"],
     # Control Center, Membership and Office Employees are Manager-only,
     # always-on-top owner pages and are never granted to any other role.
     "Manager": ["Home","Control Center","Membership","Office Employees","Applicant Intake","Employee Directory","Employee Profile","Payroll",
-        "Payroll Approvals","Leave & Discipline","Leave Records","Vacation","HR Manager Approval","Demotion","Public Holidays","Cost Centers","Recycle Bin","Administration"],
+        "Payroll Approvals","Leave & Discipline","Leave Records","Buffer Employees","Vacation","HR Manager Approval","Demotion","Public Holidays","Cost Centers","Recycle Bin","Administration"],
 }
 ROLE_DEFAULT_FALLBACK = ["Home","Applicant Intake","Employee Directory","Employee Profile",
-    "Payroll","Payroll Approvals","Leave & Discipline","Leave Records","Vacation","HR Review","HR Manager Approval","Demotion","Public Holidays","Cost Centers"]
+    "Payroll","Payroll Approvals","Leave & Discipline","Leave Records","Buffer Employees","Vacation","HR Review","HR Manager Approval","Demotion","Public Holidays","Cost Centers"]
 
 def get_user_nav_views(role, nav_access_json):
     """Returns the ordered list of views this user can see."""
@@ -1585,7 +1585,7 @@ NAV_GROUPS = [
     ("RECRUITMENT", ["Applicant Intake"]),
     ("WORKFORCE", ["Employee Directory","Employee Profile","Supervisor Console"]),
     ("FINANCE", ["Payroll","Payroll Approvals","Cost Centers"]),
-    ("HR OPERATIONS", ["Leave & Discipline","Leave Records","Vacation","HR Review","HR Manager Approval","Demotion"]),
+    ("HR OPERATIONS", ["Leave & Discipline","Leave Records","Buffer Employees","Vacation","HR Review","HR Manager Approval","Demotion"]),
     ("REFERENCE", ["Public Holidays"]),
     ("SYSTEM", ["Recycle Bin","Administration"]),
 ]
@@ -4604,26 +4604,65 @@ with main_block:
             with pd.ExcelWriter(lr_buf,engine="xlsxwriter") as w: display_lr.to_excel(w,index=False,sheet_name="Leave Records")
             st.download_button("Export to Excel",lr_buf.getvalue(),file_name=f"LeaveRecords_{lr_from}_to_{lr_to}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
-        st.markdown("<hr>",unsafe_allow_html=True)
-        st.markdown('<div class="ey">Buffer / Substitute Coverage — All Divisions</div>',unsafe_allow_html=True)
-        st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Who is currently covering for whom while someone is on leave or absent. Assigned by Supervisors in Supervisor Console → Buffer Coverage.</div>',unsafe_allow_html=True)
+    # ════════════════════════════════════════════════════════
+    # BUFFER EMPLOYEES — dedicated page: full roster (filterable by
+    # Division) plus every approved leave/absence that named a buffer,
+    # so HR/Manager have one place to see buffer status company-wide
+    # without digging through Leave Records.
+    # ════════════════════════════════════════════════════════
+    elif V=="Buffer Employees":
+        st.markdown('<div class="ey">Coverage Oversight</div>',unsafe_allow_html=True)
+        st.markdown('<div class="tl">Buffer / Reserve Employees</div>',unsafe_allow_html=True)
+        st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Everyone currently marked as buffer-eligible (Employee Profile → Edit → "Available as Buffer / Reserve Employee"), across the whole company, plus every approved leave/absence where a Supervisor named a buffer on the original form (Record Absence, Record Leave, Vacation, Daily Status).</div>',unsafe_allow_html=True)
+
         conn=get_conn()
-        buf_all=pg_read_sql("""SELECT ba.id,eo.full_name as covered_employee,eo.division,eo.cost_center,
-            eb.full_name as buffer_employee,ba.position,ba.reason,ba.start_date,ba.end_date,ba.status
-            FROM buffer_assignments ba
-            LEFT JOIN employees eo ON ba.original_emp_id=eo.emp_id
-            LEFT JOIN employees eb ON ba.buffer_emp_id=eb.emp_id
-            ORDER BY ba.assigned_at DESC LIMIT 300""",conn)
+        buf_roster=pg_read_sql("""SELECT emp_id,full_name,division,cost_center,job_title,current_status
+            FROM employees WHERE is_buffer=1 ORDER BY division,full_name""",conn)
         conn.close()
-        if len(buf_all)==0:
-            st.info("No buffer coverage assignments recorded yet.")
+        br_div_filter=st.selectbox("Division",["All"]+get_division_list(),key="br_div_filter")
+        buf_roster_view = buf_roster if br_div_filter=="All" else buf_roster[buf_roster['division']==br_div_filter]
+
+        st.markdown('<div class="ey" style="margin-top:10px">Roster</div>',unsafe_allow_html=True)
+        st.markdown(f'<div class="mg" style="grid-template-columns:1fr"><div class="mb mg-teal"><div class="ml ml-teal">Total Buffer Employees{"" if br_div_filter=="All" else f" — {br_div_filter}"}</div><div class="mv">{len(buf_roster_view)}</div></div></div>',unsafe_allow_html=True)
+        if len(buf_roster_view)==0:
+            st.info("No buffer-eligible employees for this filter yet.")
         else:
-            active_count=len(buf_all[buf_all['status']=='Active'])
-            st.markdown(f'<div class="mg" style="grid-template-columns:1fr"><div class="mb mg-cyan"><div class="ml ml-cyan">Currently Active Coverage</div><div class="mv">{active_count}</div></div></div>',unsafe_allow_html=True)
-            st.dataframe(buf_all.drop(columns=["id"]).rename(columns={
+            st.dataframe(buf_roster_view.rename(columns={
+                "emp_id":"Employee ID","full_name":"Full Name","division":"Division","cost_center":"Cost Center",
+                "job_title":"Position","current_status":"Status"
+            }),use_container_width=True,hide_index=True)
+            br_buf=io.BytesIO()
+            with pd.ExcelWriter(br_buf,engine="xlsxwriter") as w: buf_roster_view.to_excel(w,index=False,sheet_name="BufferRoster")
+            st.download_button("Export Buffer Roster",br_buf.getvalue(),file_name=f"BufferRoster_{br_div_filter}_{date.today().isoformat()}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+
+        st.markdown("<hr>",unsafe_allow_html=True)
+        st.markdown('<div class="ey">Coverage — Which Leaves Have a Buffer</div>',unsafe_allow_html=True)
+        conn=get_conn()
+        buf_leave_all=pg_read_sql("""SELECT eb.full_name as buffer_employee,eo.full_name as covered_employee,
+            eo.division,eo.cost_center,lr.leave_type as reason,lr.start_date,lr.end_date,'Leave' as record_type
+            FROM leave_records lr
+            JOIN employees eo ON lr.emp_id=eo.emp_id
+            JOIN employees eb ON lr.buffer_emp_id=eb.emp_id
+            WHERE lr.status='Approved' AND lr.buffer_emp_id IS NOT NULL""",conn)
+        buf_absent_all=pg_read_sql("""SELECT eb.full_name as buffer_employee,eo.full_name as covered_employee,
+            eo.division,eo.cost_center,'Absent' as reason,ar.absent_date as start_date,ar.absent_date as end_date,'Absence' as record_type
+            FROM absent_records ar
+            JOIN employees eo ON ar.emp_id=eo.emp_id
+            JOIN employees eb ON ar.buffer_emp_id=eb.emp_id
+            WHERE COALESCE(ar.record_status,'Active')='Active' AND ar.buffer_emp_id IS NOT NULL""",conn)
+        conn.close()
+        buf_all=pd.concat([buf_leave_all,buf_absent_all],ignore_index=True) if len(buf_leave_all)>0 or len(buf_absent_all)>0 else pd.DataFrame()
+        if len(buf_all)>0 and br_div_filter!="All":
+            buf_all=buf_all[buf_all['division']==br_div_filter]
+        if len(buf_all)==0:
+            st.info("No buffer coverage recorded yet for this filter.")
+        else:
+            buf_all=buf_all.sort_values("start_date",ascending=False)
+            st.markdown(f'<div class="mg" style="grid-template-columns:1fr"><div class="mb mg-cyan"><div class="ml ml-cyan">Total Coverage Records</div><div class="mv">{len(buf_all)}</div></div></div>',unsafe_allow_html=True)
+            st.dataframe(buf_all.rename(columns={
                 "covered_employee":"Covered Employee","division":"Division","cost_center":"Cost Center",
-                "buffer_employee":"Buffer Employee","position":"Position","reason":"Reason",
-                "start_date":"Start","end_date":"End","status":"Status"
+                "buffer_employee":"Buffer Employee","reason":"Reason",
+                "start_date":"Start","end_date":"End","record_type":"Type"
             }),use_container_width=True,hide_index=True)
             buf_buf=io.BytesIO()
             with pd.ExcelWriter(buf_buf,engine="xlsxwriter") as w: buf_all.to_excel(w,index=False,sheet_name="BufferCoverage")
