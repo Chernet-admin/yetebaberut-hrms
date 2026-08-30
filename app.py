@@ -1658,7 +1658,7 @@ if st.session_state.role:
                 is_owner = (v in MANAGER_ONLY_VIEWS)
                 wrap_classes = " ".join(filter(None,["nav-active" if is_active else "", "nav-owner" if is_owner else ""]))
                 if wrap_classes: st.markdown(f'<div class="{wrap_classes}">', unsafe_allow_html=True)
-                btn_label = f"👑 {v}" if is_owner else v
+                btn_label = v
                 if st.button(btn_label, use_container_width=True, key=f"nav_{v}"):
                     st.session_state.view=v; st.rerun()
                 if wrap_classes: st.markdown('</div>', unsafe_allow_html=True)
@@ -2141,7 +2141,7 @@ with main_block:
         if sel and "rows" in sel["selection"] and len(sel["selection"]["rows"])>0:
             st.session_state.eid=vdf.iloc[sel["selection"]["rows"][0]]["emp_id"]
             st.toast(f"Loaded {st.session_state.eid} Employee Profile")
-        if st.session_state.role=="Manager":
+        if st.session_state.role in ("Manager","HR Staff"):
             st.markdown("<hr>",unsafe_allow_html=True)
             t1,t2,t3=st.tabs(["Quick Edit","Add New Employee","Remove Employee"])
             with t1:
@@ -2418,7 +2418,7 @@ with main_block:
                         with dcol1:
                             st.download_button(f"Download",data=bytes(fdata),file_name=fname,use_container_width=True,key=f"dl_{dk}_{eid2}")
                         with dcol2:
-                            if st.session_state.role=="Manager":
+                            if st.session_state.role in ("Manager","HR Staff"):
                                 if st.button(f"Delete {lbl2}",key=f"del_{dk}_{eid2}",use_container_width=True):
                                     conn=get_conn()
                                     conn.execute(f"UPDATE employees SET {nk}=NULL,{dk}=NULL WHERE emp_id=?",(eid2,))
@@ -2426,7 +2426,7 @@ with main_block:
                                     get_employee.clear()
                                     st.session_state.pop(f"_docblob_{dk}_{eid2}",None)
                                     st.success(f"{lbl2} deleted."); st.rerun()
-                    if st.session_state.role=="Manager":
+                    if st.session_state.role in ("Manager","HR Staff"):
                         st.markdown('<div style="font-size:10px;color:#6B7FA3;margin:8px 0 5px"> Upload new / replace — from scanner, camera or file</div>',unsafe_allow_html=True)
                         upl=st.file_uploader(f"Upload {lbl2}",type=allowed,key=f"up_{dk}_{eid2}")
                         if upl and st.button("Save",key=f"sv_{dk}_{eid2}",use_container_width=True):
@@ -2438,7 +2438,7 @@ with main_block:
                             st.session_state.pop(f"_docblob_{dk}_{eid2}",None)
                             st.success(f"{lbl2} saved!"); st.rerun()
         with t5:
-            if st.session_state.role=="Manager":
+            if st.session_state.role in ("Manager","HR Staff"):
                 with st.form(f"fe_{eid2}"):
                     st.markdown('<div class="fs">Personal Information</div>',unsafe_allow_html=True)
                     p1,p2,p3=st.columns(3)
@@ -2568,7 +2568,7 @@ with main_block:
                         conn.commit(); conn.close()
                         st.cache_data.clear()
                         st.success("Profile saved!"); st.rerun()
-            else: st.info("Manager role required.")
+            else: st.info("Manager or HR Staff role required.")
         with t6:
             st.markdown(f'<div class="card"><div class="fs">Notes</div><div style="color:#C8D8F0;font-size:12px;line-height:1.7;white-space:pre-wrap">{r.get("notes","No notes.") or "No notes."}</div></div>',unsafe_allow_html=True)
 
@@ -2747,7 +2747,7 @@ with main_block:
           <div class="mb mg-purple"><div class="ml ml-purple">On Leave</div><div class="mv">{leave_div}</div></div>
         </div>""",unsafe_allow_html=True)
 
-        sup1,sup2,sup3,sup4,sup5,sup6,sup7,sup8=st.tabs(["Record Absence","Record Leave","Issue Fine","Vacation","Movement Log","Submit Monthly Sheet","Daily Status (New Workflow)","Buffer Coverage"])
+        sup1,sup2,sup3,sup4,sup5,sup6,sup7,sup8,sup9=st.tabs(["Record Absence","Record Leave","Issue Fine","Vacation","Movement Log","Submit Monthly Sheet","Daily Status (New Workflow)","Buffer Coverage","Day-Off Calendar"])
 
         elo_sup={f"{r['emp_id']} — {r['full_name']}":r['emp_id'] for _,r in my_emps.iterrows()}
 
@@ -3160,6 +3160,45 @@ with main_block:
                 with pd.ExcelWriter(buf_buf,engine="xlsxwriter") as w: buf_combined.to_excel(w,index=False,sheet_name="BufferCoverage")
                 st.download_button("Export Buffer Coverage",buf_buf.getvalue(),file_name=f"BufferCoverage_{my_division}_{date.today().isoformat()}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
+        with sup9:
+            st.markdown('<div style="color:#6B7FA3;font-size:12px;margin-bottom:12px">Each employee has one fixed weekly day-off. The system <b style="color:#F0C96B">automatically</b> calculates which calendar dates match that weekday every month — no manual date entry required. As the Supervisor, you set and change each employee\'s day-off here; Payroll only reads it.</div>',unsafe_allow_html=True)
+            dc2,dc3=st.columns(2)
+            with dc2:
+                cal_yr=st.selectbox("Year",[datetime.now().year,datetime.now().year+1],key="cal_yr")
+            with dc3:
+                cal_mo=st.selectbox("Month",list(range(1,13)),index=datetime.now().month-1,format_func=lambda m: calendar.month_name[m],key="cal_mo")
+            conn=get_conn()
+            cal_emps=pg_read_sql("SELECT emp_id,full_name,weekly_dayoff FROM employees WHERE division=? AND current_status='Active Deployment' ORDER BY emp_id",conn,params=(my_division,))
+            conn.close()
+            if len(cal_emps)==0:
+                st.info("No active employees in your division.")
+            else:
+                cal_disp=cal_emps.copy()
+                cal_disp['Day-Off Dates This Month']=cal_disp['weekly_dayoff'].apply(
+                    lambda wd: ", ".join([d.strftime("%b %d (%a)") for d in get_dayoff_dates(wd or "Sunday",cal_yr,cal_mo)]))
+                cal_disp['Total Days']=cal_disp['weekly_dayoff'].apply(lambda wd: count_dayoffs_in_month(wd or "Sunday",cal_yr,cal_mo))
+                st.dataframe(cal_disp[['emp_id','full_name','weekly_dayoff','Total Days','Day-Off Dates This Month']].rename(
+                    columns={"emp_id":"Employee ID","full_name":"Full Name","weekly_dayoff":"Weekly Day-Off"}),
+                    use_container_width=True,hide_index=True)
+                cbuf=io.BytesIO()
+                with pd.ExcelWriter(cbuf,engine="xlsxwriter") as w: cal_disp.to_excel(w,index=False,sheet_name="DayOff_Calendar")
+                st.download_button("Export Day-Off Calendar",cbuf.getvalue(),file_name=f"DayOff_{my_division}_{cal_yr}_{cal_mo:02d}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+                st.markdown("<hr>",unsafe_allow_html=True)
+                st.markdown('<div class="fs">Change an Employee\'s Weekly Day-Off</div>',unsafe_allow_html=True)
+                wd_emp_lo={f"{r['emp_id']} — {r['full_name']}":r for _,r in cal_emps.iterrows()}
+                wd_emp_pick=st.selectbox("Employee",list(wd_emp_lo.keys()),key="wd_emp_pick")
+                wd_row=wd_emp_lo[wd_emp_pick]
+                wd_opts=["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"]
+                cur_wd=wd_row['weekly_dayoff'] or "Sunday"
+                new_wd=st.selectbox("New Weekly Day-Off",wd_opts,index=wd_opts.index(cur_wd) if cur_wd in wd_opts else 0,key="wd_new_pick")
+                if st.button("Apply Day-Off Change",use_container_width=True,key="wd_apply_btn"):
+                    conn=get_conn()
+                    conn.execute("UPDATE employees SET weekly_dayoff=? WHERE emp_id=?",(new_wd,wd_row['emp_id']))
+                    conn.commit(); conn.close()
+                    get_employee.clear(); st.cache_data.clear()
+                    st.success(f"{wd_emp_pick.split(' — ')[1]}'s weekly day-off changed to {new_wd}."); st.rerun()
+
     # ════════════════════════════════════════════════════════
     # PAYROLL — with autonomous day-off date calculation
     # ════════════════════════════════════════════════════════
@@ -3169,7 +3208,7 @@ with main_block:
         conn=get_conn()
         el=pg_read_sql("SELECT emp_id,full_name,division,cost_center,basic_salary,weekly_dayoff FROM employees WHERE current_status='Active Deployment' ORDER BY emp_id LIMIT 5000",conn); conn.close()
         if len(el)==0: st.warning("No active employees."); st.stop()
-        pt1,pt2,pt3,pt4,pt5,pt6=st.tabs(["Process Payroll","History","Day-Off Calendar","Cost Center Sheet","Pension & Tax Reports","Salary Categories"])
+        pt1,pt2,pt4,pt5,pt6=st.tabs(["Process Payroll","History","Cost Center Sheet","Pension & Tax Reports","Salary Categories"])
         with pt1:
             st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">Follows the master hierarchy: Division → Cost Center → Employee → Position/Category. Pick the payroll month, narrow by Division and Cost Center, then select the employee. Only HR + Manager-approved attendance, leave and absence feed into the figures below.</div>',unsafe_allow_html=True)
             ps0,ps1x,ps2x=st.columns(3)
@@ -3230,25 +3269,12 @@ with main_block:
 
             st.markdown("<hr>",unsafe_allow_html=True)
             st.markdown('<div class="fs">Employee Weekly Day-Off Setting</div>',unsafe_allow_html=True)
-            wd_disp_col,wd_edit_col=st.columns([2,1])
-            with wd_disp_col:
-                st.markdown(f"""<div style="background:#0D1526;border:1px solid rgba(56,189,248,0.25);border-radius:10px;padding:12px 16px">
-                  <div style="font-size:9px;color:#6B7FA3;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">Current Setting</div>
-                  <div style="font-size:14px;color:#38BDF8;font-weight:600">Every {weekly_dayoff}</div>
-                  <div style="font-size:11px;color:#94A8C8;margin-top:6px">System automatically found <b style="color:#F0C96B">{dayoff_count}</b> {weekly_dayoff}s in {pay_month}: {", ".join([d.strftime("%b %d") for d in dayoff_dates])}</div>
-                </div>""",unsafe_allow_html=True)
-            with wd_edit_col:
-                st.write("")
-                with st.popover("Change Day-Off",use_container_width=True):
-                    wd_opts=["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"]
-                    new_wd=st.selectbox("New weekly day-off",wd_opts,index=wd_opts.index(weekly_dayoff))
-                    if st.button("Apply Change",use_container_width=True):
-                        conn=get_conn()
-                        conn.execute("UPDATE employees SET weekly_dayoff=? WHERE emp_id=?",(new_wd,seid))
-                        conn.commit(); conn.close()
-                        get_employee.clear()
-                        st.success(f"Day-off changed to {new_wd}. System will recalculate dates automatically.")
-                        st.rerun()
+            st.markdown(f"""<div style="background:#0D1526;border:1px solid rgba(56,189,248,0.25);border-radius:10px;padding:12px 16px">
+              <div style="font-size:9px;color:#6B7FA3;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">Current Setting (read-only here — changed by the Supervisor)</div>
+              <div style="font-size:14px;color:#38BDF8;font-weight:600">Every {weekly_dayoff}</div>
+              <div style="font-size:11px;color:#94A8C8;margin-top:6px">System automatically found <b style="color:#F0C96B">{dayoff_count}</b> {weekly_dayoff}s in {pay_month}: {", ".join([d.strftime("%b %d") for d in dayoff_dates])}</div>
+              <div style="font-size:10px;color:#6B7FA3;margin-top:6px">To change this employee's weekly day-off, use Supervisor Console → Day-Off Calendar.</div>
+            </div>""",unsafe_allow_html=True)
 
             emp_category = er.get('category')
             cat_rate = get_category_rate(emp_category)
@@ -3417,31 +3443,9 @@ with main_block:
                 # Bulk print all
                 if hist_month!="All" and st.button(f"Print All Payslips for {hist_month}",use_container_width=True):
                     st.info(f"Use the individual employee payslip print button in 'Process Payroll' tab for each employee, or export to Excel above for a bulk register.")
-        with pt3:
-            st.markdown('<div style="color:#6B7FA3;font-size:12px;margin-bottom:12px">Each employee has one fixed weekly day-off (set in Employee Profile  Edit). The system <b style="color:#F0C96B">automatically</b> calculates which calendar dates match that weekday every month — no manual date entry required. Change the day below and dates recalculate instantly.</div>',unsafe_allow_html=True)
-            dc1,dc2,dc3=st.columns(3)
-            with dc1:
-                cal_div=st.selectbox("Filter Division",["All"]+get_division_list(),key="cal_div")
-            with dc2:
-                cal_yr=st.selectbox("Year",[datetime.now().year,datetime.now().year+1],key="cal_yr")
-            with dc3:
-                cal_mo=st.selectbox("Month",list(range(1,13)),index=datetime.now().month-1,format_func=lambda m: calendar.month_name[m],key="cal_mo")
-            conn=get_conn()
-            if cal_div!="All":
-                cal_emps=pg_read_sql("SELECT emp_id,full_name,division,weekly_dayoff FROM employees WHERE current_status='Active Deployment' AND division=? ORDER BY emp_id",conn,params=(cal_div,))
-            else:
-                cal_emps=pg_read_sql("SELECT emp_id,full_name,division,weekly_dayoff FROM employees WHERE current_status='Active Deployment' ORDER BY emp_id LIMIT 500",conn)
-            conn.close()
-            if len(cal_emps)>0:
-                cal_emps['Day-Off Dates This Month']=cal_emps['weekly_dayoff'].apply(
-                    lambda wd: ", ".join([d.strftime("%b %d (%a)") for d in get_dayoff_dates(wd or "Sunday",cal_yr,cal_mo)]))
-                cal_emps['Total Days']=cal_emps['weekly_dayoff'].apply(lambda wd: count_dayoffs_in_month(wd or "Sunday",cal_yr,cal_mo))
-                st.dataframe(cal_emps[['emp_id','full_name','division','weekly_dayoff','Total Days','Day-Off Dates This Month']],use_container_width=True,hide_index=True)
-                cbuf=io.BytesIO()
-                with pd.ExcelWriter(cbuf,engine="xlsxwriter") as w: cal_emps.to_excel(w,index=False,sheet_name="DayOff_Calendar")
-                st.download_button("Export Day-Off Calendar",cbuf.getvalue(),file_name=f"DayOff_{cal_yr}_{cal_mo:02d}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            else:
-                st.info("No active employees found for this filter.")
+        # Day-Off Calendar moved to Supervisor Console — Supervisors manage
+        # their own division's weekly day-off schedule there now, instead
+        # of it living in Payroll.
 
 
         # ════════════════════════════════════════════════════════
@@ -4618,7 +4622,57 @@ with main_block:
         conn=get_conn()
         buf_roster=pg_read_sql("""SELECT emp_id,full_name,division,cost_center,job_title,current_status
             FROM employees WHERE is_buffer=1 ORDER BY division,full_name""",conn)
+        buf_leave_all=pg_read_sql("""SELECT eb.full_name as buffer_employee,eb.emp_id as buffer_emp_id,
+            eo.full_name as covered_employee,eo.division,eo.cost_center,lr.leave_type as reason,
+            lr.start_date,lr.end_date,'Leave' as record_type
+            FROM leave_records lr
+            JOIN employees eo ON lr.emp_id=eo.emp_id
+            JOIN employees eb ON lr.buffer_emp_id=eb.emp_id
+            WHERE lr.status='Approved' AND lr.buffer_emp_id IS NOT NULL""",conn)
+        buf_absent_all=pg_read_sql("""SELECT eb.full_name as buffer_employee,eb.emp_id as buffer_emp_id,
+            eo.full_name as covered_employee,eo.division,eo.cost_center,'Absent' as reason,
+            ar.absent_date as start_date,ar.absent_date as end_date,'Absence' as record_type
+            FROM absent_records ar
+            JOIN employees eo ON ar.emp_id=eo.emp_id
+            JOIN employees eb ON ar.buffer_emp_id=eb.emp_id
+            WHERE COALESCE(ar.record_status,'Active')='Active' AND ar.buffer_emp_id IS NOT NULL""",conn)
         conn.close()
+        buf_all_master=pd.concat([buf_leave_all,buf_absent_all],ignore_index=True) if len(buf_leave_all)>0 or len(buf_absent_all)>0 else pd.DataFrame()
+
+        # ═══════════════════════════════════════════
+        # DASHBOARD — total buffer employees per Division,
+        # and total coverage per leave type (Vacation, Sick, Absent, etc.)
+        # ═══════════════════════════════════════════
+        st.markdown('<div class="ey">Dashboard — Buffer Employees by Division</div>',unsafe_allow_html=True)
+        if len(buf_roster)==0:
+            st.info("No buffer-eligible employees yet.")
+        else:
+            div_counts=buf_roster.groupby('division').size()
+            dash_html='<div class="mg">'
+            div_colors=["mg-teal","mg-gold","mg-cyan","mg-purple","mg-amber","mg-green","mg-red"]
+            for i,(div_name,cnt) in enumerate(div_counts.items()):
+                cls=div_colors[i%len(div_colors)]
+                dash_html+=f'<div class="mb {cls}"><div class="ml {cls.replace("mg-","ml-")}">{div_name or "Unassigned"}</div><div class="mv">{cnt}</div></div>'
+            dash_html+='</div>'
+            st.markdown(dash_html,unsafe_allow_html=True)
+
+        st.markdown('<div class="ey" style="margin-top:10px">Dashboard — Total Coverage by Leave Type</div>',unsafe_allow_html=True)
+        if len(buf_all_master)==0:
+            st.info("No coverage recorded yet.")
+        else:
+            reason_counts=buf_all_master.groupby('reason').size()
+            reason_html='<div class="mg">'
+            reason_colors=["mg-red","mg-teal","mg-green","mg-amber","mg-purple","mg-cyan"]
+            for i,(reason_name,cnt) in enumerate(reason_counts.items()):
+                cls=reason_colors[i%len(reason_colors)]
+                reason_html+=f'<div class="mb {cls}"><div class="ml {cls.replace("mg-","ml-")}">{reason_name}</div><div class="mv">{cnt}</div></div>'
+            reason_html+='</div>'
+            st.markdown(reason_html,unsafe_allow_html=True)
+
+        # ═══════════════════════════════════════════
+        # ROSTER
+        # ═══════════════════════════════════════════
+        st.markdown("<hr>",unsafe_allow_html=True)
         br_div_filter=st.selectbox("Division",["All"]+get_division_list(),key="br_div_filter")
         buf_roster_view = buf_roster if br_div_filter=="All" else buf_roster[buf_roster['division']==br_div_filter]
 
@@ -4635,23 +4689,12 @@ with main_block:
             with pd.ExcelWriter(br_buf,engine="xlsxwriter") as w: buf_roster_view.to_excel(w,index=False,sheet_name="BufferRoster")
             st.download_button("Export Buffer Roster",br_buf.getvalue(),file_name=f"BufferRoster_{br_div_filter}_{date.today().isoformat()}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 
+        # ═══════════════════════════════════════════
+        # COVERAGE — full detail list
+        # ═══════════════════════════════════════════
         st.markdown("<hr>",unsafe_allow_html=True)
         st.markdown('<div class="ey">Coverage — Which Leaves Have a Buffer</div>',unsafe_allow_html=True)
-        conn=get_conn()
-        buf_leave_all=pg_read_sql("""SELECT eb.full_name as buffer_employee,eo.full_name as covered_employee,
-            eo.division,eo.cost_center,lr.leave_type as reason,lr.start_date,lr.end_date,'Leave' as record_type
-            FROM leave_records lr
-            JOIN employees eo ON lr.emp_id=eo.emp_id
-            JOIN employees eb ON lr.buffer_emp_id=eb.emp_id
-            WHERE lr.status='Approved' AND lr.buffer_emp_id IS NOT NULL""",conn)
-        buf_absent_all=pg_read_sql("""SELECT eb.full_name as buffer_employee,eo.full_name as covered_employee,
-            eo.division,eo.cost_center,'Absent' as reason,ar.absent_date as start_date,ar.absent_date as end_date,'Absence' as record_type
-            FROM absent_records ar
-            JOIN employees eo ON ar.emp_id=eo.emp_id
-            JOIN employees eb ON ar.buffer_emp_id=eb.emp_id
-            WHERE COALESCE(ar.record_status,'Active')='Active' AND ar.buffer_emp_id IS NOT NULL""",conn)
-        conn.close()
-        buf_all=pd.concat([buf_leave_all,buf_absent_all],ignore_index=True) if len(buf_leave_all)>0 or len(buf_absent_all)>0 else pd.DataFrame()
+        buf_all=buf_all_master.copy()
         if len(buf_all)>0 and br_div_filter!="All":
             buf_all=buf_all[buf_all['division']==br_div_filter]
         if len(buf_all)==0:
@@ -4659,7 +4702,7 @@ with main_block:
         else:
             buf_all=buf_all.sort_values("start_date",ascending=False)
             st.markdown(f'<div class="mg" style="grid-template-columns:1fr"><div class="mb mg-cyan"><div class="ml ml-cyan">Total Coverage Records</div><div class="mv">{len(buf_all)}</div></div></div>',unsafe_allow_html=True)
-            st.dataframe(buf_all.rename(columns={
+            st.dataframe(buf_all.drop(columns=["buffer_emp_id"]).rename(columns={
                 "covered_employee":"Covered Employee","division":"Division","cost_center":"Cost Center",
                 "buffer_employee":"Buffer Employee","reason":"Reason",
                 "start_date":"Start","end_date":"End","record_type":"Type"
@@ -4667,6 +4710,51 @@ with main_block:
             buf_buf=io.BytesIO()
             with pd.ExcelWriter(buf_buf,engine="xlsxwriter") as w: buf_all.to_excel(w,index=False,sheet_name="BufferCoverage")
             st.download_button("Export Buffer Coverage",buf_buf.getvalue(),file_name=f"BufferCoverage_{date.today().isoformat()}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+
+        # ═══════════════════════════════════════════
+        # MONTHLY DETAIL — per Buffer Employee: how many different
+        # employees they covered, and how many coverage records
+        # ("leave works") in the chosen month.
+        # ═══════════════════════════════════════════
+        st.markdown("<hr>",unsafe_allow_html=True)
+        st.markdown('<div class="ey">Monthly Detail — Per Buffer Employee</div>',unsafe_allow_html=True)
+        st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:8px">For the selected month: how many different employees each Buffer Employee covered, and how many coverage records ("leave works") they handled in total.</div>',unsafe_allow_html=True)
+        mo1,mo2=st.columns(2)
+        with mo1: bm_year=st.selectbox("Year",[datetime.now().year,datetime.now().year-1],key="bm_year")
+        with mo2: bm_month=st.selectbox("Month",list(range(1,13)),index=datetime.now().month-1,format_func=lambda m: calendar.month_name[m],key="bm_month")
+
+        if len(buf_all_master)==0:
+            st.info("No coverage records to summarize yet.")
+        else:
+            def _overlaps_month(row):
+                try:
+                    sd=datetime.strptime(row['start_date'],"%Y-%m-%d").date()
+                    ed=datetime.strptime(row['end_date'],"%Y-%m-%d").date()
+                    m_start=date(bm_year,bm_month,1)
+                    m_end_day=calendar.monthrange(bm_year,bm_month)[1]
+                    m_end=date(bm_year,bm_month,m_end_day)
+                    return sd<=m_end and ed>=m_start
+                except: return False
+            bm_data=buf_all_master[buf_all_master.apply(_overlaps_month,axis=1)]
+            if br_div_filter!="All":
+                bm_data=bm_data[bm_data['division']==br_div_filter]
+            if len(bm_data)==0:
+                st.info(f"No buffer coverage in {calendar.month_name[bm_month]} {bm_year} for this filter.")
+            else:
+                summary=bm_data.groupby(['buffer_emp_id','buffer_employee']).agg(
+                    Employees_Covered=('covered_employee','nunique'),
+                    Leave_Works=('covered_employee','size')
+                ).reset_index().rename(columns={"buffer_employee":"Buffer Employee","Employees_Covered":"Employees Covered","Leave_Works":"Leave Works (Coverage Records)"})
+                st.dataframe(summary.drop(columns=["buffer_emp_id"]),use_container_width=True,hide_index=True)
+
+                st.markdown('<div style="font-size:12px;color:#94A8C8;margin-top:10px">Detail per Buffer Employee:</div>',unsafe_allow_html=True)
+                for buf_id,buf_name in summary[['buffer_emp_id','Buffer Employee']].drop_duplicates().itertuples(index=False):
+                    with st.expander(f"{buf_name} — {int(summary[summary['buffer_emp_id']==buf_id]['Employees Covered'].iloc[0])} employee(s) covered, {int(summary[summary['buffer_emp_id']==buf_id]['Leave Works (Coverage Records)'].iloc[0])} leave work(s)"):
+                        detail=bm_data[bm_data['buffer_emp_id']==buf_id][['covered_employee','reason','start_date','end_date','division','cost_center']].sort_values('start_date')
+                        st.dataframe(detail.rename(columns={
+                            "covered_employee":"Employee Name","reason":"Leave Type","start_date":"Start","end_date":"End",
+                            "division":"Division","cost_center":"Cost Center"
+                        }),use_container_width=True,hide_index=True)
 
     # ════════════════════════════════════════════════════════
     # VACATION — dedicated request + approval flow
