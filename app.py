@@ -262,7 +262,7 @@ def init_db():
         # Division → Cost Center → Employee → Position/Category.
         # job_title already stores the Position; category stores the
         # salary/skill grade (e.g. "A", "B", "C") used by Annex III payroll.
-        "category":"TEXT","payment_method":"TEXT DEFAULT 'Bank Transfer'","is_buffer":"INTEGER DEFAULT 0"}
+        "category":"TEXT","payment_method":"TEXT DEFAULT 'Bank Transfer'","is_buffer":"INTEGER DEFAULT 0","shift_type":"TEXT"}
     for col,typ in migrations.items():
         if col not in ex:
             try: c.execute(f"ALTER TABLE employees ADD COLUMN {col} {typ}"); conn.commit()
@@ -337,7 +337,7 @@ def init_db():
         "paid_leave_value":"REAL DEFAULT 0","overhead_profit":"REAL DEFAULT 0",
         "vat_amount":"REAL DEFAULT 0","total_billed_amount":"REAL DEFAULT 0",
         "payment_method":"TEXT DEFAULT 'Bank Transfer'","category":"TEXT",
-        "gm_approval_status":"TEXT DEFAULT 'Not Submitted'"}.items():
+        "gm_approval_status":"TEXT DEFAULT 'Not Submitted'","shift_type":"TEXT","shift_premium":"REAL DEFAULT 0"}.items():
         if pcol not in pcols:
             try: c.execute(f"ALTER TABLE payroll ADD COLUMN {pcol} {ptyp}"); conn.commit()
             except: pass
@@ -600,6 +600,33 @@ def init_db():
         except: pass
     conn.commit()
 
+    # ── SHIFT TYPES (manually created — same pattern as Salary Categories) ──
+    # Each Shift carries a time window and a premium/allowance in ETB. An
+    # employee's Shift connects straight to payroll: assign a Shift on the
+    # employee record (Employee Profile → Edit) and its premium auto-fills
+    # in Process Payroll — no manual entry, same auto-connect model as
+    # Position → Salary Category.
+    c.execute("""CREATE TABLE IF NOT EXISTS shift_types(
+        name TEXT PRIMARY KEY,
+        start_time TEXT,end_time TEXT,
+        premium_amount REAL DEFAULT 0,
+        is_active INTEGER DEFAULT 1,
+        updated_by TEXT,updated_at TEXT)""")
+    now_sh=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    SHIFT_SEED = [
+        ("Office Hour","08:00 AM","05:00 PM"),
+        ("Late Evening","05:00 PM","02:00 AM"),
+        ("Evening","09:00 PM","05:00 AM"),
+        ("Night","12:00 AM","08:00 AM"),
+        ("Morning","06:00 AM","02:00 PM"),
+    ]
+    for sh_name,sh_start,sh_end in SHIFT_SEED:
+        try:
+            c.execute("""INSERT INTO shift_types(name,start_time,end_time,premium_amount,is_active,updated_by,updated_at)
+                VALUES(?,?,?,0,1,'system',?) ON CONFLICT(name) DO NOTHING""",(sh_name,sh_start,sh_end,now_sh))
+        except: pass
+    conn.commit()
+
     # ── BUFFER / SUBSTITUTE COVERAGE ──
     # When an employee is on Sick/Vacation/Annual/other leave or Absent, a
     # Supervisor assigns a Buffer (reserve pool) employee to cover their
@@ -797,6 +824,29 @@ def get_position_category(position_name):
     if len(match)==0: return None
     cat=match.iloc[0]['category']
     return cat if cat else None
+
+@st.cache_data(ttl=20)
+def get_shift_types(active_only=True):
+    """Master Shift list — manually created (Office Hour, Late Evening,
+    Evening, Night, Morning, or any custom shift). Each carries a time
+    window and a premium/allowance in ETB."""
+    conn=get_conn()
+    if active_only:
+        df=pg_read_sql("SELECT * FROM shift_types WHERE is_active=1 ORDER BY name",conn)
+    else:
+        df=pg_read_sql("SELECT * FROM shift_types ORDER BY name",conn)
+    conn.close()
+    return df
+
+def get_shift_premium(shift_name):
+    """Looks up a Shift's premium/allowance — the automatic connection:
+    assign a Shift on the employee record, and payroll pulls this premium
+    straight in, with no manual per-employee entry."""
+    if not shift_name: return 0.0
+    df=get_shift_types(active_only=False)
+    match=df[df['name']==shift_name]
+    if len(match)==0: return 0.0
+    return float(match.iloc[0]['premium_amount'] or 0)
 
 @st.cache_data(ttl=20)
 def get_cost_centers(division=None):
@@ -5313,7 +5363,7 @@ with main_block:
     # ════════════════════════════════════════════════════════
     elif V=="Cost Centers":
         st.markdown('<div class="ey">Financial & Organizational Structure</div>',unsafe_allow_html=True)
-        st.markdown('<div class="tl">Divisions, Cost Centers & Job Positions</div>',unsafe_allow_html=True)
+        st.markdown('<div class="tl">Divisions, Cost Centers, Job Positions & Shifts</div>',unsafe_allow_html=True)
 
         oc1,oc2=st.columns(2)
         with oc1: total_div_count=len(get_division_list())
@@ -5322,13 +5372,15 @@ with main_block:
         div_all=pg_read_sql("SELECT * FROM divisions ORDER BY created_at DESC",conn)
         conn.close()
         jp_all=get_job_positions(active_only=False)
-        st.markdown(f"""<div class="mg" style="grid-template-columns:repeat(3,1fr)">
+        sh_all=get_shift_types(active_only=False)
+        st.markdown(f"""<div class="mg" style="grid-template-columns:repeat(4,1fr)">
           <div class="mb mg-teal"><div class="ml ml-teal">Divisions</div><div class="mv">{total_div_count}</div></div>
           <div class="mb mg-gold"><div class="ml ml-gold">Cost Centers</div><div class="mv">{len(cc_all)}</div></div>
           <div class="mb mg-purple"><div class="ml ml-purple">Job Positions</div><div class="mv">{len(jp_all)}</div></div>
+          <div class="mb mg-cyan"><div class="ml ml-cyan">Shifts</div><div class="mv">{len(sh_all)}</div></div>
         </div>""",unsafe_allow_html=True)
 
-        cc_div_tab, cc_cc_tab, cc_jp_tab = st.tabs(["Divisions","Cost Centers","Job Positions"])
+        cc_div_tab, cc_cc_tab, cc_jp_tab, cc_sh_tab = st.tabs(["Divisions","Cost Centers","Job Positions","Shifts"])
 
         # ── DIVISIONS TAB ──
         with cc_div_tab:
@@ -5572,6 +5624,87 @@ with main_block:
             jp_buf=io.BytesIO()
             with pd.ExcelWriter(jp_buf,engine="xlsxwriter") as w: jp_all.to_excel(w,index=False,sheet_name="Positions")
             st.download_button("Export Positions List",jp_buf.getvalue(),file_name=f"Positions_{datetime.now().strftime('%Y%m%d')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        # ── SHIFTS TAB ──
+        with cc_sh_tab:
+            st.markdown('<div style="font-size:12px;color:#94A8C8;margin-bottom:10px">The 5 standard shifts are pre-loaded with their time windows. Set each one\'s premium/allowance here — once set, assigning that Shift to an employee (Employee Profile → Edit) auto-connects them to it in Payroll, with no manual entry, the same way Position connects to Salary Category.</div>',unsafe_allow_html=True)
+
+            if len(sh_all)>0:
+                for _,sh in sh_all.iterrows():
+                    status_label="Active" if sh['is_active']==1 else "Inactive"
+                    st.markdown(f"""<div class="card" style="padding:12px 16px;margin-bottom:8px">
+                      <div style="display:flex;justify-content:space-between;align-items:center">
+                        <div>
+                          <span style="font-family:'Cinzel',serif;color:#F0C96B;font-weight:700;font-size:14px">{sh['name']}</span>
+                          <span style="color:#94A8C8;font-size:12px;margin-left:8px">{sh['start_time']} — {sh['end_time']}</span>
+                          <span style="font-size:10px;color:#6B7FA3;margin-left:8px">{status_label}</span>
+                        </div>
+                        <div style="text-align:right"><span class="cc-tag" style="background:rgba(16,185,129,0.12);color:#10B981;border-color:rgba(16,185,129,0.3)">Premium: ETB {sh['premium_amount']:,.2f}</span></div>
+                      </div>
+                    </div>""",unsafe_allow_html=True)
+            else:
+                st.info("No shifts configured yet.")
+
+            if st.session_state.role=="Manager":
+                st.markdown("<hr>",unsafe_allow_html=True)
+                sht1,sht2=st.tabs(["Create / Update Shift","Manage Shifts"])
+                with sht1:
+                    existing_shifts=sh_all['name'].tolist() if len(sh_all)>0 else []
+                    sh_pick_opts=["+ New Shift"]+existing_shifts
+                    sh_pick=st.selectbox("Shift",sh_pick_opts,key="sh_pick")
+                    if sh_pick=="+ New Shift":
+                        sh_pre={"name":"","start_time":"","end_time":"","premium_amount":0.0}
+                    else:
+                        sh_pre=sh_all[sh_all['name']==sh_pick].iloc[0].to_dict()
+                    with st.form("shift_form"):
+                        sf1,sf2=st.columns(2)
+                        with sf1: sh_name=st.text_input("Shift Name *",value=sh_pre.get("name") or "",placeholder="e.g. Night",disabled=(sh_pick!="+ New Shift"))
+                        with sf2: sh_premium=st.number_input("Premium / Allowance (ETB per month)",min_value=0.0,value=float(sh_pre.get("premium_amount") or 0),step=50.0)
+                        sf3,sf4=st.columns(2)
+                        with sf3: sh_start=st.text_input("Start Time",value=sh_pre.get("start_time") or "",placeholder="e.g. 08:00 AM")
+                        with sf4: sh_end=st.text_input("End Time",value=sh_pre.get("end_time") or "",placeholder="e.g. 05:00 PM")
+                        if st.form_submit_button("Save Shift",use_container_width=True):
+                            final_name=sh_name.strip() if sh_pick=="+ New Shift" else sh_pick
+                            if not final_name:
+                                st.error("Shift name is required.")
+                            else:
+                                conn=get_conn()
+                                conn.execute("""INSERT INTO shift_types(name,start_time,end_time,premium_amount,is_active,updated_by,updated_at)
+                                    VALUES(?,?,?,?,1,?,?)
+                                    ON CONFLICT(name) DO UPDATE SET start_time=?,end_time=?,premium_amount=?,updated_by=?,updated_at=?""",
+                                    (final_name,sh_start,sh_end,sh_premium,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                     sh_start,sh_end,sh_premium,st.session_state.uid,datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                                conn.commit(); conn.close()
+                                get_shift_types.clear()
+                                st.success(f"Shift '{final_name}' saved — Premium ETB {sh_premium:,.2f}.")
+                                st.rerun()
+                with sht2:
+                    if len(sh_all)>0:
+                        sh_manage_opts={r['name']:r['name'] for _,r in sh_all.iterrows()}
+                        sel_sh=st.selectbox("Select Shift",list(sh_manage_opts.keys()),key="sel_sh_manage")
+                        shc1,shc2,shc3=st.columns(3)
+                        with shc1:
+                            if st.button("Activate",use_container_width=True,key="sh_activate"):
+                                conn=get_conn(); conn.execute("UPDATE shift_types SET is_active=1 WHERE name=?",(sel_sh,)); conn.commit(); conn.close()
+                                get_shift_types.clear(); st.success("Activated."); st.rerun()
+                        with shc2:
+                            if st.button("Deactivate",use_container_width=True,key="sh_deactivate"):
+                                conn=get_conn(); conn.execute("UPDATE shift_types SET is_active=0 WHERE name=?",(sel_sh,)); conn.commit(); conn.close()
+                                get_shift_types.clear(); st.warning("Deactivated."); st.rerun()
+                        with shc3:
+                            if st.button("Delete",use_container_width=True,key="sh_delete"):
+                                conn=get_conn(); cur=conn.cursor()
+                                cur.execute("SELECT * FROM shift_types WHERE name=?",(sel_sh,))
+                                sh_cols=[d[0] for d in cur.description]; sh_row=cur.fetchone()
+                                sh_dict=dict(zip(sh_cols,sh_row)) if sh_row else {}
+                                conn.execute("DELETE FROM shift_types WHERE name=?",(sel_sh,)); conn.commit(); conn.close()
+                                soft_delete("Shift Type", sel_sh, f"Shift — {sel_sh}", sh_dict, st.session_state.uid)
+                                get_shift_types.clear(); st.error("Moved to Recycle Bin."); st.rerun()
+                    else:
+                        st.info("No shifts yet. Create one in the first tab.")
+            sh_buf=io.BytesIO()
+            with pd.ExcelWriter(sh_buf,engine="xlsxwriter") as w: sh_all.to_excel(w,index=False,sheet_name="Shifts")
+            st.download_button("Export Shifts List",sh_buf.getvalue(),file_name=f"Shifts_{datetime.now().strftime('%Y%m%d')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
     # ════════════════════════════════════════════════════════
