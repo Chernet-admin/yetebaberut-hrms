@@ -2571,7 +2571,21 @@ with main_block:
                         else:
                             st.markdown(f'<div style="font-size:9px;color:#6B7FA3;text-transform:uppercase;margin-bottom:2px">Category (auto from Position)</div><div style="font-size:12px;color:#F59E0B;padding-top:8px">Not mapped — set in Payroll → Salary Categories</div>',unsafe_allow_html=True)
                     em1,em2b,em3=st.columns(3)
-                    with em1: pass
+                    with em1:
+                        sh_list_edit=get_shift_types()
+                        sh_names_edit=sh_list_edit['name'].tolist() if len(sh_list_edit)>0 else []
+                        cur_shift=r.get("shift_type") or ""
+                        if sh_names_edit:
+                            shift_opts_edit=["— No Shift —"]+sh_names_edit
+                            shift_idx=shift_opts_edit.index(cur_shift) if cur_shift in shift_opts_edit else 0
+                            eshift_pick=st.selectbox("Shift",shift_opts_edit,index=shift_idx,help="Create new shifts in Cost Centers → Shifts")
+                            eshift = None if eshift_pick=="— No Shift —" else eshift_pick
+                            shift_prem_preview=get_shift_premium(eshift) if eshift else 0.0
+                            if eshift:
+                                st.caption(f"Premium: ETB {shift_prem_preview:,.2f} — auto-applied in Payroll")
+                        else:
+                            st.warning("No shifts created yet (Cost Centers → Shifts).")
+                            eshift=None
                     with em2b:
                         et=["Permanent","Contract","Temporary","Part-Time"]
                         eety=st.selectbox("Type",et,index=et.index(r.get("employment_type","Permanent")) if r.get("employment_type") in et else 0)
@@ -2608,13 +2622,13 @@ with main_block:
                             guarantor_name=?,guarantor_phone=?,guarantor_city=?,guarantor_subcity=?,guarantor_woreda=?,
                             guarantor_company_id=?,guarantor_company_name=?,guarantor_letter_number=?,guarantor_date_written=?,
                             tin_number=?,pension_number=?,bank_name=?,bank_account=?,
-                            edu_background=?,field_of_graduate=?,graduation_year=?,institution_name=?,job_title=?,category=?,employment_type=?,
+                            edu_background=?,field_of_graduate=?,graduation_year=?,institution_name=?,job_title=?,category=?,shift_type=?,employment_type=?,
                             division=?,cost_center=?,basic_salary=?,weekly_dayoff=?,start_date=?,contract_end_date=?,current_status=?,is_buffer=?,notes=? WHERE emp_id=?""",
                             (en,ec,ec2,ee,enatid,esx,emar,enat,erel,eage,epob,ebt,eres,ecity,esc2,ewo,eha,
                              eecn,eecp,eeccity,eecsc,eecwo,
                              egn,egp,egcity,egsc,egwo,egcid,egcname,egletter,egdate,
                              etin,epen2,ebnk,eacc,
-                             eedu,efld,egry,eins,ejob,ecat,eety,edep,None if eccsel=="Unassigned" else eccsel,esal,ewd,esd,ecd,est,1 if ebuf else 0,enotes,eid2))
+                             eedu,efld,egry,eins,ejob,ecat,eshift,eety,edep,None if eccsel=="Unassigned" else eccsel,esal,ewd,esd,ecd,est,1 if ebuf else 0,enotes,eid2))
                         conn.commit(); conn.close()
                         st.cache_data.clear()
                         st.success("Profile saved!"); st.rerun()
@@ -3341,6 +3355,18 @@ with main_block:
             with al2: housing=st.number_input("Housing Allowance",min_value=0.0,value=300.0,step=50.0)
             with al3: other_al=st.number_input("Other Allowance",min_value=0.0,value=0.0,step=50.0)
             with al4: st.markdown(f'<div style="background:#0D1526;border:1px solid rgba(212,168,71,0.2);border-radius:8px;padding:10px;margin-top:20px"><div style="color:#6B7FA3;font-size:9px">BASIC SALARY</div><div style="color:#F0C96B;font-size:17px;font-family:Cinzel,serif;font-weight:700">ETB {base:,.2f}</div></div>',unsafe_allow_html=True)
+
+            emp_shift = er.get('shift_type')
+            shift_prem_auto = get_shift_premium(emp_shift) if emp_shift else 0.0
+            sh1,sh2=st.columns(2)
+            with sh1:
+                if emp_shift:
+                    st.markdown(f'<div style="font-size:11px;color:#34D399;margin-bottom:4px">Shift: <b>{emp_shift}</b> — premium auto-connected from Cost Centers → Shifts.</div>',unsafe_allow_html=True)
+                else:
+                    st.markdown('<div style="font-size:11px;color:#6B7FA3;margin-bottom:4px">No Shift assigned (Employee Profile → Edit) — Shift Premium defaults to 0.</div>',unsafe_allow_html=True)
+            with sh2:
+                shift_premium=st.number_input("Shift Premium (ETB)",min_value=0.0,value=shift_prem_auto,step=50.0,help="Auto-filled from the employee's assigned Shift; adjust here for a one-off exception.")
+
             st.markdown('<div class="fs">Annex III — Client Billing Inputs</div>',unsafe_allow_html=True)
             an1,an2,an3,an4=st.columns(4)
             with an1: meal_al=st.number_input("Meal Allowance",min_value=0.0,value=float(cat_rate['meal_allowance']) if cat_rate else float(get_setting("policy_meal_allowance","0")),step=50.0)
@@ -3374,13 +3400,14 @@ with main_block:
                 st.success("No pending fines.")
             other_ded=st.number_input("Other Deductions (ETB)",min_value=0.0,value=0.0,step=50.0)
             notes_pay=st.text_area("Payroll Notes",placeholder="Optional...")
-            net,tax,pen_emp,pen_er,daily_rate,gross=calc_pay(base,transport,housing,other_al,total_fine_amt,unpaid_days,absent_input,other_ded)
+            net,tax,pen_emp,pen_er,daily_rate,gross=calc_pay(base,transport,housing,other_al+shift_premium,total_fine_amt,unpaid_days,absent_input,other_ded)
             st.markdown(f"""<div class="ps">
               <div style="font-family:'Cinzel',serif;font-size:12px;color:#D4A847;margin-bottom:10px;letter-spacing:.05em">AUTO PAYROLL — {pay_month}</div>
               <div class="pr"><span class="pl">Basic Salary</span><span class="pv">ETB {base:,.2f}</span></div>
               <div class="pr"><span class="pl">Transport</span><span class="pv">ETB {transport:,.2f}</span></div>
               <div class="pr"><span class="pl">Housing</span><span class="pv">ETB {housing:,.2f}</span></div>
               <div class="pr"><span class="pl">Other Allow.</span><span class="pv">ETB {other_al:,.2f}</span></div>
+              <div class="pr"><span class="pl">Shift Premium{f" ({emp_shift})" if emp_shift else ""}</span><span class="pv">ETB {shift_premium:,.2f}</span></div>
               <div class="pr"><span class="pl" style="font-weight:600">GROSS</span><span class="pv" style="color:#F0C96B;font-weight:600">ETB {gross:,.2f}</span></div>
               <div class="pr"><span class="pl">Income Tax</span><span class="pd">- ETB {tax:,.2f}</span></div>
               <div class="pr"><span class="pl">Pension Emp 7%</span><span class="pd">- ETB {pen_emp:,.2f}</span></div>
@@ -3426,13 +3453,13 @@ with main_block:
                             sick_leave_days,annual_leave_days,maternity_leave_days,mourning_leave_days,unpaid_leave_days,
                             absent_days,holiday_days,dayoff_days,gross_salary,net_salary,payment_status,notes,created_at,
                             full_name,division,cost_center,meal_allowance,medical_insurance,paid_leave_value,
-                            overhead_profit,vat_amount,total_billed_amount,payment_method,category,gm_approval_status)
-                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Processed',?,?,?,?,?,?,?,?,?,?,?,?,?,'Not Submitted')""",
+                            overhead_profit,vat_amount,total_billed_amount,payment_method,category,shift_type,shift_premium,gm_approval_status)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Processed',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Not Submitted')""",
                             (seid,pay_month,base,transport,housing,other_al,tax,pen_emp,pen_er,other_ded,
                              total_fine_amt,total_fine_days,sick_days,annual_days,mat_days,mourning_days,
                              unpaid_days,absent_input,hol_count,dayoff_count,gross,net,notes_pay,datetime.now().strftime("%Y-%m-%d"),
                              er['full_name'],er['division'],er['cost_center'],meal_al,medical_ins,paid_leave_value,
-                             overhead_profit,vat_amount,total_billed,payment_method,er.get('category')))
+                             overhead_profit,vat_amount,total_billed,payment_method,er.get('category'),emp_shift,shift_premium))
                         if apply_all and len(fines_df)>0:
                             ids=tuple(fines_df["id"].tolist())
                             if len(ids)==1: conn.execute("UPDATE fine_letters SET applied_to_payroll='Yes' WHERE id=?",(ids[0],))
